@@ -7,6 +7,7 @@
  *   agent-gh git <git arguments...>
  *   agent-gh doctor                who is acting, then login, git author, and repository access
  *   agent-gh setup <family>        create johnrees-<family> (run in your own terminal)
+ *   agent-gh settings [family...]  print where each family App's permissions and repositories are changed
  */
 import { defaultConfigDir } from "./config.ts";
 import { doctor } from "./doctor.ts";
@@ -16,13 +17,15 @@ import { familyNames } from "./family.ts";
 import { detectIdentity, inAgentSession } from "./harness.ts";
 import { originUrl, resolveRepo } from "./repo.ts";
 import { type Context, runAs } from "./run.ts";
+import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
 
 const USAGE = `usage:
   agent-gh <gh arguments...>        run gh as this agent's bot
   agent-gh git <git arguments...>   run git as this agent's bot
   agent-gh doctor                   show who is acting, then check login, git author, and repository access
-  agent-gh setup <family>           create johnrees-<family> (${familyNames().join(", ")}); run it yourself, not from an agent`;
+  agent-gh setup <family>           create johnrees-<family> (${familyNames().join(", ")}); run it yourself, not from an agent
+  agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)`;
 
 const main = async (argv: readonly string[]): Promise<number> => {
   const [first, ...rest] = argv;
@@ -31,6 +34,21 @@ const main = async (argv: readonly string[]): Promise<number> => {
     return first === undefined ? 1 : 0;
   }
   const env = process.env;
+  if (first === "settings") {
+    const dir = defaultConfigDir();
+    if (rest.some((family) => !familyNames().includes(family))) {
+      console.error(USAGE);
+      return 1;
+    }
+    const configured = configuredFamilies(dir);
+    const families = rest.length > 0 ? rest : configured;
+    if (families.length === 0) {
+      console.error(`no family is set up in ${dir}; run \`agent-gh setup <family>\` in your own terminal`);
+      return 1;
+    }
+    for (const family of families) for (const line of settingsLines(dir, family, "https://github.com")) console.log(line);
+    return families.every((family) => configured.includes(family)) ? 0 : 1;
+  }
   if (first === "setup") {
     const [family] = rest;
     if (family === undefined || !familyNames().includes(family) || rest.length !== 1) {

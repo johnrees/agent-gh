@@ -7,6 +7,7 @@ agent-gh pr create --draft --fill      # gh, as the bot
 agent-gh git commit -m "..."           # git, as the bot, with Agent-* trailers
 agent-gh git push -u origin my-branch  # github.com remotes over HTTPS; SSH is off
 agent-gh doctor                        # harness, model, family, bot; then login, git author, and access
+agent-gh settings claude               # the App's settings, permissions, and repository-access pages
 ```
 
 ## Who is acting
@@ -40,7 +41,7 @@ agent-gh setup glm   # or claude, codex, deepseek, kimi, qwen
 
 This opens a local page that posts an App manifest to GitHub: a private App named `johnrees-<family>` with contents, issues, and pull requests write, actions and checks read, and no webhook deliveries. After you click **Create**, GitHub hands the credentials back to the local page. agent-gh keeps only the private key and the public identifiers in `~/.config/agent-gh/` (directory 700, files 600). It refuses to run inside an agent session.
 
-Then install the App on each repository agents work in, at the URL setup prints (`https://github.com/apps/johnrees-<family>/installations/new`, **Only select repositories**). Adding a repository later is a checkbox on that page; no new key. Check it with `agent-gh doctor` from the repository, inside an agent session.
+Then install the App on each repository agents work in, at its repository-access page (**Only select repositories**). Adding a repository later is a checkbox on that page; no new key. `agent-gh settings <family>` prints that page and the App's permissions page, from the slug setup recorded; with no family it lists every set-up App, since GitHub has no API to change either and each App is edited by hand. Check it with `agent-gh doctor` from the repository, inside an agent session.
 
 ## Commit trailers
 
