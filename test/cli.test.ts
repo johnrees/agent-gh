@@ -56,6 +56,19 @@ test("agents cannot run setup, for any family", async () => {
   });
 });
 
+test("an agent cannot authorize itself to act as John", async () => {
+  for (const env of [{ CODEX_THREAD_ID: "t" }, { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1" }, { PI_SESSION_ID: "p" }]) {
+    expect(await cli(["login", "claude"], env)).toEqual({
+      code: 1,
+      stderr:
+        "agent-gh: logging in failed: an agent cannot authorize itself to act as John; run `agent-gh login` in your own terminal. No personal-login fallback was used.",
+    });
+  }
+  const unknown = await cli(["login", "mistral"], {});
+  expect(unknown.code).toBe(1);
+  expect(unknown.stderr).toStartWith("usage:");
+});
+
 test("an unknown family for setup prints usage listing the families", async () => {
   const result = await cli(["setup", "mistral"], {});
   expect(result.code).toBe(1);

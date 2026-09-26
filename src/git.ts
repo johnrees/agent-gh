@@ -21,9 +21,9 @@ export const subcommand = (args: readonly string[]): string | undefined => {
 };
 
 /**
- * Subcommands that never talk to a remote, so they need the bot's identity
- * but no token. Anything else (push, fetch, pull, clone, ls-remote, submodule,
- * and anything unlisted) gets a token.
+ * Subcommands that never talk to a remote, so they need no token. Anything
+ * else (push, fetch, pull, clone, ls-remote, submodule, and anything unlisted)
+ * gets John's user token for the family's App.
  */
 const LOCAL = new Set([
   "add", "am", "apply", "bisect", "blame", "branch", "checkout", "cherry-pick", "clean", "commit", "config", "describe",
@@ -36,23 +36,30 @@ export const needsToken = (args: readonly string[]): boolean => {
   return name === undefined || !LOCAL.has(name);
 };
 
-/** The trailers a commit carries: only what the harness reports, never a guess. */
+/** The agent trailers: only what the harness reports, never a guess. An amend replaces them. */
 export const TRAILER_KEYS = ["Agent-Model", "Agent-Harness", "Agent-Effort"] as const;
 
-export const trailers = (identity: Identity): string[] => [
+/** The App a commit credits, so GitHub shows John and the family's App together. */
+export type CoAuthor = { readonly slug: string; readonly bot_user_id: number };
+
+export const coAuthorTrailer = (app: CoAuthor): string =>
+  `Co-authored-by: ${app.slug}[bot] <${app.bot_user_id}+${app.slug}[bot]@users.noreply.github.com>`;
+
+export const trailers = (identity: Identity, app: CoAuthor): string[] => [
   ...(identity.model === undefined ? [] : [`Agent-Model: ${identity.model}`]),
   `Agent-Harness: ${identity.harness}`,
   ...(identity.effort === undefined ? [] : [`Agent-Effort: ${identity.effort}`]),
+  coAuthorTrailer(app),
 ];
 
 /**
  * Adds `--trailer` arguments right after `commit`, so they precede any `--`
  * pathspec separator and work with -m, -F, --amend, and --no-edit. Other
- * commands pass through unchanged.
+ * commands pass through unchanged. The commit's author stays John's own.
  */
-export const withTrailers = (args: readonly string[], identity: Identity): string[] => {
+export const withTrailers = (args: readonly string[], identity: Identity, app: CoAuthor): string[] => {
   const index = subcommandIndex(args);
   if (index === undefined || args[index] !== "commit") return [...args];
-  const added = trailers(identity).flatMap((trailer) => ["--trailer", trailer]);
+  const added = trailers(identity, app).flatMap((trailer) => ["--trailer", trailer]);
   return [...args.slice(0, index + 1), ...added, ...args.slice(index + 1)];
 };

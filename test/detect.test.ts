@@ -4,7 +4,6 @@ import { Failure } from "../src/failure.ts";
 import { familyOfHost, familyOfModel, familyOfProvider } from "../src/family.ts";
 import { codexProviderOf, detectHarness, detectIdentity, type Env, inAgentSession } from "../src/harness.ts";
 import { parseRepo, repoFlag, resolveRepo } from "../src/repo.ts";
-import { CONFIG } from "./fake-github.ts";
 
 const refusal = (run: () => unknown): string => {
   try {
@@ -182,7 +181,7 @@ test("Codex's default provider is read from the keys that select it", () => {
   expect(codexProviderOf('[model_providers.zai]\nmodel_provider = "not top level"\n')).toBeUndefined();
 });
 
-test("the child environment appends to inherited git config and replaces agent trailers", () => {
+test("the child environment appends to inherited git config, replaces agent trailers, and keeps John's author", () => {
   const parent: Env = {
     HOME: "/home/x",
     GH_DEBUG: "api",
@@ -193,14 +192,14 @@ test("the child environment appends to inherited git config and replaces agent t
     GIT_CONFIG_KEY_1: "user.name",
     GIT_CONFIG_VALUE_1: "Someone",
   };
-  const env = childEnv(parent, "ghs_x", { owner: "johnrees", name: "penmon" }, CONFIG);
+  const env = childEnv(parent, "ghu_x", { owner: "johnrees", name: "penmon" });
   expect(env.HOME).toBe("/home/x");
   expect(env.GH_DEBUG).toBeUndefined();
-  expect(env.GH_TOKEN).toBe("ghs_x");
+  expect(env.GH_TOKEN).toBe("ghu_x");
   expect(env.GIT_CONFIG_KEY_0).toBe("core.editor");
   expect(env.GIT_CONFIG_KEY_1).toBe("user.name");
-  expect(env.GIT_CONFIG_COUNT).toBe("9");
-  expect([2, 3, 4, 5, 6, 7, 8].map((n) => [env[`GIT_CONFIG_KEY_${n}`], env[`GIT_CONFIG_VALUE_${n}`]])).toEqual([
+  expect(env.GIT_CONFIG_COUNT).toBe("10");
+  expect([2, 3, 4, 5, 6, 7, 8, 9].map((n) => [env[`GIT_CONFIG_KEY_${n}`], env[`GIT_CONFIG_VALUE_${n}`]])).toEqual([
     ["credential.helper", ""],
     ["credential.https://github.com.helper", "!gh auth git-credential"],
     ["url.https://github.com/.insteadOf", "git@github.com:"],
@@ -208,23 +207,24 @@ test("the child environment appends to inherited git config and replaces agent t
     ["trailer.Agent-Model.ifexists", "replace"],
     ["trailer.Agent-Harness.ifexists", "replace"],
     ["trailer.Agent-Effort.ifexists", "replace"],
+    ["trailer.Co-authored-by.ifexists", "addIfDifferent"],
   ]);
   expect(env.GIT_SSH_COMMAND).toContain("exit 1");
   expect(env.GIT_TERMINAL_PROMPT).toBe("0");
   expect(env.GH_PROMPT_DISABLED).toBe("1");
   expect(env.GH_HOST).toBe("github.com");
-  expect(env.GIT_AUTHOR_NAME).toBe("johnrees-claude[bot]");
+  expect(env.GIT_AUTHOR_NAME).toBeUndefined();
 });
 
-test("without a token, nothing can authenticate as John", () => {
-  const env = childEnv({ GH_TOKEN: "ghp_johns_own", GITHUB_TOKEN: "ghp_x" }, undefined, { owner: "a", name: "b" }, CONFIG);
+test("without a token, nothing can authenticate as John, and John stays the author", () => {
+  const env = childEnv({ GH_TOKEN: "ghp_johns_own", GITHUB_TOKEN: "ghp_x" }, undefined, { owner: "a", name: "b" });
   expect(env.GH_TOKEN).toBeUndefined();
   expect(env.GITHUB_TOKEN).toBeUndefined();
   const keys = Object.entries(env).filter(([name]) => name.startsWith("GIT_CONFIG_KEY_")).map(([, key]) => key);
   expect(keys).toContain("credential.helper");
   expect(keys).not.toContain("credential.https://github.com.helper");
-  expect(env.GIT_CONFIG_COUNT).toBe("6");
-  expect(env.GIT_COMMITTER_NAME).toBe("johnrees-claude[bot]");
+  expect(env.GIT_CONFIG_COUNT).toBe("7");
+  expect(env.GIT_COMMITTER_NAME).toBeUndefined();
 });
 
 test("repositories parse from every form gh and git use", () => {

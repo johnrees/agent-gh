@@ -20,7 +20,9 @@ export type Stage =
   | "reading key"
   | "signing"
   | "finding the installation"
-  | "requesting the token"
+  | "logging in"
+  | "reading the login"
+  | "refreshing the login"
   | "starting the child"
   | "setting up";
 

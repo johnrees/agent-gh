@@ -108,8 +108,10 @@ export const setup = async (family: string, deps: Setup): Promise<AppConfig> => 
   );
   try {
     const config = await done;
-    deps.print(`Created ${config.slug}. Install it on each repository agents work in:`);
-    deps.print(`  https://github.com/apps/${config.slug}/installations/new`);
+    deps.print(`Created ${config.slug}. Next:`);
+    deps.print(`  1. Install it on each repository agents work in: ${deps.github}/apps/${config.slug}/installations/new`);
+    deps.print(`  2. Tick "Enable Device Flow" and save (a manifest cannot set it): ${deps.github}/settings/apps/${config.slug}`);
+    deps.print(`  3. Run \`agent-gh login ${family}\` to let it act as you.`);
     return config;
   } finally {
     clearTimeout(timer);

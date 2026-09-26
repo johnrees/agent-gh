@@ -102,7 +102,7 @@ test("the hook script denies with Claude Code's PreToolUse decision", async () =
   const commit = await hook(JSON.stringify({ tool_name: "Bash", tool_input: { command: "git commit -m x" } }));
   const commitReason = JSON.parse(commit.stdout).hookSpecificOutput.permissionDecisionReason;
   expect(commitReason).toBe(
-    "git commit would be authored as John. Run it as `agent-gh git commit ...` so this agent's bot is the author and a commit carries the Agent-* trailers.",
+    "git commit would not credit this agent. Run it as `agent-gh git commit ...` so a commit carries the Agent-* trailers and the family App as co-author.",
   );
 
   const allowed = await hook(JSON.stringify({ tool_name: "Bash", tool_input: { command: "agent-gh pr create" } }));

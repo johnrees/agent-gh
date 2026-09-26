@@ -1,12 +1,14 @@
 import { runChild } from "./child.ts";
-import { botEmail } from "./env.ts";
-import { type Context, withToken } from "./run.ts";
+import { coAuthorTrailer } from "./git.ts";
 import { slug } from "./repo.ts";
+import { type Context, withToken } from "./run.ts";
 
 /**
- * One check of the whole path: who is acting (harness, model, family, bot),
- * then the bot's login through gh, its git author, and git access to the
- * repository, all with one token. Exit 0 only if all hold.
+ * One check of the whole path: who is acting (harness, model, family, App),
+ * then, with John's user token for that App: the acting user, that the token
+ * belongs to the App (GitHub lists only the issuing App's installations for a
+ * user token), John's git author, and git access to the repository. Exit 0
+ * only if all hold.
  */
 export const doctor = async (context: Context, print: (line: string) => void): Promise<number> => {
   const { identity } = context;
@@ -16,25 +18,27 @@ export const doctor = async (context: Context, print: (line: string) => void): P
   print(`family: ${identity.family}`);
   print(`repository: ${slug(context.repo)}`);
   return withToken(context, async (env, config) => {
-    print(`bot: ${config.bot_login}`);
-    const login = await runChild(
-      ["gh", "api", "graphql", "-f", "query={ viewer { login } }", "--jq", ".data.viewer.login"],
+    print(`app: ${config.slug}`);
+    print(`commits get: ${coAuthorTrailer(config)}`);
+    const user = await runChild(["gh", "api", "user", "--jq", ".login"], env, true);
+    const installs = await runChild(
+      ["gh", "api", "user/installations", "--jq", ".installations[] | select(.app_slug == \"" + config.slug + "\") | .account.login"],
       env,
       true,
     );
     const ident = await runChild(["git", "var", "GIT_AUTHOR_IDENT"], env, true);
-    const remote = await runChild(
-      ["git", "ls-remote", `https://github.com/${slug(context.repo)}.git`, "HEAD"],
-      env,
-      true,
-    );
+    const remote = await runChild(["git", "ls-remote", `https://github.com/${slug(context.repo)}.git`, "HEAD"], env, true);
+    const login = user.stdout.trim();
+    const owners = installs.stdout.trim().split("\n").filter(Boolean);
+    const author = ident.stdout.trim().replace(/ \d+ [+-]\d{4}$/, "");
     const checks = [
-      ["gh login", login.code === 0 && login.stdout.trim() === config.bot_login, login.stdout.trim() || "none"],
+      ["acting user", user.code === 0 && login !== "" && !login.endsWith("[bot]"), login || "none"],
       [
-        "git author",
-        ident.code === 0 && ident.stdout.startsWith(`${config.bot_login} <${botEmail(config)}>`),
-        ident.stdout.trim().replace(/ \d+ [+-]\d{4}$/, "") || "none",
+        "token app",
+        installs.code === 0 && owners.includes(context.repo.owner),
+        owners.length > 0 ? `${config.slug}, installed on ${owners.join(", ")}` : "no installation of this App for the token",
       ],
+      ["git author", ident.code === 0 && author !== "" && !author.includes("[bot]"), author || "none"],
       ["repository access", remote.code === 0, remote.code === 0 ? "git ls-remote succeeded" : "git ls-remote failed"],
     ] as const;
     for (const [name, ok, seen] of checks) print(`${ok ? "ok  " : "FAIL"} ${name}: ${seen}`);

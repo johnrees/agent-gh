@@ -1,5 +1,5 @@
 /**
- * Finds commands that would act as John instead of this agent's bot: GitHub
+ * Finds commands that would skip agent-gh and act with John's own login: GitHub
  * writes through gh, and git commands that create or rewrite commits or push,
  * unless they run through agent-gh. The check behind hooks/deny-bare-gh.ts.
  * It is a guard against the easy mistake, not a security boundary: `eval`,
@@ -142,10 +142,10 @@ export const bareWrite = (line: string): string | undefined => {
 
 export const denyReason = (write: string): string => {
   if (write === "git push") {
-    return "git push would publish as John. Run it through agent-gh so it carries this agent's bot identity: `agent-gh git push ...`.";
+    return "git push would publish with John's own login, without this agent's App. Run it through agent-gh: `agent-gh git push ...`.";
   }
   if (write.startsWith("git ")) {
-    return `${write} would be authored as John. Run it as \`agent-gh ${write} ...\` so this agent's bot is the author and a commit carries the Agent-* trailers.`;
+    return `${write} would not credit this agent. Run it as \`agent-gh ${write} ...\` so a commit carries the Agent-* trailers and the family App as co-author.`;
   }
-  return `${write} would publish as John. Run GitHub writes through agent-gh so they carry this agent's bot identity: \`agent-gh ${write.replace(/^gh /, "").replace(/ \(a write\)$/, "")} ...\`.`;
+  return `${write} would publish with John's own login, without this agent's App badge. Run GitHub writes through agent-gh: \`agent-gh ${write.replace(/^gh /, "").replace(/ \(a write\)$/, "")} ...\`.`;
 };
