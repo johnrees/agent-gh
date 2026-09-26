@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import registryJson from "../apps.json" with { type: "json" };
 import { Failure } from "./failure.ts";
 
 /** What `agent-gh setup` records for one model family's App. No secret lives here. */
@@ -11,6 +12,22 @@ export type AppConfig = {
   readonly bot_login: string;
   readonly bot_user_id: number;
 };
+
+/** One App's public identifiers, as committed in apps.json. */
+export type RegistryEntry = {
+  readonly slug: string;
+  readonly app_id: number;
+  readonly client_id: string;
+  readonly bot_user_id: number;
+};
+export type Registry = Readonly<Record<string, RegistryEntry>>;
+
+/**
+ * John's family Apps, committed so that another machine needs only
+ * `agent-gh login <family>`: public identifiers only (the client ID travels in
+ * every device-flow and browser request), never a key or a token.
+ */
+export const REGISTRY: Registry = registryJson;
 
 export const defaultConfigDir = (): string => join(homedir(), ".config", "agent-gh");
 
@@ -36,19 +53,41 @@ const isConfig = (value: unknown): value is AppConfig => {
   );
 };
 
-export const readConfig = (dir: string, family: string): AppConfig => {
+const fromEntry = (entry: RegistryEntry): AppConfig => ({
+  client_id: entry.client_id,
+  app_id: entry.app_id,
+  slug: entry.slug,
+  bot_login: `${entry.slug}[bot]`,
+  bot_user_id: entry.bot_user_id,
+});
+
+/** Whether the family has an App, locally recorded or committed in the registry. */
+export const isConfigured = (dir: string, family: string, registry: Registry = REGISTRY): boolean =>
+  existsSync(paths(dir, family).config) || Object.hasOwn(registry, family);
+
+/**
+ * The family's App: a local `<family>.json` from `agent-gh setup` wins (a new
+ * App works before its registry entry is committed), else the committed
+ * registry. Only a family in neither is told to run setup: setup on a family
+ * that already has an App would create a second one.
+ */
+export const readConfig = (dir: string, family: string, registry: Registry = REGISTRY): AppConfig => {
   const path = paths(dir, family).config;
   let text: string;
   try {
     text = readFileSync(path, "utf8");
   } catch (error) {
-    if (code(error) === "ENOENT") {
+    if (code(error) !== "ENOENT") throw new Failure("reading config", `${path} could not be read (${code(error)})`);
+    const entry = Object.hasOwn(registry, family) ? registry[family] : undefined;
+    if (entry === undefined) {
       throw new Failure(
         "reading config",
-        `no App for ${family} in ${dir}; run \`agent-gh setup ${family}\` in your own terminal`,
+        `${family} has no App yet: run \`agent-gh setup ${family}\` on the machine where you create Apps, then commit the registry entry it prints`,
       );
     }
-    throw new Failure("reading config", `${path} could not be read (${code(error)})`);
+    const config = fromEntry(entry);
+    if (!isConfig(config)) throw new Failure("reading config", `the ${family} entry in apps.json is not a valid App`);
+    return config;
   }
   let value: unknown;
   try {
@@ -60,7 +99,11 @@ export const readConfig = (dir: string, family: string): AppConfig => {
   return value;
 };
 
-/** The App's private key. The caller zeroes the buffer once it has signed. */
+/**
+ * The App's private key, which only `agent-gh setup` writes and only App-level
+ * requests (the planned `audit`) read: everyday commands use John's user token.
+ * The caller zeroes the buffer once it has signed.
+ */
 export const readKey = (dir: string, family: string): Buffer => {
   const path = paths(dir, family).key;
   let mode: number;
@@ -89,6 +132,10 @@ export const hasCredentials = (dir: string, family: string): boolean => {
   const { config, key } = paths(dir, family);
   return existsSync(config) || existsSync(key);
 };
+
+/** The line `agent-gh setup` asks John to add to apps.json for a new App. */
+export const registryLine = (family: string, config: AppConfig): string =>
+  `"${family}": ${JSON.stringify({ slug: config.slug, app_id: config.app_id, client_id: config.client_id, bot_user_id: config.bot_user_id })}`;
 
 /** Writes a new App's key and config: directory 700, files 600, never overwriting. */
 export const writeCredentials = (dir: string, family: string, config: AppConfig, pem: string): void => {

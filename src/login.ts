@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { readConfig, type AppConfig } from "./config.ts";
+import { readConfig, REGISTRY, type AppConfig, type Registry } from "./config.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { type Api, errorCode, getJson, oauthPost } from "./github.ts";
 
@@ -197,6 +197,7 @@ export const userToken = async (config: AppConfig, family: string, deps: LoginDe
 
 type DeviceDeps = LoginDeps & {
   readonly github: string;
+  readonly registry?: Registry;
   readonly open: (url: string) => void;
   readonly print: (line: string) => void;
 };
@@ -211,7 +212,7 @@ const deviceFlowOff = (config: AppConfig, github: string) =>
  */
 export const login = async (family: string, deps: DeviceDeps): Promise<string> => {
   const stage: Stage = "logging in";
-  const config = readConfig(deps.dir, family);
+  const config = readConfig(deps.dir, family, deps.registry ?? REGISTRY);
   const device = await oauthPost(deps.api, stage, "/login/device/code", { client_id: config.client_id });
   if (device.error === "device_flow_disabled") throw new Failure(stage, deviceFlowOff(config, deps.github));
   if (device.error !== undefined) throw new Failure(stage, `GitHub refused the device code request (${errorCode(device.error)})`);
@@ -225,8 +226,12 @@ export const login = async (family: string, deps: DeviceDeps): Promise<string> =
   ) {
     throw new Failure(stage, "invalid response");
   }
-  deps.print(`Open ${verification_uri} and enter ${user_code} to let ${config.slug} act as you.`);
-  deps.open(verification_uri);
+  deps.print(`Open ${verification_uri} in any browser (on this machine or another) and enter ${user_code} to let ${config.slug} act as you.`);
+  try {
+    deps.open(verification_uri);
+  } catch {
+    // A headless machine has no browser to open: the printed URL and code are the path.
+  }
   const deadline = deps.nowSeconds() + (expires_in as number);
   let wait = interval as number;
   for (;;) {

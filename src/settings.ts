@@ -1,22 +1,22 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { readConfig } from "./config.ts";
+import { isConfigured, readConfig, REGISTRY, type Registry } from "./config.ts";
 import { familyNames } from "./family.ts";
 
-/** Families whose App `agent-gh setup` has recorded in `dir`. */
-export const configuredFamilies = (dir: string): string[] =>
-  familyNames().filter((family) => existsSync(join(dir, `${family}.json`)));
+/** Families with an App: recorded locally by `agent-gh setup`, or committed in apps.json. */
+export const configuredFamilies = (dir: string, registry: Registry = REGISTRY): string[] =>
+  familyNames().filter((family) => isConfigured(dir, family, registry));
 
 /**
  * The pages where a family App is changed by hand: GitHub has no API to edit an
  * App's permissions or the repositories an installation may use. The slug comes
- * from the recorded config, since GitHub may have assigned a different one.
+ * from the App's config, since GitHub may have assigned a different one.
  */
-export const settingsLines = (dir: string, family: string, github: string): string[] => {
-  if (!existsSync(join(dir, `${family}.json`))) {
-    return [`${family}: not set up; run \`agent-gh setup ${family}\` in your own terminal`];
+export const settingsLines = (dir: string, family: string, github: string, registry: Registry = REGISTRY): string[] => {
+  if (!isConfigured(dir, family, registry)) {
+    return [
+      `${family}: has no App yet; run \`agent-gh setup ${family}\` on the machine where you create Apps, then commit the registry entry it prints`,
+    ];
   }
-  const { slug } = readConfig(dir, family);
+  const { slug } = readConfig(dir, family, registry);
   return [
     `${family}: ${slug}`,
     `  app settings:      ${github}/settings/apps/${slug}`,

@@ -5,7 +5,7 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build": "bun build src/main.ts --compile --outfile dist/agent-gh",
+    "build": "bun build src/main.ts --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv --outfile dist/agent-gh",
     "install-local": "bun run build && install -m 755 dist/agent-gh \"$HOME/.local/bin/agent-gh\""
   },
   "devDependencies": {

@@ -26,18 +26,16 @@ test("outside an agent session, agent-gh refuses", async () => {
   });
 });
 
-test("without an App, agent-gh names the setup command", async () => {
-  const result = await cli(["pr", "view"], { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1", GH_REPO: "johnrees/penmon" });
-  expect(result.code).toBe(1);
-  expect(result.stderr).toStartWith("agent-gh: reading config failed: no App for claude in ");
-  expect(result.stderr).toContain("run `agent-gh setup claude` in your own terminal");
-});
-
-test("a family without an App names its setup command", async () => {
-  const result = await cli(["pr", "view"], { PI_SESSION_ID: "p", PI_PROVIDER: "zai", PI_MODEL: "glm-4.6", GH_REPO: "johnrees/penmon" });
-  expect(result.code).toBe(1);
-  expect(result.stderr).toContain("no App for glm in ");
-  expect(result.stderr).toContain("run `agent-gh setup glm` in your own terminal");
+test("a family in the registry needs only a login, and is never told to run setup", async () => {
+  for (const [env, family] of [
+    [{ CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1", GH_REPO: "johnrees/penmon" }, "claude"],
+    [{ PI_SESSION_ID: "p", PI_PROVIDER: "zai", PI_MODEL: "glm-4.6", GH_REPO: "johnrees/penmon" }, "glm"],
+  ] as const) {
+    const result = await cli(["pr", "view"], env);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toStartWith(`agent-gh: reading the login failed: no login for ${family}; run \`agent-gh login ${family}\` in your own terminal`);
+    expect(result.stderr).not.toContain("setup");
+  }
 });
 
 test("an IDE terminal's CLAUDECODE is a person, and opencode must declare its model", async () => {
