@@ -29,6 +29,16 @@ export type Registry = Readonly<Record<string, RegistryEntry>>;
  */
 export const REGISTRY: Registry = registryJson;
 
+/**
+ * The read-only App (`johnrees-read`): contents, issues, pull requests,
+ * actions, and checks read, nothing written. It answers git's credential
+ * requests and a person's gh on machines that only run agents, so clones and
+ * reads work there while every write needs a family App through agent-gh. It
+ * is a registry entry, never a model family: nothing publishes or co-authors
+ * as it.
+ */
+export const READ_APP = "read";
+
 export const defaultConfigDir = (): string => join(homedir(), ".config", "agent-gh");
 
 const paths = (dir: string, family: string) => ({

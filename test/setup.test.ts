@@ -31,6 +31,15 @@ test("the manifest asks for exactly the permissions agents need, and no webhook 
   expect("callback_urls" in value).toBe(false);
 });
 
+test("the read App's manifest reads everything a family App can reach and writes nothing", () => {
+  const value = manifest("read", "http://127.0.0.1:5000/callback");
+  expect(value.name).toBe("johnrees-read");
+  expect(value.public).toBe(false);
+  expect(value.default_events).toEqual([]);
+  expect(Object.keys(value.default_permissions)).toEqual(Object.keys(manifest("claude", "x").default_permissions));
+  expect(Object.values(value.default_permissions).every((level) => level === "read")).toBe(true);
+});
+
 const conversion = {
   id: 99,
   slug: "johnrees-codex",

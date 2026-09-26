@@ -24,7 +24,9 @@ export type Stage =
   | "reading the login"
   | "refreshing the login"
   | "starting the child"
-  | "setting up";
+  | "setting up"
+  | "installing the shims"
+  | "reading a credential";
 
 export const describe = (failure: Failure): string =>
   `agent-gh: ${failure.stage} failed: ${failure.detail}. No personal-login fallback was used.`;

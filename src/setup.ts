@@ -1,30 +1,31 @@
 import { randomBytes } from "node:crypto";
-import { hasCredentials, REGISTRY, registryLine, writeCredentials, type AppConfig, type Registry } from "./config.ts";
+import { hasCredentials, READ_APP, REGISTRY, registryLine, writeCredentials, type AppConfig, type Registry } from "./config.ts";
 import { Failure } from "./failure.ts";
 import type { Api } from "./github.ts";
 
+const WRITE = { contents: "write", issues: "write", pull_requests: "write", actions: "read", checks: "read" } as const;
+const READ = { contents: "read", issues: "read", pull_requests: "read", actions: "read", checks: "read" } as const;
+
 /**
- * The App a model family publishes as, whichever harness runs the model: private to John's account, no webhook
- * deliveries, and exactly the permissions agents need to push branches and
- * work issues and pull requests.
+ * An App private to John's account, with no webhook deliveries. A model
+ * family's App (the one its agents publish as, whichever harness runs the
+ * model) gets exactly the permissions agents need to push branches and work
+ * issues and pull requests; the read App (`read`) gets the same areas read only.
  */
 export const manifest = (family: string, redirectUrl: string) => ({
   name: `johnrees-${family}`,
   url: "https://github.com/johnrees",
-  description: `The identity of agents running ${family} models, used through agent-gh.`,
+  description:
+    family === READ_APP
+      ? "Read-only access for git clone and gh reads on machines that only run agents, through agent-gh."
+      : `The identity of agents running ${family} models, used through agent-gh.`,
   public: false,
   // GitHub requires a URL whenever hook_attributes is present; active: false
   // means nothing is ever delivered to it.
   hook_attributes: { url: "https://github.com/johnrees", active: false },
   redirect_url: redirectUrl,
   default_events: [],
-  default_permissions: {
-    contents: "write",
-    issues: "write",
-    pull_requests: "write",
-    actions: "read",
-    checks: "read",
-  },
+  default_permissions: family === READ_APP ? READ : WRITE,
   request_oauth_on_install: false,
   setup_on_update: false,
 });
@@ -119,7 +120,11 @@ export const setup = async (family: string, deps: Setup): Promise<AppConfig> => 
   try {
     const config = await done;
     deps.print(`Created ${config.slug}. Next:`);
-    deps.print(`  1. Install it on each repository agents work in: ${deps.github}/apps/${config.slug}/installations/new`);
+    deps.print(
+      family === READ_APP
+        ? `  1. Install it on every repository you clone on agent machines (it can only read): ${deps.github}/apps/${config.slug}/installations/new`
+        : `  1. Install it on each repository agents work in: ${deps.github}/apps/${config.slug}/installations/new`,
+    );
     deps.print(`  2. Tick "Enable Device Flow" and save (a manifest cannot set it): ${deps.github}/settings/apps/${config.slug}`);
     deps.print(`  3. Run \`agent-gh login ${family}\` to let it act as you.`);
     deps.print(`  4. Add this line to apps.json in the agent-gh repository and commit it, so other machines need only \`agent-gh login ${family}\`:`);

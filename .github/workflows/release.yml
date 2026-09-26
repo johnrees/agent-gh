@@ -1,0 +1,60 @@
+name: Release
+# A v* tag builds agent-gh for every platform install.sh supports and
+# publishes them with SHA256SUMS. All four build on Linux: Bun's darwin
+# cross-compile is ad-hoc signed and runs on macOS (checked on arm64), so no
+# macOS runner or codesign step is needed.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - asset: agent-gh-linux-x64
+            target: bun-linux-x64-baseline
+          - asset: agent-gh-linux-arm64
+            target: bun-linux-arm64
+          - asset: agent-gh-darwin-x64
+            target: bun-darwin-x64-baseline
+          - asset: agent-gh-darwin-arm64
+            target: bun-darwin-arm64
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - run: bun install --frozen-lockfile
+      - name: Build ${{ matrix.asset }}
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          bun build src/main.ts --compile --target="$TARGET" \
+            --no-compile-autoload-bunfig --no-compile-autoload-dotenv \
+            --define "AGENT_GH_VERSION=\"$TAG\"" --outfile "dist/$ASSET"
+      - if: matrix.asset == 'agent-gh-linux-x64'
+        run: test "$(dist/agent-gh-linux-x64 --version)" = "agent-gh ${{ github.ref_name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum agent-gh-* > SHA256SUMS && cat SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/* --repo "${{ github.repository }}" --title "$TAG" --generate-notes

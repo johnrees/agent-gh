@@ -261,3 +261,69 @@ export const login = async (family: string, deps: DeviceDeps): Promise<string> =
     return user.login;
   }
 };
+
+/**
+ * Whether the family's stored login can still act without a new device flow:
+ * present, readable, and its refresh token (if any) not yet expired. An
+ * expired access token is fine; agent-gh refreshes it.
+ */
+export const loginUsable = (dir: string, family: string, now: number): boolean => {
+  try {
+    const stored = readLogin(dir, family);
+    if (stored.refresh_token === null) return stored.expires_at === null || now < stored.expires_at;
+    return stored.refresh_expires_at === null || now < stored.refresh_expires_at;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The families `AGENT_GH_FAMILIES` names, in family order, or undefined when
+ * it is unset (every family). A name no family has is refused, so a typo
+ * never silently skips a login.
+ */
+export const limitedFamilies = (families: readonly string[], limit: string | undefined): string[] | undefined => {
+  if (limit === undefined || limit.trim() === "") return undefined;
+  const wanted = limit.split(",").map((name) => name.trim()).filter((name) => name !== "");
+  const unknown = wanted.filter((name) => !families.includes(name));
+  if (unknown.length > 0) {
+    throw new Failure("logging in", `AGENT_GH_FAMILIES names ${unknown.join(", ")}, which no family is called; use ${families.join(", ")}`);
+  }
+  return families.filter((name) => wanted.includes(name));
+};
+
+/**
+ * The Apps `login --all` covers, in order: each family (or those
+ * `AGENT_GH_FAMILIES` names), then the read App, keeping only the Apps that
+ * exist (`configured`).
+ */
+export const loginTargets = (
+  families: readonly string[],
+  limit: string | undefined,
+  read: string,
+  configured: (name: string) => boolean,
+): string[] => [...(limitedFamilies(families, limit) ?? families), read].filter(configured);
+
+/**
+ * `agent-gh login --all`: a device-flow login for each target not already
+ * usable, one after another. A failed one is reported and the rest still run;
+ * the result lists the failures (empty when every login is usable).
+ */
+export const loginAll = async (targets: readonly string[], deps: DeviceDeps): Promise<string[]> => {
+  const failed: string[] = [];
+  for (const family of targets) {
+    if (loginUsable(deps.dir, family, deps.nowSeconds())) {
+      deps.print(`${family}: already logged in`);
+      continue;
+    }
+    deps.print(`${family}: logging in`);
+    try {
+      await login(family, deps);
+    } catch (error) {
+      if (!(error instanceof Failure)) throw error;
+      deps.print(`${family}: ${error.stage} failed: ${error.detail}`);
+      failed.push(family);
+    }
+  }
+  return failed;
+};
