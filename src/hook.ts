@@ -1,8 +1,11 @@
 /**
- * Finds GitHub writes in a shell command that do not go through agent-gh:
- * the check behind hooks/deny-bare-gh.ts. It is a guard against the easy
- * mistake, not a security boundary: `eval`, aliases, and scripts get past it.
+ * Finds commands that would act as John instead of this agent's bot: GitHub
+ * writes through gh, and git commands that create or rewrite commits or push,
+ * unless they run through agent-gh. The check behind hooks/deny-bare-gh.ts.
+ * It is a guard against the easy mistake, not a security boundary: `eval`,
+ * aliases, and scripts get past it.
  */
+import { subcommand } from "./git.ts";
 
 /** gh subcommands that write, by command group. */
 const GH_WRITES: Readonly<Record<string, readonly string[]>> = {
@@ -16,8 +19,13 @@ const WRITE_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
 const API_FIELDS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
 /** Words that run the next word as the command. */
 const WRAPPERS = new Set(["command", "builtin", "exec", "env", "time", "nohup", "sudo", "xargs"]);
-/** git's global options that take a separate value. */
-const GIT_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"]);
+/**
+ * git subcommands that create or rewrite commits, which a bare git would
+ * author as John, and push, which would publish as John. `--abort` and
+ * `--quit` only stop an operation, so they stay allowed.
+ */
+const GIT_AUTHORS = new Set(["commit", "merge", "pull", "cherry-pick", "revert", "rebase", "am"]);
+const GIT_STOPS = new Set(["--abort", "--quit"]);
 
 /** Splits a command line into simple commands of words, honouring quotes. */
 export const simpleCommands = (line: string): string[][] => {
@@ -108,18 +116,14 @@ const ghWrites = (args: readonly string[]): string | undefined => {
   return undefined;
 };
 
-const gitPushes = (args: readonly string[]): boolean => {
-  let index = 0;
-  while (index < args.length) {
-    const arg = args[index] as string;
-    if (GIT_VALUE_OPTIONS.has(arg)) index += 2;
-    else if (arg.startsWith("-")) index++;
-    else return arg === "push";
-  }
-  return false;
+const gitWrites = (args: readonly string[]): string | undefined => {
+  const name = subcommand(args);
+  if (name === "push") return "git push";
+  if (name !== undefined && GIT_AUTHORS.has(name) && !args.some((arg) => GIT_STOPS.has(arg))) return `git ${name}`;
+  return undefined;
 };
 
-/** The first GitHub write in `line` that skips agent-gh, or undefined. */
+/** The first command in `line` that would act as John, or undefined. */
 export const bareWrite = (line: string): string | undefined => {
   for (const words of simpleCommands(line)) {
     const found = program(words);
@@ -128,10 +132,20 @@ export const bareWrite = (line: string): string | undefined => {
       const write = ghWrites(found.args);
       if (write !== undefined) return write;
     }
-    if (found.name === "git" && gitPushes(found.args)) return "git push";
+    if (found.name === "git") {
+      const write = gitWrites(found.args);
+      if (write !== undefined) return write;
+    }
   }
   return undefined;
 };
 
-export const denyReason = (write: string): string =>
-  `${write} would publish as John. Run GitHub writes through agent-gh so they carry this agent's bot identity: \`agent-gh ${write.replace(/^gh /, "").replace(/ \(a write\)$/, "")} ...\` (git: \`agent-gh git push ...\`).`;
+export const denyReason = (write: string): string => {
+  if (write === "git push") {
+    return "git push would publish as John. Run it through agent-gh so it carries this agent's bot identity: `agent-gh git push ...`.";
+  }
+  if (write.startsWith("git ")) {
+    return `${write} would be authored as John. Run it as \`agent-gh ${write} ...\` so this agent's bot is the author and a commit carries the Agent-* trailers.`;
+  }
+  return `${write} would publish as John. Run GitHub writes through agent-gh so they carry this agent's bot identity: \`agent-gh ${write.replace(/^gh /, "").replace(/ \(a write\)$/, "")} ...\`.`;
+};
