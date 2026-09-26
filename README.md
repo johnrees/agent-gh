@@ -1,14 +1,31 @@
 # agent-gh
 
-Runs `gh` and `git` as the current agent's GitHub App bot, so its issues, comments, commits, and pull requests are attributed to `johnrees-<harness>[bot]` instead of John. One App per harness serves every repository it is installed on; each command gets a fresh token for that one repository, revoked when the command ends. It never falls back to John's login.
+Runs `gh` and `git` as John through the GitHub App of the model family driving the current agent session. GitHub shows each issue, comment, review, and pull request as John with the App's badge (`performed_via_github_app` is `johnrees-<family>`), the way Claude's cloud agent posts. Commits keep John as author and credit the App as co-author. One App per model family (claude, codex, glm, deepseek, kimi, qwen) serves every harness and every repository it is installed on. It never falls back to John's own gh login.
 
 ```sh
-agent-gh pr create --draft --fill      # gh, as the bot
-agent-gh git push -u origin my-branch  # git, as the bot (github.com remotes over HTTPS; SSH is off)
-agent-gh doctor                        # bot login, git author, and repository access
+agent-gh pr create --draft --fill      # gh, as John through the App
+agent-gh git commit -m "..."           # John as author; Agent-* trailers and the App as co-author
+agent-gh git push -u origin my-branch  # github.com remotes over HTTPS; SSH is off
+agent-gh doctor                        # harness, model, family, App; then user, token App, git author, and access
+agent-gh settings claude               # the App's settings, permissions, and repository-access pages
 ```
 
-The harness comes from the environment its tools run in, never from an argument: `CLAUDECODE=1` (Claude Code), `CODEX_THREAD_ID` or `CODEX_SESSION_ID` (Codex), `PI_SESSION_ID` (pi). With none, agent-gh refuses; with two, it refuses as ambiguous. `AGENT_GH_HARNESS` names the harness only on a runner with no harness variable. The repository is gh's `-R`/`--repo`, else `GH_REPO`, else `origin`.
+## Who is acting
+
+agent-gh finds the harness from a variable it sets for its tools, then the model from what that harness reports. It never guesses: signals that disagree, or a model no family claims, are refused.
+
+| Harness | Detected by | Model |
+| --- | --- | --- |
+| Claude Code | `CLAUDECODE=1` with `CLAUDE_CODE_CHILD_SESSION` (an IDE terminal alone is a person) | claude, unless `ANTHROPIC_BASE_URL`'s host or `ANTHROPIC_*_MODEL` name another family; effort from `CLAUDE_EFFORT` |
+| pi | `PI_SESSION_ID` | `PI_MODEL` and `PI_PROVIDER`; effort from `PI_REASONING_LEVEL` |
+| Codex | `CODEX_THREAD_ID` or `CODEX_SESSION_ID` | codex, unless `config.toml` selects another `model_provider`; then the model must be declared |
+| opencode | `OPENCODE_TERMINAL=1` | must be declared |
+
+A session declares its model with `AGENT_GH_MODEL` (and optionally `AGENT_GH_PROVIDER`) only where the harness reports none; where it does, the two must agree. `AGENT_GH_HARNESS` names the harness only on a runner with no harness variable. The repository is gh's `-R`/`--repo`, else `GH_REPO`, else `origin`.
+
+- **opencode** (2.0.16) passes no model to shell commands, and its documented `shell.env` plugin hook is not in the 2.x binary. Start a private server with the model declared, one model per launch: `AGENT_GH_MODEL=zai/glm-4.6 opencode --standalone`. The shared background service keeps the environment it started with, and a model switched mid-session is not seen, so restart after switching.
+- **Codex** with another provider: add `[shell_environment_policy] set = { AGENT_GH_MODEL = "glm-4.6" }` to that config or profile. A profile chosen with `--profile` is invisible to agent-gh unless it declares the model this way.
+- **Claude Code** with another backend: set `ANTHROPIC_BASE_URL` (z.ai, bigmodel, DeepSeek, Moonshot, and DashScope hosts are known) in the environment that launches `claude`. For a gateway serving several families, also set `ANTHROPIC_MODEL` to a concrete model id.
 
 ## Install
 
@@ -16,19 +33,31 @@ The harness comes from the environment its tools run in, never from an argument:
 bun install && bun run install-local   # builds dist/agent-gh and installs ~/.local/bin/agent-gh
 ```
 
-## Set up a harness (once, in your own terminal)
+## Set up a family (once, in your own terminal)
 
 ```sh
-agent-gh setup claude   # then: agent-gh setup codex
+agent-gh setup glm   # or claude, codex, deepseek, kimi, qwen
 ```
 
-This opens a local page that posts an App manifest to GitHub: a private App named `johnrees-<harness>` with contents, issues, and pull requests write, actions and checks read, and no webhook deliveries. After you click **Create**, GitHub hands the credentials back to the local page. agent-gh keeps only the private key and the public identifiers in `~/.config/agent-gh/` (directory 700, files 600). It refuses to run inside an agent session.
+This opens a local page that posts an App manifest to GitHub: a private App named `johnrees-<family>` with contents, issues, and pull requests write, actions and checks read, and no webhook deliveries. After you click **Create**, GitHub hands the credentials back to the local page. agent-gh keeps only the private key and the public identifiers in `~/.config/agent-gh/` (directory 700, files 600). It refuses to run inside an agent session.
 
-Then install the App on each repository agents work in, at the URL setup prints (`https://github.com/apps/johnrees-<harness>/installations/new`, **Only select repositories**). Adding a repository later is a checkbox on that page; no new key. Check it with `agent-gh doctor` from the repository, inside an agent session.
+Then, for each App (`agent-gh settings <family>` prints its pages):
+
+1. Install it on each repository agents work in, at its repository-access page (**Only select repositories**). Adding a repository later is a checkbox there; no new key.
+2. Tick **Enable Device Flow** on its settings page and save. A manifest cannot set it.
+3. Run `agent-gh login <family>`. It prints a code to enter at github.com/login/device, then stores John's user token for that App in `~/.config/agent-gh/<family>.token.json` (mode 600). It refuses to run inside an agent session.
+
+User tokens last 8 hours and refresh for 6 months (unless the App opts out of expiring tokens). agent-gh refreshes a token five minutes before it expires, under a lock so parallel sessions never spend the rotating refresh token twice; a device-flow token refreshes without the client secret, so none is stored. When the refresh token itself expires, run `agent-gh login` again. A user token reaches every repository its App is installed on and John can access; unlike an installation token, it cannot be narrowed to one repository per command, so agent-gh checks with the App's key that the App is installed on the target repository before each GitHub command.
+
+GitHub has no API to change an App's permissions or its repositories, so each App is edited by hand. Check the whole path with `agent-gh doctor` from the repository, inside an agent session.
+
+## Commit trailers
+
+`agent-gh git commit` keeps John's own git author and committer and adds, with `--trailer` (so `-m`, `-F`, `--amend`, and `--no-edit` all work): `Agent-Harness`, plus `Agent-Model` and `Agent-Effort` when the harness reports them, and `Co-authored-by: johnrees-<family>[bot] <id+johnrees-<family>[bot]@users.noreply.github.com>`, so GitHub shows John and the App together. An amend replaces the Agent-* trailers and credits the App only once, keeping other co-authors. They replace Claude Code's `Co-Authored-By` line, which can be turned off with `"attribution": { "commit": "" }`.
 
 ## Claude Code
 
-Allow the command, and deny GitHub writes that skip it. In `~/.claude/settings.json`:
+Allow the command, and deny commands that would skip it and act with John's own login. In `~/.claude/settings.json`:
 
 ```json
 {
@@ -44,8 +73,8 @@ Allow the command, and deny GitHub writes that skip it. In `~/.claude/settings.j
 }
 ```
 
-The hook denies `gh pr|issue|release|repo` writes, `gh api` writes (an explicit write method, fields or input without a method, or a GraphQL mutation), and `git push` unless the command runs through agent-gh. It is a guard against the easy mistake, not a security boundary. Codex does not read Claude Code hooks; repositories that need the rule to bind every harness check authorship in CI.
+The hook denies, unless run through agent-gh: `gh pr|issue|release|repo` writes; `gh api` writes (an explicit write method, fields or input without a method, or a GraphQL mutation); and `git commit`, `merge`, `pull`, `cherry-pick`, `revert`, `rebase`, `am` (except `--abort` and `--quit`), and `push`. Reads such as `git status`, `diff`, `log`, `show`, and `fetch` stay allowed. It is a guard against the easy mistake, not a security boundary. Codex and opencode do not read Claude Code hooks; repositories that need the rule to bind every harness check authorship in CI.
 
 ## Development
 
-`bun test` runs offline against a fake GitHub API; `bun run typecheck`; `bun run build`.
+`bun test` runs offline against a fake GitHub API and real throwaway git repositories; `bun run typecheck`; `bun run build`.

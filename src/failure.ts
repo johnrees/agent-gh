@@ -14,12 +14,15 @@ export class Failure extends Error {
 
 export type Stage =
   | "detecting the harness"
+  | "detecting the model"
   | "resolving the repository"
   | "reading config"
   | "reading key"
   | "signing"
   | "finding the installation"
-  | "requesting the token"
+  | "logging in"
+  | "reading the login"
+  | "refreshing the login"
   | "starting the child"
   | "setting up";
 

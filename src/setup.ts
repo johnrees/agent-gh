@@ -4,14 +4,14 @@ import { Failure } from "./failure.ts";
 import type { Api } from "./github.ts";
 
 /**
- * The App a harness publishes as: private to John's account, no webhook
+ * The App a model family publishes as, whichever harness runs the model: private to John's account, no webhook
  * deliveries, and exactly the permissions agents need to push branches and
  * work issues and pull requests.
  */
-export const manifest = (harness: string, redirectUrl: string) => ({
-  name: `johnrees-${harness}`,
+export const manifest = (family: string, redirectUrl: string) => ({
+  name: `johnrees-${family}`,
   url: "https://github.com/johnrees",
-  description: `The ${harness} agent's identity, used through agent-gh.`,
+  description: `The identity of agents running ${family} models, used through agent-gh.`,
   public: false,
   // GitHub requires a URL whenever hook_attributes is present; active: false
   // means nothing is ever delivered to it.
@@ -47,16 +47,16 @@ type Setup = {
 };
 
 /**
- * Creates `johnrees-<harness>` from a manifest: serves a one-shot page on
+ * Creates `johnrees-<family>` from a manifest: serves a one-shot page on
  * 127.0.0.1 that posts the manifest to GitHub, receives the redirect, converts
  * its code into the App's credentials, and stores only the key and the public
  * identifiers. The client secret and webhook secret are discarded.
  */
-export const setup = async (harness: string, deps: Setup): Promise<AppConfig> => {
-  if (hasCredentials(deps.configDir, harness)) {
+export const setup = async (family: string, deps: Setup): Promise<AppConfig> => {
+  if (hasCredentials(deps.configDir, family)) {
     throw new Failure(
       "setting up",
-      `an App for ${harness} is already configured in ${deps.configDir}; remove ${harness}.json and ${harness}.pem first to create another`,
+      `an App for ${family} is already configured in ${deps.configDir}; remove ${family}.json and ${family}.pem first to create another`,
     );
   }
   const state = randomBytes(24).toString("hex");
@@ -76,8 +76,8 @@ export const setup = async (harness: string, deps: Setup): Promise<AppConfig> =>
         const action = `${deps.github}/settings/apps/new?state=${state}`;
         return page(
           `<form method="post" action="${escape(action)}"><input type="hidden" name="manifest" value="${escape(
-            JSON.stringify(manifest(harness, redirect)),
-          )}"><p>Create the <b>johnrees-${escape(harness)}</b> GitHub App.</p><button>Continue to GitHub</button></form><script>document.forms[0].submit()</script>`,
+            JSON.stringify(manifest(family, redirect)),
+          )}"><p>Create the <b>johnrees-${escape(family)}</b> GitHub App.</p><button>Continue to GitHub</button></form><script>document.forms[0].submit()</script>`,
         );
       }
       if (url.pathname !== "/callback" || finished) return new Response("Not found", { status: 404 });
@@ -87,7 +87,7 @@ export const setup = async (harness: string, deps: Setup): Promise<AppConfig> =>
       }
       finished = true;
       try {
-        const config = await convert(deps, harness, code);
+        const config = await convert(deps, family, code);
         settle.resolve(config);
         return page(`<p>Created ${escape(config.slug)}. Return to the terminal to install it on repositories.</p>`);
       } catch (error) {
@@ -100,7 +100,7 @@ export const setup = async (harness: string, deps: Setup): Promise<AppConfig> =>
   });
   port = server.port ?? 0;
   const local = `http://127.0.0.1:${port}/`;
-  deps.print(`Opening ${local} to create johnrees-${harness}. If no browser opens, visit it yourself.`);
+  deps.print(`Opening ${local} to create johnrees-${family}. If no browser opens, visit it yourself.`);
   deps.open(local);
   const timer = setTimeout(
     () => settle.reject(new Failure("setting up", "no reply from GitHub before the setup timed out")),
@@ -108,8 +108,10 @@ export const setup = async (harness: string, deps: Setup): Promise<AppConfig> =>
   );
   try {
     const config = await done;
-    deps.print(`Created ${config.slug}. Install it on each repository agents work in:`);
-    deps.print(`  https://github.com/apps/${config.slug}/installations/new`);
+    deps.print(`Created ${config.slug}. Next:`);
+    deps.print(`  1. Install it on each repository agents work in: ${deps.github}/apps/${config.slug}/installations/new`);
+    deps.print(`  2. Tick "Enable Device Flow" and save (a manifest cannot set it): ${deps.github}/settings/apps/${config.slug}`);
+    deps.print(`  3. Run \`agent-gh login ${family}\` to let it act as you.`);
     return config;
   } finally {
     clearTimeout(timer);
@@ -118,7 +120,7 @@ export const setup = async (harness: string, deps: Setup): Promise<AppConfig> =>
   }
 };
 
-const convert = async (deps: Setup, harness: string, code: string): Promise<AppConfig> => {
+const convert = async (deps: Setup, family: string, code: string): Promise<AppConfig> => {
   const post = await fetchJson(deps.api, `/app-manifests/${code}/conversions`, "POST");
   const { id, slug, client_id, pem } = post;
   if (!Number.isSafeInteger(id) || typeof slug !== "string" || typeof client_id !== "string" || typeof pem !== "string") {
@@ -133,7 +135,7 @@ const convert = async (deps: Setup, harness: string, code: string): Promise<AppC
     bot_login: `${slug}[bot]`,
     bot_user_id: user.id as number,
   };
-  writeCredentials(deps.configDir, harness, config, pem);
+  writeCredentials(deps.configDir, family, config, pem);
   return config;
 };
 

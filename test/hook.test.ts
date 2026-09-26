@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { bareWrite } from "../src/hook.ts";
 
-test("bare GitHub writes are found wherever they sit in a command line", () => {
+test("bare GitHub writes and commit-making git are found wherever they sit in a command line", () => {
   const denied: [string, string][] = [
     ["gh pr create --draft --title x", "gh pr create"],
     ["gh pr edit 3 --body y", "gh pr edit"],
@@ -31,6 +31,18 @@ test("bare GitHub writes are found wherever they sit in a command line", () => {
     ["/opt/homebrew/bin/gh pr merge 1", "gh pr merge"],
     ["echo $(gh pr create --fill)", "gh pr create"],
     ["git status\ngit push", "git push"],
+    ["git commit -m 'git push later'", "git commit"],
+    ["git -C /r commit --amend --no-edit", "git commit"],
+    ["git -c core.hooksPath=/dev/null commit -am x", "git commit"],
+    ["git merge feature", "git merge"],
+    ["git merge --continue", "git merge"],
+    ["git pull --rebase", "git pull"],
+    ["git cherry-pick abc123", "git cherry-pick"],
+    ["git revert HEAD", "git revert"],
+    ["git rebase -i main", "git rebase"],
+    ["git rebase --continue", "git rebase"],
+    ["git am < fix.patch", "git am"],
+    ["cargo test && git commit -m done", "git commit"],
   ];
   for (const [command, write] of denied) expect([command, bareWrite(command)]).toEqual([command, write]);
 });
@@ -48,7 +60,17 @@ test("reads, agent-gh, and mentions are allowed", () => {
     "cd x && agent-gh issue comment 1 -b ok",
     "echo 'gh pr create'",
     "git log --oneline",
-    "git commit -m 'git push later'",
+    "git status",
+    "git diff --stat",
+    "git show HEAD",
+    "git fetch origin",
+    "git branch -a",
+    "git worktree list",
+    "git merge --abort",
+    "git rebase --abort",
+    "git cherry-pick --quit",
+    "agent-gh git commit -m 'git push later'",
+    "agent-gh git rebase main",
     "rg 'gh pr merge' docs",
   ]) {
     expect([command, bareWrite(command)]).toEqual([command, undefined]);
@@ -76,6 +98,12 @@ test("the hook script denies with Claude Code's PreToolUse decision", async () =
   expect(output.hookEventName).toBe("PreToolUse");
   expect(output.permissionDecision).toBe("deny");
   expect(output.permissionDecisionReason).toContain("agent-gh pr create");
+
+  const commit = await hook(JSON.stringify({ tool_name: "Bash", tool_input: { command: "git commit -m x" } }));
+  const commitReason = JSON.parse(commit.stdout).hookSpecificOutput.permissionDecisionReason;
+  expect(commitReason).toBe(
+    "git commit would not credit this agent. Run it as `agent-gh git commit ...` so a commit carries the Agent-* trailers and the family App as co-author.",
+  );
 
   const allowed = await hook(JSON.stringify({ tool_name: "Bash", tool_input: { command: "agent-gh pr create" } }));
   expect([allowed.code, allowed.stdout]).toEqual([0, ""]);

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Failure } from "./failure.ts";
 
-/** What `agent-gh setup` records for one harness's App. No secret lives here. */
+/** What `agent-gh setup` records for one model family's App. No secret lives here. */
 export type AppConfig = {
   readonly client_id: string;
   readonly app_id: number;
@@ -14,9 +14,9 @@ export type AppConfig = {
 
 export const defaultConfigDir = (): string => join(homedir(), ".config", "agent-gh");
 
-const paths = (dir: string, harness: string) => ({
-  config: join(dir, `${harness}.json`),
-  key: join(dir, `${harness}.pem`),
+const paths = (dir: string, family: string) => ({
+  config: join(dir, `${family}.json`),
+  key: join(dir, `${family}.pem`),
 });
 
 const code = (error: unknown): string =>
@@ -36,8 +36,8 @@ const isConfig = (value: unknown): value is AppConfig => {
   );
 };
 
-export const readConfig = (dir: string, harness: string): AppConfig => {
-  const path = paths(dir, harness).config;
+export const readConfig = (dir: string, family: string): AppConfig => {
+  const path = paths(dir, family).config;
   let text: string;
   try {
     text = readFileSync(path, "utf8");
@@ -45,7 +45,7 @@ export const readConfig = (dir: string, harness: string): AppConfig => {
     if (code(error) === "ENOENT") {
       throw new Failure(
         "reading config",
-        `no App for ${harness} in ${dir}; run \`agent-gh setup ${harness}\` in your own terminal`,
+        `no App for ${family} in ${dir}; run \`agent-gh setup ${family}\` in your own terminal`,
       );
     }
     throw new Failure("reading config", `${path} could not be read (${code(error)})`);
@@ -61,8 +61,8 @@ export const readConfig = (dir: string, harness: string): AppConfig => {
 };
 
 /** The App's private key. The caller zeroes the buffer once it has signed. */
-export const readKey = (dir: string, harness: string): Buffer => {
-  const path = paths(dir, harness).key;
+export const readKey = (dir: string, family: string): Buffer => {
+  const path = paths(dir, family).key;
   let mode: number;
   try {
     mode = statSync(path).mode;
@@ -70,7 +70,7 @@ export const readKey = (dir: string, harness: string): Buffer => {
     if (code(error) === "ENOENT") {
       throw new Failure(
         "reading key",
-        `no private key for ${harness} in ${dir}; run \`agent-gh setup ${harness}\` in your own terminal`,
+        `no private key for ${family} in ${dir}; run \`agent-gh setup ${family}\` in your own terminal`,
       );
     }
     throw new Failure("reading key", `${path} could not be read (${code(error)})`);
@@ -85,14 +85,14 @@ export const readKey = (dir: string, harness: string): Buffer => {
   }
 };
 
-export const hasCredentials = (dir: string, harness: string): boolean => {
-  const { config, key } = paths(dir, harness);
+export const hasCredentials = (dir: string, family: string): boolean => {
+  const { config, key } = paths(dir, family);
   return existsSync(config) || existsSync(key);
 };
 
 /** Writes a new App's key and config: directory 700, files 600, never overwriting. */
-export const writeCredentials = (dir: string, harness: string, config: AppConfig, pem: string): void => {
-  const { config: configPath, key } = paths(dir, harness);
+export const writeCredentials = (dir: string, family: string, config: AppConfig, pem: string): void => {
+  const { config: configPath, key } = paths(dir, family);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
   writeFileSync(key, pem, { mode: 0o600, flag: "wx" });

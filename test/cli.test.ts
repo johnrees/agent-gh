@@ -27,14 +27,28 @@ test("outside an agent session, agent-gh refuses", async () => {
 });
 
 test("without an App, agent-gh names the setup command", async () => {
-  const result = await cli(["pr", "view"], { CLAUDECODE: "1", GH_REPO: "johnrees/penmon" });
+  const result = await cli(["pr", "view"], { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1", GH_REPO: "johnrees/penmon" });
   expect(result.code).toBe(1);
   expect(result.stderr).toStartWith("agent-gh: reading config failed: no App for claude in ");
   expect(result.stderr).toContain("run `agent-gh setup claude` in your own terminal");
 });
 
-test("agents cannot run setup", async () => {
-  const result = await cli(["setup", "claude"], { CODEX_THREAD_ID: "t" });
+test("a family without an App names its setup command", async () => {
+  const result = await cli(["pr", "view"], { PI_SESSION_ID: "p", PI_PROVIDER: "zai", PI_MODEL: "glm-4.6", GH_REPO: "johnrees/penmon" });
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("no App for glm in ");
+  expect(result.stderr).toContain("run `agent-gh setup glm` in your own terminal");
+});
+
+test("an IDE terminal's CLAUDECODE is a person, and opencode must declare its model", async () => {
+  expect((await cli(["pr", "view"], { CLAUDECODE: "1" })).stderr).toContain("no agent harness detected");
+  const opencode = await cli(["pr", "view"], { OPENCODE_TERMINAL: "1", GH_REPO: "johnrees/penmon" });
+  expect(opencode.code).toBe(1);
+  expect(opencode.stderr).toStartWith("agent-gh: detecting the model failed: opencode does not tell shell commands which model runs");
+});
+
+test("agents cannot run setup, for any family", async () => {
+  const result = await cli(["setup", "glm"], { CODEX_THREAD_ID: "t" });
   expect(result).toEqual({
     code: 1,
     stderr:
@@ -42,8 +56,22 @@ test("agents cannot run setup", async () => {
   });
 });
 
-test("an unknown harness for setup prints usage", async () => {
-  const result = await cli(["setup", "copilot"], {});
+test("an agent cannot authorize itself to act as John", async () => {
+  for (const env of [{ CODEX_THREAD_ID: "t" }, { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1" }, { PI_SESSION_ID: "p" }]) {
+    expect(await cli(["login", "claude"], env)).toEqual({
+      code: 1,
+      stderr:
+        "agent-gh: logging in failed: an agent cannot authorize itself to act as John; run `agent-gh login` in your own terminal. No personal-login fallback was used.",
+    });
+  }
+  const unknown = await cli(["login", "mistral"], {});
+  expect(unknown.code).toBe(1);
+  expect(unknown.stderr).toStartWith("usage:");
+});
+
+test("an unknown family for setup prints usage listing the families", async () => {
+  const result = await cli(["setup", "mistral"], {});
   expect(result.code).toBe(1);
   expect(result.stderr).toStartWith("usage:");
+  expect(result.stderr).toContain("(claude, codex, glm, deepseek, kimi, qwen)");
 });
