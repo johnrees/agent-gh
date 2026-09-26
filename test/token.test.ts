@@ -22,7 +22,7 @@ const setup = (routes: Record<string, (body: string) => Response> = HAPPY) => {
   const out = join(mkdtempSync(join(tmpdir(), "agent-gh-out-")), "env.json");
   const warnings: string[] = [];
   const context: Context = {
-    harness: "claude",
+    identity: { harness: "claude", family: "claude" },
     repo: { owner: "johnrees", name: "penmon" },
     env: { PATH: process.env.PATH, OUT: out, GH_DEBUG: "api", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "a.b", GIT_CONFIG_VALUE_0: "c" },
     api: fake.api,
@@ -170,7 +170,7 @@ group("every failure names its stage and carries no secret", () => {
 
   test("no config tells John to run setup", async () => {
     const { context } = setup();
-    const error = await failure(runAs({ ...context, harness: "codex" }, recorder()));
+    const error = await failure(runAs({ ...context, identity: { harness: "codex", family: "codex" } }, recorder()));
     expect(error.stage).toBe("reading config");
     expect(error.detail).toContain("run `agent-gh setup codex` in your own terminal");
   });

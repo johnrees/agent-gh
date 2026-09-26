@@ -1,17 +1,19 @@
 #!/usr/bin/env bun
 /**
- * agent-gh: run gh or git as the current agent harness's GitHub App bot.
+ * agent-gh: run gh or git as the GitHub App bot of the model family driving
+ * this agent session (johnrees-<family>), whatever harness runs it.
  *
  *   agent-gh <gh arguments...>     gh as the bot, e.g. agent-gh pr create --draft
  *   agent-gh git <git arguments...>
- *   agent-gh doctor                check login, git author, and repository access
- *   agent-gh setup <harness>       create johnrees-<harness> (run in your own terminal)
+ *   agent-gh doctor                who is acting, then login, git author, and repository access
+ *   agent-gh setup <family>        create johnrees-<family> (run in your own terminal)
  */
 import { defaultConfigDir } from "./config.ts";
 import { doctor } from "./doctor.ts";
 import { describe, Failure } from "./failure.ts";
 import { GITHUB } from "./github.ts";
-import { detectHarness, harnessNames, HARNESSES } from "./harness.ts";
+import { familyNames } from "./family.ts";
+import { detectIdentity, inAgentSession } from "./harness.ts";
 import { originUrl, resolveRepo } from "./repo.ts";
 import { type Context, runAs } from "./run.ts";
 import { setup } from "./setup.ts";
@@ -19,8 +21,8 @@ import { setup } from "./setup.ts";
 const USAGE = `usage:
   agent-gh <gh arguments...>        run gh as this agent's bot
   agent-gh git <git arguments...>   run git as this agent's bot
-  agent-gh doctor                   check the bot's login, git author, and repository access
-  agent-gh setup <harness>          create johnrees-<harness> (${harnessNames().join(", ")}); run it yourself, not from an agent`;
+  agent-gh doctor                   show who is acting, then check login, git author, and repository access
+  agent-gh setup <family>           create johnrees-<family> (${familyNames().join(", ")}); run it yourself, not from an agent`;
 
 const main = async (argv: readonly string[]): Promise<number> => {
   const [first, ...rest] = argv;
@@ -30,15 +32,15 @@ const main = async (argv: readonly string[]): Promise<number> => {
   }
   const env = process.env;
   if (first === "setup") {
-    const [harness] = rest;
-    if (harness === undefined || !harnessNames().includes(harness) || rest.length !== 1) {
+    const [family] = rest;
+    if (family === undefined || !familyNames().includes(family) || rest.length !== 1) {
       console.error(USAGE);
       return 1;
     }
-    if (HARNESSES.some((known) => known.detect(env))) {
+    if (inAgentSession(env)) {
       throw new Failure("setting up", "agents do not create their own credentials; run `agent-gh setup` in your own terminal");
     }
-    await setup(harness, {
+    await setup(family, {
       configDir: defaultConfigDir(),
       api: GITHUB,
       github: "https://github.com",
@@ -54,11 +56,11 @@ const main = async (argv: readonly string[]): Promise<number> => {
     });
     return 0;
   }
-  const harness = detectHarness(env);
+  const identity = detectIdentity(env);
   const [command, args] =
     first === "git" ? (["git", rest] as const) : first === "gh" ? (["gh", rest] as const) : (["gh", argv] as const);
   const context: Context = {
-    harness,
+    identity,
     repo: await resolveRepo(first === "doctor" ? "git" : command, args, env, () => originUrl(process.cwd())),
     env,
     api: GITHUB,

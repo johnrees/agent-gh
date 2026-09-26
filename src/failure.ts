@@ -14,6 +14,7 @@ export class Failure extends Error {
 
 export type Stage =
   | "detecting the harness"
+  | "detecting the model"
   | "resolving the repository"
   | "reading config"
   | "reading key"

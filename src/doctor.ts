@@ -4,13 +4,19 @@ import { type Context, withToken } from "./run.ts";
 import { slug } from "./repo.ts";
 
 /**
- * One check of the whole path: the bot's login through gh, its git author,
- * and git access to the repository, all with one token. Exit 0 only if all hold.
+ * One check of the whole path: who is acting (harness, model, family, bot),
+ * then the bot's login through gh, its git author, and git access to the
+ * repository, all with one token. Exit 0 only if all hold.
  */
 export const doctor = async (context: Context, print: (line: string) => void): Promise<number> => {
-  print(`harness: ${context.harness}`);
+  const { identity } = context;
+  print(`harness: ${identity.harness}`);
+  print(`model: ${identity.model ?? "not reported"}`);
+  if (identity.effort !== undefined) print(`effort: ${identity.effort}`);
+  print(`family: ${identity.family}`);
   print(`repository: ${slug(context.repo)}`);
   return withToken(context, async (env, config) => {
+    print(`bot: ${config.bot_login}`);
     const login = await runChild(
       ["gh", "api", "graphql", "-f", "query={ viewer { login } }", "--jq", ".data.viewer.login"],
       env,
