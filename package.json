@@ -1,0 +1,15 @@
+{
+  "name": "agent-gh",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/main.ts --compile --outfile dist/agent-gh",
+    "install-local": "bun run build && install -m 755 dist/agent-gh \"$HOME/.local/bin/agent-gh\""
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "7.0.2"
+  }
+}
