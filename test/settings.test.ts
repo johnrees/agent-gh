@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REGISTRY } from "../src/config.ts";
+import { READ_APP, REGISTRY } from "../src/config.ts";
 import { familyNames } from "../src/family.ts";
 import { configuredFamilies, settingsLines } from "../src/settings.ts";
 
@@ -47,9 +47,9 @@ test("settings prints a family's pages from its recorded slug", async () => {
 test("settings without a family lists every family with an App, local or in the registry", async () => {
   const result = await settings([], { claude: "johnrees-claude" });
   expect(result.code).toBe(0);
-  const expected = familyNames()
-    .filter((family) => family === "claude" || Object.hasOwn(REGISTRY, family))
-    .map((family) => `${family}: ${family === "claude" ? "johnrees-claude" : REGISTRY[family]?.slug}`);
+  const expected = [...familyNames(), READ_APP]
+    .filter((app) => app === "claude" || Object.hasOwn(REGISTRY, app))
+    .map((app) => `${app}: ${app === "claude" ? "johnrees-claude" : REGISTRY[app]?.slug}`);
   expect(result.stdout.filter((line) => !line.startsWith(" "))).toEqual(expected);
 });
 

@@ -24,8 +24,8 @@ const WRAPPERS = new Set(["command", "builtin", "exec", "env", "time", "nohup", 
  * author as John, and push, which would publish as John. `--abort` and
  * `--quit` only stop an operation, so they stay allowed.
  */
-const GIT_AUTHORS = new Set(["commit", "merge", "pull", "cherry-pick", "revert", "rebase", "am"]);
-const GIT_STOPS = new Set(["--abort", "--quit"]);
+export const GIT_AUTHORS = new Set(["commit", "merge", "pull", "cherry-pick", "revert", "rebase", "am"]);
+export const GIT_STOPS = new Set(["--abort", "--quit"]);
 
 /** Splits a command line into simple commands of words, honouring quotes. */
 export const simpleCommands = (line: string): string[][] => {

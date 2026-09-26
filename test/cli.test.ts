@@ -71,5 +71,5 @@ test("an unknown family for setup prints usage listing the families", async () =
   const result = await cli(["setup", "mistral"], {});
   expect(result.code).toBe(1);
   expect(result.stderr).toStartWith("usage:");
-  expect(result.stderr).toContain("(claude, codex, glm, deepseek, kimi, qwen)");
+  expect(result.stderr).toContain("(claude, codex, glm, deepseek, kimi, qwen, or read)");
 });

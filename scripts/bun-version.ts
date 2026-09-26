@@ -1,7 +1,7 @@
 /**
  * Why a machine's Bun cannot build agent-gh, or undefined when it can. The
  * lockfile and the compiled binary are pinned to one Bun; another version
- * rewrites bun.lock (seen on skull with Arch's bun 1.4.0).
+ * rewrites bun.lock (seen with Arch's bun 1.4.0).
  */
 export const bunVersionProblem = (actual: string, pinned: string): string | undefined =>
   actual === pinned

@@ -16,6 +16,8 @@ test("the compiled binary ignores the working directory's bunfig.toml and .env",
   const build = packageJson.scripts.build.split(" ");
   expect(build).toContain("--no-compile-autoload-bunfig");
   expect(build).toContain("--no-compile-autoload-dotenv");
+  const release = await Bun.file(join(root, ".github", "workflows", "release.yml")).text();
+  expect(release).toContain("--no-compile-autoload-bunfig --no-compile-autoload-dotenv");
   const out = join(mkdtempSync(join(tmpdir(), "agent-gh-bin-")), "agent-gh");
   const compile = Bun.spawnSync([process.execPath, ...build.slice(1).filter((arg) => arg !== "dist/agent-gh"), out], {
     cwd: root,

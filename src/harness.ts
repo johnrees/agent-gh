@@ -6,9 +6,13 @@ import { familyNames, familyOfHost, familyOfModel, familyOfProvider } from "./fa
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
+/** One variable: set (not blank), or exactly `equals`. */
+export type Condition = { readonly name: string; readonly equals?: string };
+
 type Harness = {
   readonly name: string;
-  readonly detect: (env: Env) => boolean;
+  /** Matches when every condition of any one rule holds. Data, so the gh and git shims test the same thing. */
+  readonly rules: readonly (readonly Condition[])[];
   /** Where the harness sets the variable, so the rule can be rechecked. */
   readonly source: string;
 };
@@ -25,32 +29,38 @@ export const HARNESSES: readonly Harness[] = [
     // IDE extensions also set CLAUDECODE=1 in their integrated terminals, so
     // a person typing there is not an agent: CLAUDE_CODE_CHILD_SESSION marks a
     // process a tool call or hook started (code.claude.com/docs/en/env-vars).
-    detect: (env) => env.CLAUDECODE === "1" && set(env.CLAUDE_CODE_CHILD_SESSION),
+    rules: [[{ name: "CLAUDECODE", equals: "1" }, { name: "CLAUDE_CODE_CHILD_SESSION" }]],
     source: "Claude Code: CLAUDECODE=1 and CLAUDE_CODE_CHILD_SESSION in tool and hook subprocesses",
   },
   {
     name: "codex",
-    detect: (env) => set(env.CODEX_THREAD_ID) || set(env.CODEX_SESSION_ID),
+    rules: [[{ name: "CODEX_THREAD_ID" }], [{ name: "CODEX_SESSION_ID" }]],
     source:
       "openai/codex codex-rs/protocol/src/shell_environment.rs:7,152 (CODEX_THREAD_ID) and codex-rs/core/src/exec_env.rs:42 (CODEX_SESSION_ID)",
   },
   {
     name: "pi",
-    detect: (env) => set(env.PI_SESSION_ID),
+    rules: [[{ name: "PI_SESSION_ID" }]],
     source: "pi packages/coding-agent/src/core/tools/bash.ts:180 (PI_SESSION_ID, with PI_MODEL and PI_PROVIDER)",
   },
   {
     name: "opencode",
-    detect: (env) => env.OPENCODE_TERMINAL === "1",
+    rules: [[{ name: "OPENCODE_TERMINAL", equals: "1" }]],
     source: "opencode 2.0.16: its shell and PTY environments set OPENCODE_TERMINAL=1",
   },
   // TODO kimi: add once the variable Kimi's CLI sets for its shell tool is found in its source.
 ];
 
+const holds = (env: Env, condition: Condition): boolean =>
+  condition.equals === undefined ? set(env[condition.name]) : env[condition.name] === condition.equals;
+
+export const detects = (harness: Harness, env: Env): boolean =>
+  harness.rules.some((rule) => rule.every((condition) => holds(env, condition)));
+
 export const harnessNames = (): string[] => HARNESSES.map((harness) => harness.name);
 
 /** True inside any agent harness's tool process: setup refuses there. */
-export const inAgentSession = (env: Env): boolean => HARNESSES.some((harness) => harness.detect(env));
+export const inAgentSession = (env: Env): boolean => HARNESSES.some((harness) => detects(harness, env));
 
 /**
  * The harness this process runs under. `AGENT_GH_HARNESS` names one only when
@@ -58,7 +68,7 @@ export const inAgentSession = (env: Env): boolean => HARNESSES.some((harness) =>
  * detected harness.
  */
 export const detectHarness = (env: Env): string => {
-  const matched = HARNESSES.filter((harness) => harness.detect(env)).map((harness) => harness.name);
+  const matched = HARNESSES.filter((harness) => detects(harness, env)).map((harness) => harness.name);
   const named = env.AGENT_GH_HARNESS;
   if (matched.length > 1) {
     throw new Failure(
