@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readConfig, REGISTRY } from "../src/config.ts";
+import { READ_APP, readConfig, REGISTRY } from "../src/config.ts";
 import { familyNames } from "../src/family.ts";
 
-test("every registry entry names a family the family table knows", () => {
-  for (const family of Object.keys(REGISTRY)) expect(familyNames()).toContain(family);
+test("every registry entry names a family the family table knows, or the read App", () => {
+  for (const name of Object.keys(REGISTRY)) expect([...familyNames(), READ_APP]).toContain(name);
 });
 
 test("every registry entry is a usable App: public identifiers only", () => {
