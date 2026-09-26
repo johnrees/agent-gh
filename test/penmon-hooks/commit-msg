@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Installed with `git config core.hooksPath .githooks`. agent-gh
+# (johnrees/agent-gh#5) refuses a commit an agent session would make as
+# John; git runs this hook whichever tool commits.
+command -v agent-gh > /dev/null || exit 0
+exec agent-gh guard commit-msg "$1"

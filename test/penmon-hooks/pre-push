@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Installed with `git config core.hooksPath .githooks`. A push is not the
+# end of a change: its PR's checks are.
+branch=$(git branch --show-current)
+cat >&2 << MESSAGE
+pre-push: open or update the draft PR for ${branch:-this push}:
+  gh pr create --draft
+CI skips drafts and runs once the reviewer marks the PR ready (never mark
+your own). Then watch the current head's checks until they pass:
+  gh pr checks <number> --watch
+MESSAGE
+
+# agent-gh (johnrees/agent-gh#5) refuses a push an agent session would make
+# as John; git runs this hook whichever tool pushes.
+command -v agent-gh > /dev/null || exit 0
+exec agent-gh guard pre-push
