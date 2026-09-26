@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { hasCredentials, writeCredentials, type AppConfig } from "./config.ts";
+import { hasCredentials, REGISTRY, registryLine, writeCredentials, type AppConfig, type Registry } from "./config.ts";
 import { Failure } from "./failure.ts";
 import type { Api } from "./github.ts";
 
@@ -39,6 +39,8 @@ const page = (body: string) =>
 
 type Setup = {
   readonly configDir: string;
+  /** The committed App registry; tests pass their own. */
+  readonly registry?: Registry;
   readonly api: Api;
   readonly github: string;
   readonly open: (url: string) => void;
@@ -50,9 +52,17 @@ type Setup = {
  * Creates `johnrees-<family>` from a manifest: serves a one-shot page on
  * 127.0.0.1 that posts the manifest to GitHub, receives the redirect, converts
  * its code into the App's credentials, and stores only the key and the public
- * identifiers. The client secret and webhook secret are discarded.
+ * identifiers. The client secret and webhook secret are discarded. A family
+ * already in the committed registry is refused: setup would make a second App.
  */
 export const setup = async (family: string, deps: Setup): Promise<AppConfig> => {
+  const registry = deps.registry ?? REGISTRY;
+  if (Object.hasOwn(registry, family)) {
+    throw new Failure(
+      "setting up",
+      `${registry[family]?.slug ?? family} already exists (it is in apps.json); run \`agent-gh login ${family}\` on this machine instead`,
+    );
+  }
   if (hasCredentials(deps.configDir, family)) {
     throw new Failure(
       "setting up",
@@ -112,6 +122,8 @@ export const setup = async (family: string, deps: Setup): Promise<AppConfig> => 
     deps.print(`  1. Install it on each repository agents work in: ${deps.github}/apps/${config.slug}/installations/new`);
     deps.print(`  2. Tick "Enable Device Flow" and save (a manifest cannot set it): ${deps.github}/settings/apps/${config.slug}`);
     deps.print(`  3. Run \`agent-gh login ${family}\` to let it act as you.`);
+    deps.print(`  4. Add this line to apps.json in the agent-gh repository and commit it, so other machines need only \`agent-gh login ${family}\`:`);
+    deps.print(`     ${registryLine(family, config)}`);
     return config;
   } finally {
     clearTimeout(timer);

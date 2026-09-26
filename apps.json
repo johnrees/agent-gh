@@ -1,0 +1,38 @@
+{
+  "claude": {
+    "slug": "johnrees-claude",
+    "app_id": 5085898,
+    "client_id": "Iv23liz8JWqEZ7eOGHSn",
+    "bot_user_id": 334194033
+  },
+  "codex": {
+    "slug": "johnrees-codex",
+    "app_id": 5085906,
+    "client_id": "Iv23liUkBrBGwbRrY6eP",
+    "bot_user_id": 334194238
+  },
+  "deepseek": {
+    "slug": "johnrees-deepseek",
+    "app_id": 5086107,
+    "client_id": "Iv23liGkdXw49vRY4REl",
+    "bot_user_id": 334201257
+  },
+  "glm": {
+    "slug": "johnrees-glm",
+    "app_id": 5086103,
+    "client_id": "Iv23liU5yOS8pQGbmHzs",
+    "bot_user_id": 334201061
+  },
+  "kimi": {
+    "slug": "johnrees-kimi",
+    "app_id": 5086116,
+    "client_id": "Iv23liW7Mr0YS7GUv3Jz",
+    "bot_user_id": 334201504
+  },
+  "qwen": {
+    "slug": "johnrees-qwen",
+    "app_id": 5086113,
+    "client_id": "Iv23liqP9wTztBMJvhOX",
+    "bot_user_id": 334201377
+  }
+}

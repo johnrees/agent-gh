@@ -83,7 +83,11 @@ export const oauthPost = async (
 export const errorCode = (value: unknown): string =>
   typeof value === "string" && /^[a-z_]{1,40}$/.test(value) ? value : "an unrecognised error";
 
-/** A GitHub App JWT: RS256, issued by the App's client ID, valid for nine minutes. */
+/**
+ * A GitHub App JWT: RS256, issued by the App's client ID, valid for nine
+ * minutes. For App-level requests only (the planned `audit`); everyday
+ * commands authenticate with John's user token.
+ */
 export const appJwt = (config: AppConfig, key: Buffer, nowSeconds: number): string => {
   try {
     const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -98,34 +102,87 @@ export const appJwt = (config: AppConfig, key: Buffer, nowSeconds: number): stri
   }
 };
 
+const PER_PAGE = 100;
+const MAX_PAGES = 50;
+
 /**
- * Refuses up front when the family's App is not installed on the repository.
- * A user token only reaches repositories its App is installed on, and gh's own
- * error for that case does not say why. Checked with the App's JWT; the key
- * buffer is zeroed whatever happens.
+ * Walks one of the user-token list endpoints page by page until `match` finds
+ * an item or the list ends. A 401 means GitHub no longer accepts the login.
+ */
+const findInPages = async (
+  api: Api,
+  stage: Stage,
+  path: string,
+  token: string,
+  field: "installations" | "repositories",
+  match: (item: Record<string, unknown>) => boolean,
+  relogin: string,
+): Promise<Record<string, unknown> | undefined> => {
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const response = await get(api, stage, `${path}?per_page=${PER_PAGE}&page=${page}`, token);
+    if (response.status === 401) throw new Failure(stage, `GitHub refused the stored login (HTTP 401); ${relogin}`);
+    if (!response.ok) throw new Failure(stage, `HTTP ${response.status}`);
+    const body = await json(response, stage);
+    const items = body[field];
+    const total = body.total_count;
+    if (!Array.isArray(items) || !Number.isSafeInteger(total)) throw new Failure(stage, "invalid response");
+    const hit = items.find(
+      (item): item is Record<string, unknown> => typeof item === "object" && item !== null && match(item as Record<string, unknown>),
+    );
+    if (hit !== undefined) return hit;
+    if (items.length < PER_PAGE || page * PER_PAGE >= (total as number)) return undefined;
+  }
+  throw new Failure(stage, `gave up after ${MAX_PAGES * PER_PAGE} results`);
+};
+
+const fullName = (item: Record<string, unknown>): string | undefined => {
+  if (typeof item.full_name === "string") return item.full_name;
+  const owner = item.owner;
+  const login = typeof owner === "object" && owner !== null ? (owner as Record<string, unknown>).login : undefined;
+  return typeof login === "string" && typeof item.name === "string" ? `${login}/${item.name}` : undefined;
+};
+
+/**
+ * Refuses up front when the family's App is not installed on the repository:
+ * gh's own error for that case does not say why. Uses John's user token for
+ * the App (GET /user/installations, then that installation's repositories),
+ * so no machine needs the App's private key for everyday commands.
  */
 export const requireInstallation = async (
   api: Api,
   config: AppConfig,
-  key: Buffer,
+  family: string,
+  token: string,
   repo: Repo,
-  nowSeconds: number,
 ): Promise<void> => {
-  let jwt: string;
-  try {
-    jwt = appJwt(config, key, nowSeconds);
-  } finally {
-    key.fill(0);
-  }
   const stage = "finding the installation";
-  const response = await get(api, stage, `/repos/${slug(repo)}/installation`, jwt);
-  if (response.status === 404) {
-    throw new Failure(
+  const relogin = `run \`agent-gh login ${family}\` in your own terminal`;
+  const missing = () =>
+    new Failure(
       stage,
       `the ${config.slug} App is not installed on ${slug(repo)}; install it at https://github.com/apps/${config.slug}/installations/new and select ${slug(repo)}`,
     );
-  }
-  if (!response.ok) throw new Failure(stage, `HTTP ${response.status}`);
-  const { id } = await json(response, stage);
+  const installation = await findInPages(
+    api,
+    stage,
+    "/user/installations",
+    token,
+    "installations",
+    (item) => item.app_slug === config.slug,
+    relogin,
+  );
+  if (installation === undefined) throw missing();
+  const { id } = installation;
   if (!Number.isSafeInteger(id)) throw new Failure(stage, "invalid response");
+  const target = slug(repo).toLowerCase();
+  const repository = await findInPages(
+    api,
+    stage,
+    `/user/installations/${id as number}/repositories`,
+    token,
+    "repositories",
+    (item) => fullName(item)?.toLowerCase() === target,
+    relogin,
+  );
+  if (repository === undefined) throw missing();
 };

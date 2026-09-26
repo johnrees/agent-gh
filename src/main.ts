@@ -11,7 +11,7 @@
  *   agent-gh login <family>        authorize the App to act as John (run in your own terminal)
  *   agent-gh settings [family...]  print where each family App's permissions and repositories are changed
  */
-import { defaultConfigDir } from "./config.ts";
+import { defaultConfigDir, REGISTRY } from "./config.ts";
 import { doctor } from "./doctor.ts";
 import { describe, Failure } from "./failure.ts";
 import { GITHUB } from "./github.ts";
@@ -31,11 +31,12 @@ const USAGE = `usage:
   agent-gh login <family>           authorize johnrees-<family> to act as you (device flow); run it yourself, not from an agent
   agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)`;
 
+/** Opens a URL in a local browser if there is one; the printed URL is always the fallback. */
 const openUrl = (url: string) => {
   try {
-    Bun.spawn(["open", url], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", url], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
   } catch {
-    // The printed URL is the fallback.
+    // No opener (a headless or remote machine): the printed URL and code are the path.
   }
 };
 
@@ -57,7 +58,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     const configured = configuredFamilies(dir);
     const families = rest.length > 0 ? rest : configured;
     if (families.length === 0) {
-      console.error(`no family is set up in ${dir}; run \`agent-gh setup <family>\` in your own terminal`);
+      console.error("no family has an App yet; run `agent-gh setup <family>` on the machine where you create Apps");
       return 1;
     }
     for (const family of families) for (const line of settingsLines(dir, family, GITHUB.web)) console.log(line);
@@ -74,6 +75,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     }
     await setup(family, {
       configDir: defaultConfigDir(),
+      registry: REGISTRY,
       api: GITHUB,
       github: GITHUB.web,
       open: openUrl,
@@ -94,6 +96,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     await login(family, {
       api: GITHUB,
       dir: defaultConfigDir(),
+      registry: REGISTRY,
       github: GITHUB.web,
       nowSeconds,
       sleep: (ms) => Bun.sleep(ms),
@@ -111,6 +114,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     env,
     api: GITHUB,
     configDir: defaultConfigDir(),
+    registry: REGISTRY,
     nowSeconds,
     sleep: (ms) => Bun.sleep(ms),
   };
