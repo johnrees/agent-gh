@@ -34,5 +34,11 @@
     "app_id": 5086113,
     "client_id": "Iv23liqP9wTztBMJvhOX",
     "bot_user_id": 334201377
+  },
+  "read": {
+    "slug": "johnrees-read",
+    "app_id": 5090216,
+    "client_id": "Iv23liGJAws8hCxcdIdC",
+    "bot_user_id": 334329927
   }
 }
