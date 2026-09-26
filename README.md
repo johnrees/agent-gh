@@ -30,8 +30,10 @@ A session declares its model with `AGENT_GH_MODEL` (and optionally `AGENT_GH_PRO
 ## Install
 
 ```sh
-bun install && bun run install-local   # builds dist/agent-gh and installs ~/.local/bin/agent-gh
+bun run install-local   # checks Bun, installs the locked dependencies, builds, installs ~/.local/bin/agent-gh
 ```
+
+`install-local` refuses a Bun other than `.bun-version` and prints the command for that exact version (a different Bun rewrites `bun.lock`), then runs `bun install --frozen-lockfile`.
 
 ## Set up a family (once, in your own terminal)
 
@@ -58,7 +60,7 @@ A machine that only runs agents needs no key and no copied config. On it (for ex
 
 ```sh
 git clone https://github.com/johnrees/agent-gh && cd agent-gh
-bun install && bun run install-local
+bun run install-local
 agent-gh login claude   # then codex, deepseek, ... for each family you run there
 ```
 
@@ -86,7 +88,23 @@ Allow the command, and deny commands that would skip it and act with John's own 
 }
 ```
 
-The hook denies, unless run through agent-gh: `gh pr|issue|release|repo` writes; `gh api` writes (an explicit write method, fields or input without a method, or a GraphQL mutation); and `git commit`, `merge`, `pull`, `cherry-pick`, `revert`, `rebase`, `am` (except `--abort` and `--quit`), and `push`. Reads such as `git status`, `diff`, `log`, `show`, and `fetch` stay allowed. It is a guard against the easy mistake, not a security boundary. Codex and opencode do not read Claude Code hooks; repositories that need the rule to bind every harness check authorship in CI.
+The hook denies, unless run through agent-gh: `gh pr|issue|release|repo` writes; `gh api` writes (an explicit write method, fields or input without a method, or a GraphQL mutation); and `git commit`, `merge`, `pull`, `cherry-pick`, `revert`, `rebase`, `am` (except `--abort` and `--quit`), and `push`. Reads such as `git status`, `diff`, `log`, `show`, and `fetch` stay allowed. It is a guard against the easy mistake, not a security boundary. Codex and opencode do not read Claude Code hooks; the git hooks below bind every harness, and repositories check authorship in CI.
+
+## Git hooks (any harness)
+
+git runs a repository's hooks whichever tool calls it, so these bind Claude Code, Codex, opencode, and pi alike. A repository's hooks call:
+
+```sh
+# .githooks/commit-msg
+command -v agent-gh > /dev/null || exit 0
+exec agent-gh guard commit-msg "$1"
+
+# .githooks/pre-push
+command -v agent-gh > /dev/null || exit 0
+exec agent-gh guard pre-push
+```
+
+Outside an agent session both pass. Inside one, `guard commit-msg` refuses a message without the session family's `Co-authored-by` trailer (git applies `--trailer` before commit-msg runs, so `agent-gh git commit` passes), and `guard pre-push` refuses a push that did not come through agent-gh. agent-gh marks every git and gh it runs with `AGENT_GH_CHILD=1`, which also covers commits it makes without `--trailer`, such as merges. A machine without agent-gh (a cloud runner) skips the guard. A hook this version does not understand exits 2 with the update command, never a silent pass. Like the Claude Code hook, this stops the easy mistake, not a determined agent (`--no-verify`, or setting the marker); CI's authorship check is the backstop. The hooks run only in a clone with `git config core.hooksPath .githooks`.
 
 ## Development
 

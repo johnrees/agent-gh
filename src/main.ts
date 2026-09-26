@@ -10,11 +10,13 @@
  *   agent-gh setup <family>        create johnrees-<family> (run in your own terminal)
  *   agent-gh login <family>        authorize the App to act as John (run in your own terminal)
  *   agent-gh settings [family...]  print where each family App's permissions and repositories are changed
+ *   agent-gh guard <hook> [args]   decide a repository's git hook: commit-msg, pre-push
  */
 import { defaultConfigDir, REGISTRY } from "./config.ts";
 import { doctor } from "./doctor.ts";
 import { describe, Failure } from "./failure.ts";
 import { GITHUB } from "./github.ts";
+import { guard } from "./guard.ts";
 import { familyNames } from "./family.ts";
 import { detectIdentity, inAgentSession } from "./harness.ts";
 import { login } from "./login.ts";
@@ -29,7 +31,9 @@ const USAGE = `usage:
   agent-gh doctor                   show who is acting, then check the user, App, git author, and repository access
   agent-gh setup <family>           create johnrees-<family> (${familyNames().join(", ")}); run it yourself, not from an agent
   agent-gh login <family>           authorize johnrees-<family> to act as you (device flow); run it yourself, not from an agent
-  agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)`;
+  agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)
+  agent-gh guard commit-msg <file>  from a git hook: refuse an agent session's commit that does not credit its family App
+  agent-gh guard pre-push           from a git hook: refuse an agent session's push that did not come through agent-gh`;
 
 /** Opens a URL in a local browser if there is one; the printed URL is always the fallback. */
 const openUrl = (url: string) => {
@@ -49,6 +53,11 @@ const main = async (argv: readonly string[]): Promise<number> => {
     return first === undefined ? 1 : 0;
   }
   const env = process.env;
+  if (first === "guard") {
+    const verdict = guard(rest, env, defaultConfigDir(), REGISTRY);
+    if (verdict.message !== undefined) console.error(verdict.message);
+    return verdict.code;
+  }
   if (first === "settings") {
     const dir = defaultConfigDir();
     if (rest.some((family) => !familyNames().includes(family))) {

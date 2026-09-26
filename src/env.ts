@@ -1,4 +1,5 @@
 import { TRAILER_KEYS } from "./git.ts";
+import { CHILD_MARKER } from "./guard.ts";
 import type { Env } from "./harness.ts";
 import { type Repo, slug } from "./repo.ts";
 
@@ -53,5 +54,7 @@ export const childEnv = (parent: Env, token: string | undefined, repo: Repo): Re
     GIT_CONFIG_COUNT: String(first + entries.length),
     GIT_SSH_COMMAND: SSH_OFF,
     GIT_TERMINAL_PROMPT: "0",
+    // Tells a repository's hooks (agent-gh guard) that agent-gh ran this child.
+    [CHILD_MARKER]: "1",
   });
 };
