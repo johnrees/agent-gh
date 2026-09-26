@@ -48,6 +48,7 @@ const run = (configDir: string, onPage: (page: string, local: string) => Promise
   stops.push(fake.stop);
   return setup("codex", {
     configDir,
+    registry: {},
     api: fake.api,
     github: "https://github.example",
     print: () => {},
@@ -97,4 +98,28 @@ test("setup refuses when the harness already has an App", async () => {
   const error = await run(configDir, async () => {}).catch((failure: Failure) => failure);
   expect(error).toBeInstanceOf(Failure);
   expect((error as Failure).detail).toContain("already configured");
+});
+
+test("a family already in the registry is refused: setup would create a second App", async () => {
+  const configDir = join(mkdtempSync(join(tmpdir(), "agent-gh-setup-")), "config");
+  let error: unknown;
+  try {
+    await setup("codex", {
+      configDir,
+      registry: { codex: { slug: "johnrees-codex", app_id: 1, client_id: "Iv23liX", bot_user_id: 2 } },
+      api: { base: "http://127.0.0.1:1", web: "http://127.0.0.1:1", timeoutMs: 100 },
+      github: "https://github.example",
+      print: () => {},
+      timeoutMs: 100,
+      open: () => {
+        throw new Error("setup must not start");
+      },
+    });
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(Failure);
+  expect((error as Failure).detail).toBe(
+    "johnrees-codex already exists (it is in apps.json); run `agent-gh login codex` on this machine instead",
+  );
 });

@@ -2,6 +2,9 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { REGISTRY } from "../src/config.ts";
+import { familyNames } from "../src/family.ts";
+import { configuredFamilies, settingsLines } from "../src/settings.ts";
 
 const main = join(import.meta.dir, "..", "src", "main.ts");
 
@@ -41,25 +44,32 @@ test("settings prints a family's pages from its recorded slug", async () => {
   });
 });
 
-test("settings without a family lists every set-up family", async () => {
-  const result = await settings([], { claude: "johnrees-claude", codex: "johnrees-codex" });
+test("settings without a family lists every family with an App, local or in the registry", async () => {
+  const result = await settings([], { claude: "johnrees-claude" });
   expect(result.code).toBe(0);
-  expect(result.stdout.filter((line) => !line.startsWith(" "))).toEqual(["claude: johnrees-claude", "codex: johnrees-codex"]);
+  const expected = familyNames()
+    .filter((family) => family === "claude" || Object.hasOwn(REGISTRY, family))
+    .map((family) => `${family}: ${family === "claude" ? "johnrees-claude" : REGISTRY[family]?.slug}`);
+  expect(result.stdout.filter((line) => !line.startsWith(" "))).toEqual(expected);
 });
 
-test("a family that is not set up gets the setup command, not URLs, and exit 1", async () => {
-  expect(await settings(["glm"], { claude: "johnrees-claude" })).toEqual({
-    code: 1,
-    stdout: ["glm: not set up; run `agent-gh setup glm` in your own terminal"],
-    stderr: "",
-  });
+test("a family with no App anywhere gets the setup advice for where Apps are created, not URLs", () => {
+  const dir = join(mkdtempSync(join(tmpdir(), "agent-gh-")), "none");
+  expect(settingsLines(dir, "glm", "https://github.com", {})).toEqual([
+    "glm: has no App yet; run `agent-gh setup glm` on the machine where you create Apps, then commit the registry entry it prints",
+  ]);
+  expect(configuredFamilies(dir, {})).toEqual([]);
 });
 
-test("settings refuses an unknown family and an empty setup", async () => {
+test("a family in the registry prints its pages without any local config", () => {
+  const dir = join(mkdtempSync(join(tmpdir(), "agent-gh-")), "none");
+  const registry = { glm: { slug: "johnrees-glm", app_id: 1, client_id: "Iv23liG", bot_user_id: 2 } };
+  expect(settingsLines(dir, "glm", "https://github.com", registry)[0]).toBe("glm: johnrees-glm");
+  expect(configuredFamilies(dir, registry)).toEqual(["glm"]);
+});
+
+test("settings refuses an unknown family", async () => {
   const unknown = await settings(["gemma"], {});
   expect(unknown.code).toBe(1);
   expect(unknown.stderr).toStartWith("usage:");
-  const empty = await settings([], {});
-  expect(empty.code).toBe(1);
-  expect(empty.stderr).toContain("no family is set up");
 });

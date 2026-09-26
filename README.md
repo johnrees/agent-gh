@@ -46,10 +46,23 @@ Then, for each App (`agent-gh settings <family>` prints its pages):
 1. Install it on each repository agents work in, at its repository-access page (**Only select repositories**). Adding a repository later is a checkbox there; no new key.
 2. Tick **Enable Device Flow** on its settings page and save. A manifest cannot set it.
 3. Run `agent-gh login <family>`. It prints a code to enter at github.com/login/device, then stores John's user token for that App in `~/.config/agent-gh/<family>.token.json` (mode 600). It refuses to run inside an agent session.
+4. Add the `apps.json` line setup prints and commit it. The registry holds only public identifiers (slug, App ID, client ID, bot user ID), and it is how every other machine finds the App.
 
-User tokens last 8 hours and refresh for 6 months (unless the App opts out of expiring tokens). agent-gh refreshes a token five minutes before it expires, under a lock so parallel sessions never spend the rotating refresh token twice; a device-flow token refreshes without the client secret, so none is stored. When the refresh token itself expires, run `agent-gh login` again. A user token reaches every repository its App is installed on and John can access; unlike an installation token, it cannot be narrowed to one repository per command, so agent-gh checks with the App's key that the App is installed on the target repository before each GitHub command.
+User tokens last 8 hours and refresh for 6 months (unless the App opts out of expiring tokens). agent-gh refreshes a token five minutes before it expires, under a lock so parallel sessions never spend the rotating refresh token twice; a device-flow token refreshes without the client secret, so none is stored. When the refresh token itself expires, run `agent-gh login` again. A user token reaches every repository its App is installed on and John can access; unlike an installation token, it cannot be narrowed to one repository per command, so before each GitHub command agent-gh checks, with that user token (`GET /user/installations`, then the installation's repositories), that the App is installed on the target repository. Everyday commands never read the App's private key.
 
 GitHub has no API to change an App's permissions or its repositories, so each App is edited by hand. Check the whole path with `agent-gh doctor` from the repository, inside an agent session.
+
+## Another machine
+
+A machine that only runs agents needs no key and no copied config. On it (for example over `herdr --remote`):
+
+```sh
+git clone https://github.com/johnrees/agent-gh && cd agent-gh
+bun install && bun run install-local
+agent-gh login claude   # then codex, deepseek, ... for each family you run there
+```
+
+`login` reads the App from the committed `apps.json`, prints a URL and a code, and waits. On a remote or headless machine no browser opens: enter the code at the URL in any browser, on any machine. Then, from an agent session in a repository, `agent-gh doctor` checks the path. The private keys never leave the machine that ran `setup`; they are only for App-level requests. The Claude Code hook below points at a checkout, so use that machine's path. A family missing from `apps.json` has no App yet: create it with `agent-gh setup` where you create Apps, and commit the entry it prints.
 
 ## Commit trailers
 
@@ -57,7 +70,7 @@ GitHub has no API to change an App's permissions or its repositories, so each Ap
 
 ## Claude Code
 
-Allow the command, and deny commands that would skip it and act with John's own login. In `~/.claude/settings.json`:
+Allow the command, and deny commands that would skip it and act with John's own login. In `~/.claude/settings.json`, with this machine's checkout path:
 
 ```json
 {
@@ -66,7 +79,7 @@ Allow the command, and deny commands that would skip it and act with John's own 
     "PreToolUse": [
       {
         "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "bun /Users/john/Code/agent-gh/hooks/deny-bare-gh.ts" }]
+        "hooks": [{ "type": "command", "command": "bun /path/to/agent-gh/hooks/deny-bare-gh.ts" }]
       }
     ]
   }

@@ -119,6 +119,7 @@ test("a commit through agent-gh needs no login and makes no request", async () =
       env: { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: "1" },
       api: fake.api,
       configDir: creds.dir,
+      registry: {},
       nowSeconds: () => 1_900_000_000,
       sleep: async () => {},
     },

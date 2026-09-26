@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, Failure } from "../src/failure.ts";
 import { login } from "../src/login.ts";
@@ -91,7 +92,9 @@ test("John approves after two polls; slow_down adds five seconds; the token pair
     grant_type: "urn:ietf:params:oauth:grant-type:device_code",
   });
   expect(waits).toEqual([5000, 5000, 10_000]);
-  expect(printed[0]).toBe("Open https://github.com/login/device and enter WDJB-MJHT to let johnrees-claude act as you.");
+  expect(printed[0]).toBe(
+    "Open https://github.com/login/device in any browser (on this machine or another) and enter WDJB-MJHT to let johnrees-claude act as you.",
+  );
   expect(printed[1]).toStartWith("Logged in: johnrees-claude acts as johnrees.");
   expect(opened).toEqual(["https://github.com/login/device"]);
   const path = join(creds.dir, "claude.token.json");
@@ -154,4 +157,36 @@ test("a code nobody enters expires on our clock too", async () => {
   const { run } = flow({ ...DEVICE, expires_in: 12 }, [{ error: "authorization_pending" }]);
   const error = await failure(run());
   expect(error.detail).toBe("the code expired before it was entered; run `agent-gh login claude` again");
+});
+
+test("on a headless machine with no config but the registry, the printed URL and code are the path", async () => {
+  const fake = fakeGitHub({
+    "POST /login/device/code": () => reply(200, DEVICE),
+    "POST /login/oauth/access_token": () => reply(200, TOKEN),
+    "GET /user": () => reply(200, { login: "johnrees" }),
+  });
+  stops.push(fake.stop);
+  const dir = join(mkdtempSync(join(tmpdir(), "agent-gh-")), "fresh");
+  const printed: string[] = [];
+  let now = NOW;
+  const user = await login("claude", {
+    api: fake.api,
+    dir,
+    registry: { claude: { slug: CONFIG.slug, app_id: CONFIG.app_id, client_id: CONFIG.client_id, bot_user_id: CONFIG.bot_user_id } },
+    github: "https://github.com",
+    nowSeconds: () => now,
+    sleep: async (ms) => {
+      now += ms / 1000;
+    },
+    open: () => {
+      throw new Error("no browser on this machine");
+    },
+    print: (line) => printed.push(line),
+  });
+  expect(user).toBe("johnrees");
+  expect(printed[0]).toContain("https://github.com/login/device");
+  expect(printed[0]).toContain("WDJB-MJHT");
+  expect(existsSync(join(dir, "claude.token.json"))).toBe(true);
+  expect(existsSync(join(dir, "claude.json"))).toBe(false);
+  expect(existsSync(join(dir, "claude.pem"))).toBe(false);
 });

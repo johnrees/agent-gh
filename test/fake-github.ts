@@ -11,7 +11,7 @@ export const SECRET_BODY = "SECRET-BODY-3f1c";
 export const SECRET_HEADER = "SECRET-HEADER-9a2e";
 
 export type Logged = { method: string; path: string; auth: string; body: string };
-type Route = (body: string) => Response | Promise<Response>;
+type Route = (body: string, url: URL) => Response | Promise<Response>;
 
 export const reply = (status: number, value: unknown): Response =>
   new Response(JSON.stringify(value), {
@@ -33,7 +33,7 @@ export const fakeGitHub = (routes: Record<string, Route>) => {
       const body = await request.text();
       log.push({ method: request.method, path: url.pathname, auth: request.headers.get("authorization") ?? "", body });
       const route = routes[`${request.method} ${url.pathname}`];
-      return route ? route(body) : reply(404, { message: SECRET_BODY });
+      return route ? route(body, url) : reply(404, { message: SECRET_BODY });
     },
   });
   const base = `http://127.0.0.1:${server.port}`;
@@ -41,9 +41,12 @@ export const fakeGitHub = (routes: Record<string, Route>) => {
   return { api, log, stop: () => server.stop(true) };
 };
 
-/** A healthy App installed on johnrees/penmon. */
+/** A healthy App installed on johnrees/penmon, as John's user token sees it. */
 export const HAPPY = {
-  "GET /repos/johnrees/penmon/installation": () => reply(200, { id: 42 }),
+  "GET /user/installations": () =>
+    reply(200, { total_count: 1, installations: [{ id: 42, app_slug: "johnrees-claude", account: { login: "johnrees" } }] }),
+  "GET /user/installations/42/repositories": () =>
+    reply(200, { total_count: 2, repositories: [{ full_name: "johnrees/soltui" }, { full_name: "johnrees/penmon" }] }),
   "GET /user": () => reply(200, { login: "johnrees" }),
 } as const;
 
@@ -58,15 +61,20 @@ export const CONFIG: AppConfig = {
 export const ACCESS = "ghu_access_test_1111";
 export const REFRESH = "ghr_refresh_test_2222";
 
-/** A config directory holding a fresh test keypair's private key and CONFIG. */
-export const credentials = (family = "claude", config: AppConfig = CONFIG) => {
+/**
+ * A config directory holding CONFIG and, unless `key` is false, a fresh test
+ * keypair's private key. A machine that only ran `agent-gh login` has no key.
+ */
+export const credentials = (family = "claude", config: AppConfig = CONFIG, { key = true, json = true } = {}) => {
   const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const pem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
   const dir = join(mkdtempSync(join(tmpdir(), "agent-gh-")), "config");
   mkdirSync(dir, { mode: 0o700 });
-  writeFileSync(join(dir, `${family}.pem`), pem, { mode: 0o600 });
-  writeFileSync(join(dir, `${family}.json`), JSON.stringify(config), { mode: 0o600 });
-  chmodSync(join(dir, `${family}.pem`), 0o600);
+  if (key) {
+    writeFileSync(join(dir, `${family}.pem`), pem, { mode: 0o600 });
+    chmodSync(join(dir, `${family}.pem`), 0o600);
+  }
+  if (json) writeFileSync(join(dir, `${family}.json`), JSON.stringify(config), { mode: 0o600 });
   return { dir, pem, publicKey };
 };
 
