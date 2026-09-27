@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { readConfig, type Registry } from "./config.ts";
 import { coAuthorTrailer } from "./git.ts";
 import { detectIdentity, type Env, inAgentSession } from "./harness.ts";
+import { type GitConfig, githubRepoOf, onGitHub } from "./target.ts";
 
 /**
  * agent-gh sets this on every git and gh it runs, so a repository's hooks can
@@ -23,17 +24,25 @@ const unknown = (what: string): Verdict => ({
 
 /**
  * What a repository's git hook decides, whichever tool ran git. Outside an
- * agent session everything passes. Inside one, a commit must credit the
- * session family's App (which `agent-gh git commit` adds before git runs
+ * agent session everything passes, and so does a repository with no
+ * github.com remote, or a push the hook is told goes elsewhere: agent-gh
+ * governs GitHub, not local git. Inside an agent session, a commit must credit
+ * the session family's App (which `agent-gh git commit` adds before git runs
  * commit-msg) and a push must come through agent-gh. Anything this version
  * does not understand fails with exit 2, never a silent pass.
  */
-export const guard = (args: readonly string[], env: Env, configDir: string, registry: Registry): Verdict => {
+export const guard = (
+  args: readonly string[],
+  env: Env,
+  configDir: string,
+  registry: Registry,
+  repository: () => GitConfig,
+): Verdict => {
   const [hook, ...rest] = args;
   if (hook === "commit-msg") {
     const [file] = rest;
     if (file === undefined || rest.length !== 1) return unknown("commit-msg takes the message file git passes it");
-    if (!inAgentSession(env) || env[CHILD_MARKER] === "1") return PASS;
+    if (!inAgentSession(env) || env[CHILD_MARKER] === "1" || !onGitHub(repository())) return PASS;
     const identity = detectIdentity(env);
     const trailer = coAuthorTrailer(readConfig(configDir, identity.family, registry));
     const lines = readFileSync(file, "utf8").split("\n").map((line) => line.trimEnd());
@@ -45,6 +54,11 @@ export const guard = (args: readonly string[], env: Env, configDir: string, regi
   }
   if (hook === "pre-push") {
     if (!inAgentSession(env) || env[CHILD_MARKER] === "1") return PASS;
+    // git passes the remote's name and URL; a hook that forwards them lets a push elsewhere through.
+    const url = rest[1];
+    const config = repository();
+    if (url !== undefined && githubRepoOf(url, config) === undefined) return PASS;
+    if (!onGitHub(config)) return PASS;
     return {
       code: 1,
       message: "agent-gh guard: an agent session pushes through agent-gh, not with John's own login: `agent-gh git push ...`",
