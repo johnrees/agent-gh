@@ -270,24 +270,36 @@ const real = (deps: ShimDeps, name: string, args: string[], stdin: "inherit" | "
   return { code: result.exitCode ?? 1, stdout: result.stdout.toString() };
 };
 
+/** One global git setting: every value in order (`exact`), or values it must include among others. */
+export type GitSetting = { readonly key: string; readonly values: readonly string[]; readonly exact: boolean };
+
 /**
  * The global git settings that make an agent machine's git use agent-gh's
- * credential helper for github.com, each key with its exact values in order:
- * a reset, then the helper; the repository's path, so the helper can check
- * the family App's installation; and a push URL naming PUSH_USER, so a push
- * the family App cannot make, or a person's, fails with the reason, and an
- * SSH remote pushes over HTTPS.
+ * credential helper for github.com: a reset, then the helper; the
+ * repository's path, so the helper can check the family App's installation;
+ * a push URL naming PUSH_USER, so a push the family App cannot make, or a
+ * person's, fails with the reason; and HTTPS for SSH remotes, fetch and
+ * explicit pushurl alike, so no SSH key writes.
  */
-export const agentMachineGit = (agentGh: string): readonly (readonly [string, readonly string[]])[] => [
-  ["credential.https://github.com.helper", ["", `!${/\s/.test(agentGh) ? quote(agentGh) : agentGh} credential`]],
-  ["credential.https://github.com.useHttpPath", ["true"]],
-  [`url.https://${PUSH_USER}@github.com/.pushInsteadOf`, ["https://github.com/", "git@github.com:", "ssh://git@github.com/"]],
+export const agentMachineGit = (agentGh: string): readonly GitSetting[] => [
+  { key: "credential.https://github.com.helper", values: ["", `!${/\s/.test(agentGh) ? quote(agentGh) : agentGh} credential`], exact: true },
+  { key: "credential.https://github.com.useHttpPath", values: ["true"], exact: true },
+  { key: `url.https://${PUSH_USER}@github.com/.pushInsteadOf`, values: ["https://github.com/", "git@github.com:", "ssh://git@github.com/"], exact: true },
+  { key: "url.https://github.com/.insteadOf", values: ["git@github.com:", "ssh://git@github.com/"], exact: false },
 ];
 
 /** Every value of a global git setting, in order. */
 export const globalGit = (deps: ShimDeps, key: string): string[] => {
   const result = real(deps, "git", ["config", "--global", "--get-all", key]);
   return result.code === 0 ? result.stdout.replace(/\n$/, "").split("\n") : [];
+};
+
+/** Whether the machine's global git config holds a setting as install-shims writes it. */
+export const holds = (deps: ShimDeps, setting: GitSetting): boolean => {
+  const values = globalGit(deps, setting.key);
+  return setting.exact
+    ? values.length === setting.values.length && values.every((value, index) => value === setting.values[index])
+    : setting.values.every((value) => values.includes(value));
 };
 
 /** Whether gh itself holds John's personal login for github.com (a token in the environment is not asked about). */
@@ -330,11 +342,14 @@ export const installShims = (deps: ShimDeps, agentMachine: boolean, families: re
     : { agent_machine: false };
   writeAtomic(join(deps.configDir, "machine.json"), `${JSON.stringify(machine)}\n`);
   if (!agentMachine) return;
-  for (const [key, values] of agentMachineGit(deps.agentGh)) {
-    real(deps, "git", ["config", "--global", "--unset-all", key]);
-    for (const value of values) {
-      if (real(deps, "git", ["config", "--global", "--add", key, value]).code !== 0) {
-        throw new Failure("installing the shims", `git config --global could not set ${key}`);
+  for (const setting of agentMachineGit(deps.agentGh)) {
+    if (holds(deps, setting)) continue;
+    // A shared key (the insteadOf rules) keeps its other values; agent-gh's own are rewritten whole.
+    if (setting.exact) real(deps, "git", ["config", "--global", "--unset-all", setting.key]);
+    const present = setting.exact ? [] : globalGit(deps, setting.key);
+    for (const value of setting.values.filter((value) => !present.includes(value))) {
+      if (real(deps, "git", ["config", "--global", "--add", setting.key, value]).code !== 0) {
+        throw new Failure("installing the shims", `git config --global could not set ${setting.key}`);
       }
     }
   }

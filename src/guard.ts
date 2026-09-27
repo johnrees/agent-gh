@@ -17,22 +17,48 @@ const unknown = (what: string): Verdict => ({
   message: `agent-gh guard: ${what}; this agent-gh may be older than the repository's hooks, so ${UPDATE}.\n${NEXT_STEP}`,
 });
 
-/** The prefix git's comment lines start with: `core.commentString`, else `core.commentChar`, else `#`. */
-export const commentPrefix = (config: GitConfig): string => {
+/** The characters `core.commentChar=auto` chooses from, in git's order. */
+const AUTO = "#;@!$%^&|:";
+
+/**
+ * The prefix git's comment lines start with: `core.commentString`, else
+ * `core.commentChar`, else `#`. For `auto`, git chose a character no line of
+ * the starting message began with and wrote its template with it, so it is
+ * read back from the `-v` scissors line or the template's last line.
+ */
+export const commentPrefix = (config: GitConfig, text: string): string => {
   const prefix = config.get("core.commentString") ?? config.get("core.commentChar");
-  return prefix === undefined || prefix === "auto" ? "#" : prefix;
+  if (prefix !== "auto") return prefix ?? "#";
+  const lines = text.split("\n");
+  const scissors = lines.find((line) => /^. -{24} >8 -{24}$/.test(line) && AUTO.includes(line[0] as string));
+  if (scissors !== undefined) return scissors[0] as string;
+  const last = lines.findLast((line) => line.trim() !== "");
+  return last !== undefined && AUTO.includes(last[0] as string) && (last.length === 1 || /\s/.test(last[1] as string)) ? (last[0] as string) : "#";
 };
 
 /**
  * Whether a commit message has any text of its own: something before the
- * `git commit -v` scissors line that is neither blank nor a comment. git
- * aborts an empty message only after commit-msg runs, so a hook that added
+ * `git commit -v` scissors line that is not blank, and not a comment when
+ * git's cleanup strips comments (an edited message, or `commit.cleanup=strip`).
+ * git aborts an empty message only after commit-msg runs, so a hook that added
  * trailers to one would commit a message made of trailers alone.
  */
-export const hasMessage = (text: string, prefix: string): boolean => {
+export const hasMessage = (text: string, prefix: string, stripsComments: boolean): boolean => {
   const lines = text.split("\n");
   const scissors = lines.indexOf(`${prefix} ------------------------ >8 ------------------------`);
-  return (scissors === -1 ? lines : lines.slice(0, scissors)).some((line) => !line.startsWith(prefix) && line.trim() !== "");
+  return (scissors === -1 ? lines : lines.slice(0, scissors)).some(
+    (line) => line.trim() !== "" && !(stripsComments && line.startsWith(prefix)),
+  );
+};
+
+/**
+ * Whether git strips comment lines from this message. git sets GIT_EDITOR to
+ * `:` for the hook when no editor runs (`-m`, `-F`, `--no-edit`), and then
+ * keeps comment lines unless `commit.cleanup` is `strip`.
+ */
+const stripsComments = (config: GitConfig, env: Env): boolean => {
+  const cleanup = config.get("commit.cleanup") ?? "default";
+  return cleanup === "strip" || (cleanup === "default" && env.GIT_EDITOR !== ":");
 };
 
 /**
@@ -59,7 +85,9 @@ export const guard = (
     if (file === undefined || rest.length !== 1) return unknown("commit-msg takes the message file git passes it");
     if (!inAgentSession(env)) return PASS;
     const config = repository();
-    if (!onGitHub(config) || !hasMessage(readFileSync(file, "utf8"), commentPrefix(config))) return PASS;
+    if (!onGitHub(config)) return PASS;
+    const text = readFileSync(file, "utf8");
+    if (!hasMessage(text, commentPrefix(config, text), stripsComments(config, env))) return PASS;
     const identity = detectIdentity(env);
     const app = readConfig(configDir, identity.family, registry);
     const result = Bun.spawnSync(["git", "interpret-trailers", "--in-place", "--no-divider", ...trailerArgs(identity, app), file], {

@@ -256,9 +256,14 @@ test("install-shims --agent-machine: git reads with the read App and pushes with
   expect(zshrc).toStartWith("export EDITOR=vi\n\n# >>> agent-gh >>>");
   expect(printed.join("\n")).toContain("gh: logged out of your personal login");
 
+  // A rerun changes nothing, and a shared key keeps its other values.
+  git(["config", "--global", "--add", "url.https://github.com/.insteadOf", "gh:"]);
   const gitconfig = readFileSync(join(home, ".gitconfig"), "utf8");
   installShims(deps, true, ["claude"]);
   expect(readFileSync(join(home, ".gitconfig"), "utf8")).toBe(gitconfig);
+  git(["config", "--global", "--unset", "url.https://github.com/.insteadOf", "^git@"]);
+  installShims(deps, true, ["claude"]);
+  expect(git(["config", "--global", "--get-all", "url.https://github.com/.insteadOf"]).stdout).toBe("ssh://git@github.com/\ngh:\ngit@github.com:\n");
   expect(readFileSync(join(home, ".zshrc"), "utf8")).toBe(zshrc);
   expect(printed.at(-1)).toBe("gh: no personal login on this machine");
 
@@ -269,14 +274,17 @@ test("install-shims --agent-machine: git reads with the read App and pushes with
   expect(password(git(["credential", "fill"], "protocol=https\nhost=github.com\n\n", AGENT).stdout)).toBe(READ_TOKEN);
   expect(git(["credential", "fill"], "protocol=https\nhost=example.com\n\n").code).not.toBe(0);
 
-  // Pushes, and only pushes, name PUSH_USER, whichever way the remote is written.
+  // Every GitHub remote uses HTTPS, and pushes, and only pushes, name PUSH_USER, whichever way the remote is written.
   const repo = join(home, "repo");
   git(["init", "-q", repo]);
   for (const [name, url] of [["https", "https://github.com/johnrees/penmon.git"], ["scp", "git@github.com:johnrees/penmon.git"], ["ssh", "ssh://git@github.com/johnrees/penmon.git"]]) {
     git(["-C", repo, "remote", "add", name as string, url as string]);
     expect(git(["-C", repo, "remote", "get-url", "--push", name as string]).stdout).toBe(`https://${PUSH_USER}@github.com/johnrees/penmon.git\n`);
-    expect(git(["-C", repo, "remote", "get-url", name as string]).stdout).toBe(`${url}\n`);
+    expect(git(["-C", repo, "remote", "get-url", name as string]).stdout).toBe("https://github.com/johnrees/penmon.git\n");
   }
+  // git leaves an explicit pushurl alone for pushInsteadOf, but not for insteadOf: an SSH one uses HTTPS too.
+  git(["-C", repo, "remote", "set-url", "--push", "scp", "git@github.com:johnrees/penmon.git"]);
+  expect(git(["-C", repo, "remote", "get-url", "--push", "scp"]).stdout).toBe("https://github.com/johnrees/penmon.git\n");
   // An agent session's push gets its family's token; a person's is stopped before git would prompt.
   const push = git(["credential", "fill"], PUSH_FILL, AGENT);
   expect([push.code, password(push.stdout)]).toEqual([0, FAMILY_TOKEN]);
@@ -355,7 +363,8 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
   writeFileSync(join(deps.shims, "git"), ghShim(deps.shims, deps.agentGh, true).replace("# gh shim", "# git shim"));
   expect(await doctor()).toContain(`FAIL git shim: ${join(deps.shims, "git")} is left from an older agent-gh; rerun the install line`);
   Bun.spawnSync(["git", "config", "--global", "--unset-all", `url.https://${PUSH_USER}@github.com/.pushInsteadOf`], { env: deps.env });
+  Bun.spawnSync(["git", "config", "--global", "--unset", "url.https://github.com/.insteadOf", "^ssh:"], { env: deps.env });
   expect(await doctor()).toContain(
-    `FAIL git credentials: url.https://${PUSH_USER}@github.com/.pushInsteadOf not as install-shims sets it; rerun the install line with --agent-machine`,
+    `FAIL git credentials: not as install-shims sets them: url.https://${PUSH_USER}@github.com/.pushInsteadOf, url.https://github.com/.insteadOf; rerun the install line with --agent-machine`,
   );
 });

@@ -113,17 +113,37 @@ test("an empty message still aborts the commit: no trailers make it a message", 
   expect(run(["git", "commit", "-q", "-m", ""], agent).code).not.toBe(0);
   expect(run(["git", "commit", "-q", "-v"], { ...agent, GIT_EDITOR: "true" }).code).not.toBe(0);
   expect(count()).toBe(before);
-  expect(hasMessage("\n# only a comment\n", "#")).toBe(false);
-  expect(hasMessage("#123 fix\n", "#")).toBe(false);
-  expect(hasMessage("#123 fix\n", ";")).toBe(true);
-  expect(hasMessage(`\n# ------------------------ >8 ------------------------\ndiff --git a/f b/f\n`, "#")).toBe(false);
+  expect(hasMessage("\n# only a comment\n", "#", true)).toBe(false);
+  expect(hasMessage("#123 fix\n", "#", true)).toBe(false);
+  expect(hasMessage("#123 fix\n", "#", false)).toBe(true);
+  expect(hasMessage("#123 fix\n", ";", true)).toBe(true);
+  expect(hasMessage(`\n# ------------------------ >8 ------------------------\ndiff --git a/f b/f\n`, "#", true)).toBe(false);
+  // commit.cleanup=strip strips comments from a -m message too, so this one is empty.
+  const { agent: stripping, run: runStripping, count: counted, config } = world();
+  config("commit.cleanup", "strip");
+  expect(runStripping(["git", "commit", "-q", "-m", "# only a comment"], stripping).code).not.toBe(0);
+  expect(counted()).toBe(0);
 });
 
-test("git's comment character is the repository's own", () => {
-  const { agent, run, last, config } = world();
-  config("core.commentChar", ";");
+test("a message git keeps is credited, whatever looks like a comment in it", () => {
+  // -m keeps comment lines: git strips them only from an edited message.
+  const { home, agent, run, last, stage, config } = world();
   expect(run(["git", "commit", "-q", "-m", "#123 fix"], agent).code).toBe(0);
   expect(last("%B")).toBe(`#123 fix\n\n${CLAUDE_TRAILERS}`);
+  // An edited message: the repository's comment character, set or chosen by git.
+  for (const [char, message] of [[";", "#123 fix"], ["auto", "#123 fix"], ["auto", "plain"]] as const) {
+    stage(`${char} ${message}\n`);
+    config("core.commentChar", char);
+    expect([char, message, run(["git", "commit", "-q", "-e", "-m", message], { ...agent, GIT_EDITOR: "true" }).code]).toEqual([char, message, 0]);
+    expect([char, last("%B")]).toEqual([char, `${message}\n\n${CLAUDE_TRAILERS}`]);
+  }
+  // With auto, an emptied message is still empty, whichever character git chose.
+  const emptier = join(home, "emptier");
+  writeFileSync(emptier, `#!/bin/sh\ngrep '^;' "$1" > "$1.new"; mv "$1.new" "$1"\n`);
+  chmodSync(emptier, 0o755);
+  stage("emptied\n");
+  expect(run(["git", "commit", "-q", "-e", "-m", "#123 fix"], { ...agent, GIT_EDITOR: emptier }).code).not.toBe(0);
+  expect(run(["git", "commit", "-q"], { ...agent, GIT_EDITOR: "true" }).code).not.toBe(0);
 });
 
 test("a person's commit, and any commit in a repository with no github.com remote, is left exactly as written", () => {

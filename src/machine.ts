@@ -4,7 +4,7 @@ import { isConfigured, READ_APP } from "./config.ts";
 import { familyNames } from "./family.ts";
 import type { Api } from "./github.ts";
 import { loginUsable } from "./login.ts";
-import { agentMachineGit, findReal, globalGit, isShim, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
+import { agentMachineGit, findReal, holds, isShim, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
 
 export const RERUN = "rerun the install line";
 
@@ -70,17 +70,14 @@ export const machineDoctor = async (
 
   if (machine.agent_machine) {
     const wrong = agentMachineGit(deps.agentGh)
-      .filter(([key, want]) => {
-        const values = globalGit(deps, key);
-        return values.length !== want.length || values.some((value, index) => value !== want[index]);
-      })
-      .map(([key]) => key);
+      .filter((setting) => !holds(deps, setting))
+      .map((setting) => setting.key);
     add(
       wrong.length === 0 ? "ok" : "FAIL",
       "git credentials",
       wrong.length === 0
         ? "an agent session uses its family App where installed, and anyone else the read App"
-        : `${wrong.join(", ")} not as install-shims sets it; ${RERUN} with --agent-machine`,
+        : `not as install-shims sets them: ${wrong.join(", ")}; ${RERUN} with --agent-machine`,
     );
     const personal = personalGhLogin(deps);
     add(personal ? "FAIL" : "ok", "gh login", personal ? "gh holds your personal login; run `gh auth logout --hostname github.com`" : "no personal login");
