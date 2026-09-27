@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { HARNESSES, inAgentSession } from "../src/harness.ts";
 import { bareWrite } from "../src/hook.ts";
-import { ghShim, gitShim, rcBlock, sessionFunction, withBlock } from "../src/shims.ts";
+import { defaultShimDir, ghShim, gitShim, rcBlock, realFunction, sessionFunction, SHIM_HOPS, whichReal, withBlock } from "../src/shims.ts";
 
 /** A Claude Code agent session; a person's shell has neither variable. */
 const AGENT = { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1" };
@@ -140,4 +140,143 @@ test("the startup block puts the shims then agent-gh first, once, in sh, bash, a
 test("the generated shims hold no path with a quote that could break out of the shell", () => {
   expect(() => gitShim("/it's/shims", "/bin/agent-gh")).toThrow("single quote");
   expect(() => ghShim("/shims", "/it's/agent-gh", true)).toThrow("single quote");
+});
+
+/** The shells a shim meets: /bin/sh (bash on macOS, Fedora, and Arch; dash on Debian and Ubuntu), dash, and bash, each once. */
+const SHELLS = [
+  ...new Set(["/bin/sh", "/bin/dash", "/usr/bin/dash", "/bin/bash"].filter((path) => existsSync(path)).map((path) => realpathSync(path))),
+];
+
+/** Writes `text` to `dir/name` as an executable script run by `shell`, as a test fixture copying `command -v git` would. */
+const place = (dir: string, name: string, text: string, shell: string) => {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, name), text.replace(/^#!\/bin\/sh\n/, `#!${shell}\n`));
+  chmodSync(join(dir, name), 0o755);
+  return join(dir, name);
+};
+
+/** Runs `program` with only `env`, killed after five seconds: a shim that loops is a failure, not a hung test. */
+const bounded = (program: string[], env: Record<string, string>, cwd?: string) => {
+  const result = Bun.spawnSync(program, { env, ...(cwd === undefined ? {} : { cwd }), stdout: "pipe", stderr: "pipe", timeout: 5000 });
+  return { code: result.exitCode, timedOut: result.exitedDueToTimeout === true, stdout: result.stdout.toString(), stderr: result.stderr.toString() };
+};
+
+/** agent-gh v0.1.1's agh_real, which skipped only the shim directory: a copy of the shim found itself. */
+const oldReal = (shims: string) =>
+  [
+    `AGH_SHIMS='${shims}'`,
+    "agh_real() {",
+    '  agh_rest="$PATH:"',
+    '  while [ -n "$agh_rest" ]; do',
+    "    agh_dir=${agh_rest%%:*}",
+    "    agh_rest=${agh_rest#*:}",
+    '    case $agh_dir in "" | "$AGH_SHIMS" | "$AGH_SHIMS/") continue ;; esac',
+    '    if [ -f "$agh_dir/$1" ] && [ -x "$agh_dir/$1" ]; then AGH_REAL=$agh_dir/$1; return 0; fi',
+    "  done",
+    '  echo "agent-gh shim: no $1 on PATH outside $AGH_SHIMS" >&2',
+    "  exit 127",
+    "}",
+  ].join("\n");
+
+for (const shell of SHELLS) {
+  test(`a copy of the git shim runs the real git past itself, however it is named, under ${shell}`, () => {
+    const { root, shims } = world();
+    const log = join(root, "log");
+    const copy = join(root, "copy");
+    place(copy, "git", readFileSync(join(shims, "git"), "utf8"), shell);
+    // hops=0: the copy ran the real git itself, rather than running itself again first.
+    const bin = dirname(place(join(root, "real"), "git", `#!/bin/sh\necho "REAL git $* hops=$AGH_SHIM_HOPS" >> '${log}'\n`, shell));
+    const cases: [string[], string, string?][] = [
+      [[join(copy, "git"), "status"], `${copy}:${shims}:${bin}`],
+      [[join(copy, "git"), "status"], `${copy}/:${bin}`],
+      [[shell, "git", "status"], `${copy}:${bin}`, copy],
+      [["./git", "status"], `.:${bin}`, copy],
+      [[`${root}/copy/../copy/git`, "status"], `${copy}:${bin}`],
+    ];
+    for (const [program, path, cwd] of cases) {
+      writeFileSync(log, "");
+      const result = bounded(program, { PATH: path }, cwd);
+      expect([program, path, result.code, result.stderr, readFileSync(log, "utf8")]).toEqual([program, path, 0, "", "REAL git status hops=0\n"]);
+    }
+  });
+
+  test(`copies of the shim that reach each other, or no real git, fail loudly and never loop, under ${shell}`, () => {
+    const { root, shims } = world();
+    const text = readFileSync(join(shims, "git"), "utf8");
+    const a = place(join(root, "a"), "git", text, shell);
+    const b = place(join(root, "b"), "git", text, shell);
+    const both = bounded([a, "status"], { PATH: `${dirname(a)}:${dirname(b)}:${shims}` });
+    expect(both).toMatchObject({ code: 127, timedOut: false, stdout: "" });
+    const trail = [a, b, a, b].slice(0, SHIM_HOPS + 1).join(", ");
+    expect(both.stderr).toBe(
+      `agent-gh shim: ${trail} ran in turn and never reached the real git: a copy of the shim, or a wrapper that runs git from PATH, is ahead of it. Copy the real git instead: $(agent-gh which git)\n`,
+    );
+    const alone = bounded([a, "status"], { PATH: `${dirname(a)}:${shims}` });
+    expect(alone).toMatchObject({ code: 127, timedOut: false, stdout: "" });
+    expect(alone.stderr).toBe(
+      `agent-gh shim: ${a} is a copy of the git shim in ${shims}, and no real git follows it on PATH. Copy the real git instead: $(agent-gh which git)\n`,
+    );
+  });
+
+  test(`the v0.1.1 shim, copied with the real git later on PATH, runs itself until killed, under ${shell}`, () => {
+    const { root, shims, bin } = world();
+    const current = gitShim(shims, join(bin, "agent-gh"));
+    expect(current).toContain(realFunction(shims));
+    const copy = place(join(root, "copy"), "git", current.replace(realFunction(shims), oldReal(shims)), shell);
+    const result = Bun.spawnSync([copy, "status"], { env: { PATH: `${dirname(copy)}:${bin}` }, stdout: "pipe", stderr: "pipe", timeout: 1500 });
+    expect(result.exitedDueToTimeout).toBe(true);
+    expect(existsSync(join(root, "log"))).toBe(false); // the real git never ran
+  });
+
+  test(`real git running git again (a hook, git -C in it, a chain of aliases) never trips the shim's guard, under ${shell}`, () => {
+    const real = whichReal("git", process.env.PATH, defaultShimDir());
+    if (real === undefined) throw new Error("the tests need a real git on PATH");
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "agent-gh-hooks-")));
+    const shims = join(root, "shims");
+    const shim = place(shims, "git", gitShim(shims, join(root, "no-agent-gh")), shell);
+    const repo = join(root, "repo");
+    const log = join(root, "log");
+    // git puts its own exec-path first on PATH for hooks and aliases, so each one puts the shim back first, as a test fixture does.
+    const path = `${shims}:${dirname(real)}:/usr/bin:/bin`;
+    const env = { PATH: path, HOME: root, GIT_CONFIG_NOSYSTEM: "1", AGH_TEST_PATH: path, AGH_TEST_LOG: log };
+    const git = (...args: string[]) => bounded([shim, ...args], env);
+    expect(git("init", "-q", repo).code).toBe(0);
+    const hop = (next: string) => `!PATH="$AGH_TEST_PATH" git ${next}`;
+    for (const [key, value] of [
+      ["user.name", "Test"],
+      ["user.email", "test@example.com"],
+      ["core.hooksPath", join(root, "hooks")],
+      ["test.marker", "deep"],
+      ["alias.one", hop("two")],
+      ["alias.two", hop("three")],
+      ["alias.three", hop("four")],
+      ["alias.four", hop("five")],
+      ["alias.five", "config --get test.marker"],
+    ] as const) {
+      expect(git("-C", repo, "config", key, value).code).toBe(0);
+    }
+    place(
+      join(root, "hooks"),
+      "pre-commit",
+      `#!/bin/sh\nPATH=$AGH_TEST_PATH\ngit -C '${repo}' rev-parse --is-inside-work-tree >> "$AGH_TEST_LOG" && git -C '${repo}' one >> "$AGH_TEST_LOG"\n`,
+      shell,
+    );
+    const commit = git("-C", repo, "commit", "-q", "--allow-empty", "-m", "through the shim");
+    expect([commit.code, commit.timedOut, commit.stderr]).toEqual([0, false, ""]);
+    expect(readFileSync(log, "utf8")).toBe("true\ndeep\n");
+    expect(git("-C", repo, "log", "--format=%s").stdout).toBe("through the shim\n");
+  });
+}
+
+test("agent-gh which prints the real git and gh, past the shims and any copy of them", async () => {
+  const { root, shims, bin } = world();
+  const copy = place(join(root, "copy"), "git", readFileSync(join(shims, "git"), "utf8"), "/bin/sh");
+  const path = `${dirname(copy)}:${shims}:${bin}`;
+  expect(whichReal("git", path, shims)).toBe(join(bin, "git"));
+  expect(whichReal("gh", path, shims)).toBe(join(bin, "gh"));
+  expect(whichReal("git", `${dirname(copy)}:${shims}`, shims)).toBeUndefined();
+  const main = join(import.meta.dir, "..", "src", "main.ts");
+  const which = (...args: string[]) => bounded([process.execPath, main, "which", ...args], { PATH: path, HOME: root });
+  expect(which("git")).toMatchObject({ code: 0, stdout: `${join(bin, "git")}\n` });
+  expect(which("svn")).toMatchObject({ code: 1, stdout: "" });
 });

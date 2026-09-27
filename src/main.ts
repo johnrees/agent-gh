@@ -15,6 +15,7 @@
  *   agent-gh install-shims         gh and git shims first on PATH; --agent-machine also removes personal write access
  *   agent-gh doctor --machine      is this machine set up so agents use agent-gh for everything
  *   agent-gh credential <action>   git's credential helper on an agent machine: the read App's token
+ *   agent-gh which <gh|git>        the real program behind the shim, for a script that copies it
  */
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
 import { credential, readToken } from "./credential.ts";
@@ -31,7 +32,7 @@ import { type Context, runAs, runGit } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
 import { readGitConfig } from "./target.ts";
-import { defaultBinDir, defaultShimDir, installShims, type ShimDeps } from "./shims.ts";
+import { defaultBinDir, defaultShimDir, installShims, type ShimDeps, whichReal } from "./shims.ts";
 import { VERSION } from "./version.ts";
 
 const USAGE = `usage:
@@ -47,7 +48,8 @@ const USAGE = `usage:
   agent-gh read-token               print the read App's token (the gh shim's GH_TOKEN on agent machines)
   agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)
   agent-gh guard commit-msg <file>  from a git hook: refuse an agent session's commit that does not credit its family App
-  agent-gh guard pre-push           from a git hook: refuse an agent session's push that did not come through agent-gh`;
+  agent-gh guard pre-push           from a git hook: refuse an agent session's push that did not come through agent-gh
+  agent-gh which <gh|git>           print the real program behind the shim; copy this, never \`command -v git\`, into a test's PATH`;
 
 /** Opens a URL in a local browser if there is one; the printed URL is always the fallback. */
 const openUrl = (url: string) => {
@@ -106,6 +108,20 @@ const main = async (argv: readonly string[]): Promise<number> => {
     process.stdout.write(
       await credential(rest[0], input, () => readToken({ api: GITHUB, dir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) })),
     );
+    return 0;
+  }
+  if (first === "which") {
+    const [name, ...extra] = rest;
+    if ((name !== "gh" && name !== "git") || extra.length > 0) {
+      console.error(USAGE);
+      return 1;
+    }
+    const program = whichReal(name, env.PATH, defaultShimDir());
+    if (program === undefined) {
+      console.error(`agent-gh: no ${name} on PATH besides agent-gh's shims`);
+      return 1;
+    }
+    console.log(program);
     return 0;
   }
   if (first === "read-token") {
