@@ -55,7 +55,7 @@ The script and the releases download without authentication, so the curl line ne
 
 `install-shims` writes `gh` and `git` shims to `~/.local/share/agent-gh/shims` and puts them, then `~/.local/bin`, first on PATH with a marked block in each shell startup file present (`.zshrc`, `.zprofile`, `.zshenv`, `.bashrc`, `.bash_profile`, `.profile`; `.profile` when there is none). Open a new shell after it.
 
-In an agent session (the harness table above), `gh` runs `agent-gh gh`, and `git commit`, `merge`, `pull`, `cherry-pick`, `revert`, `rebase`, `am` (except `--abort` and `--quit`), and `push` run `agent-gh git`: the commands the Claude Code hook below refuses. Every other git command, and gh's own `--version` and help, is the real program. So agents use agent-gh whatever they type. Outside an agent session, and in agent-gh's own children (`AGENT_GH_CHILD=1`), the shims exec the real program after a test made of shell builtins only: no agent-gh process and no delay. The shims are generated from agent-gh's harness table, so rerun the install line after updating to keep them in step.
+In an agent session (the harness table above), `gh` runs `agent-gh gh`, and `git commit`, `merge`, `pull`, `cherry-pick`, `revert`, `rebase`, `am` (except `--abort` and `--quit`), and `push` run `agent-gh git`: the commands the Claude Code hook below refuses. agent-gh gives a command that cannot reach GitHub straight to the real git, unchanged: a commit, merge, or rebase in a repository with no github.com remote, and a push or pull whose remote (the one named, else the branch's push remote or upstream, else `origin`) is a local path or another host, after `insteadOf` rules and ssh `Host` aliases. Where the repository has a github.com remote and the target is unclear, agent-gh handles it. Every other git command, and gh's own `--version` and help, is the real program. So agents use agent-gh whatever they type. Outside an agent session, and in agent-gh's own children (`AGENT_GH_CHILD=1`), the shims exec the real program after a test made of shell builtins only: no agent-gh process and no delay. The shims are generated from agent-gh's harness table, so rerun the install line after updating to keep them in step.
 
 ### Agent machines
 
@@ -122,10 +122,10 @@ exec agent-gh guard commit-msg "$1"
 
 # .githooks/pre-push
 command -v agent-gh > /dev/null || exit 0
-exec agent-gh guard pre-push
+exec agent-gh guard pre-push "$@"
 ```
 
-Outside an agent session both pass. Inside one, `guard commit-msg` refuses a message without the session family's `Co-authored-by` trailer (git applies `--trailer` before commit-msg runs, so `agent-gh git commit` passes), and `guard pre-push` refuses a push that did not come through agent-gh. agent-gh marks every git and gh it runs with `AGENT_GH_CHILD=1`, which also covers commits it makes without `--trailer`, such as merges. A machine without agent-gh (a cloud runner) skips the guard. A hook this version does not understand exits 2 with the update command, never a silent pass. Like the Claude Code hook, this stops the easy mistake, not a determined agent (`--no-verify`, or setting the marker); CI's authorship check is the backstop. The hooks run only in a clone with `git config core.hooksPath .githooks`.
+Outside an agent session, and in a repository with no github.com remote, both pass. A pre-push hook that forwards git's arguments also passes a push to a URL off github.com. Inside one, `guard commit-msg` refuses a message without the session family's `Co-authored-by` trailer (git applies `--trailer` before commit-msg runs, so `agent-gh git commit` passes), and `guard pre-push` refuses a push that did not come through agent-gh. agent-gh marks every git and gh it runs with `AGENT_GH_CHILD=1`, which also covers commits it makes without `--trailer`, such as merges. A machine without agent-gh (a cloud runner) skips the guard. A hook this version does not understand exits 2 with the update command, never a silent pass. Like the Claude Code hook, this stops the easy mistake, not a determined agent (`--no-verify`, or setting the marker); CI's authorship check is the backstop. The hooks run only in a clone with `git config core.hooksPath .githooks`.
 
 ## Development
 

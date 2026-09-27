@@ -25,10 +25,13 @@ afterEach(() => {
 });
 
 /**
- * A clone with Penmon's hooks switched on, a local bare `origin`, one staged
- * file, and an `agent-gh` on PATH that runs this checkout's source.
+ * A clone with Penmon's hooks switched on, one staged file, and an `agent-gh`
+ * on PATH that runs this checkout's source. Its `origin` is a github.com URL
+ * that git rewrites to a local bare repository, so it is a GitHub repository
+ * to agent-gh while pushes stay local; `onGitHub: false` makes `origin` the
+ * bare path itself.
  */
-const world = () => {
+const world = ({ onGitHub = true } = {}) => {
   const home = mkdtempSync(join(tmpdir(), "agent-gh-guard-"));
   const bin = join(home, "bin");
   mkdirSync(bin);
@@ -41,7 +44,9 @@ const world = () => {
   for (const [key, value] of [["user.name", "John Rees"], ["user.email", "john@example.com"], ["core.hooksPath", HOOKS]]) {
     Bun.spawnSync(["git", "-C", dir, "config", key as string, value as string]);
   }
-  Bun.spawnSync(["git", "-C", dir, "remote", "add", "origin", remote]);
+  const url = onGitHub ? "https://github.com/johnrees/penmon.git" : remote;
+  Bun.spawnSync(["git", "-C", dir, "remote", "add", "origin", url]);
+  if (onGitHub) Bun.spawnSync(["git", "-C", dir, "config", `url.${remote}.insteadOf`, url]);
   writeFileSync(join(dir, "f"), "a\n");
   Bun.spawnSync(["git", "-C", dir, "add", "f"]);
   const person = { PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, GIT_CONFIG_NOSYSTEM: "1", GH_REPO: "johnrees/penmon" };
@@ -100,6 +105,21 @@ test("a push through agent-gh passes the pre-push guard", async () => {
   expect(code).toBe(0);
 });
 
+test("a repository with no github.com remote is never refused: its hooks are its own business", () => {
+  const { agent, run, last } = world({ onGitHub: false });
+  expect(run(["git", "commit", "-q", "-m", "local"], agent)).toEqual({ code: 0, stderr: "" });
+  expect(last("%B")).toBe("local");
+  expect(run(["git", "push", "-q", "origin", "HEAD:main"], agent).code).toBe(0);
+});
+
+test("a pre-push hook told the push goes elsewhere lets it through, even in a GitHub repository", () => {
+  const { dir } = world();
+  const github = () => ({ urls: new Map([["origin", ["https://github.com/johnrees/penmon.git"]]]), pushUrls: new Map(), rewrites: [], sshHostname: () => undefined, branch: undefined, get: () => undefined });
+  expect(guard(["pre-push", "fixture", `${dir}/../remote.git`], AGENT, "/nonexistent", REGISTRY, github).code).toBe(0);
+  expect(guard(["pre-push", "origin", "https://github.com/johnrees/penmon.git"], AGENT, "/nonexistent", REGISTRY, github).code).toBe(1);
+  expect(guard(["pre-push"], AGENT, "/nonexistent", REGISTRY, github).code).toBe(1);
+});
+
 test("outside an agent session, both hooks pass", () => {
   const { person, run } = world();
   expect(run(["git", "commit", "-q", "-m", "mine"], person).code).toBe(0);
@@ -109,7 +129,9 @@ test("outside an agent session, both hooks pass", () => {
 test("a hook this version does not understand fails with exit 2 and the update command, never a pass", () => {
   for (const args of [["post-merge"], [], ["commit-msg"], ["commit-msg", "a", "b"]]) {
     for (const env of [{}, AGENT]) {
-      const verdict = guard(args, env, "/nonexistent", REGISTRY);
+      const verdict = guard(args, env, "/nonexistent", REGISTRY, () => {
+        throw new Error("an unknown hook never reads the repository");
+      });
       expect(verdict.code).toBe(2);
       expect(verdict.message).toContain(UPDATE);
     }

@@ -15,14 +15,29 @@ const repo = (owner: string | undefined, name: string | undefined): Repo | undef
 };
 
 /**
+ * A github.com remote URL in https, ssh, git, or scp form, as a remote's `url`
+ * or `pushurl` holds it; hosts match in any case, and SSH also reaches GitHub
+ * as ssh.github.com. A path, `OWNER/REPO` shorthand, or another host is
+ * undefined: for a remote, those are not GitHub.
+ */
+export const parseRemoteUrl = (value: string): Repo | undefined => {
+  const scp = /^(?:[^@/:]+@)?(?:ssh\.)?github\.com:([^/]+)\/([^/]+?)\/?$/i.exec(value);
+  if (scp) return repo(scp[1], scp[2]);
+  const url =
+    /^(?:https?:\/\/(?:[^@/]+@)?github\.com|(?:ssh|git\+ssh|ssh\+git):\/\/(?:[^@/]+@)?(?:ssh\.)?github\.com|git:\/\/github\.com)(?::\d+)?\/([^/]+)\/([^/]+?)\/?$/i.exec(
+      value,
+    );
+  if (url) return repo(url[1], url[2]);
+  return undefined;
+};
+
+/**
  * `OWNER/REPO`, `github.com/OWNER/REPO`, or a github.com URL in https, ssh, or
  * scp form. Anything else, including another host, is undefined.
  */
 export const parseRepo = (value: string): Repo | undefined => {
-  const scp = /^git@github\.com:([^/]+)\/([^/]+?)\/?$/.exec(value);
-  if (scp) return repo(scp[1], scp[2]);
-  const url = /^(?:https:\/\/|ssh:\/\/git@|git:\/\/)github\.com\/([^/]+)\/([^/]+?)\/?$/.exec(value);
-  if (url) return repo(url[1], url[2]);
+  const remote = parseRemoteUrl(value);
+  if (remote) return remote;
   const parts = value.split("/");
   if (parts.length === 2) return repo(parts[0], parts[1]);
   if (parts.length === 3 && parts[0] === "github.com") return repo(parts[1], parts[2]);

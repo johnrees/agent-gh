@@ -27,9 +27,10 @@ import { detectIdentity, inAgentSession } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor } from "./machine.ts";
 import { originUrl, resolveRepo } from "./repo.ts";
-import { type Context, runAs } from "./run.ts";
+import { type Context, runAs, runGit } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
+import { readGitConfig } from "./target.ts";
 import { defaultBinDir, defaultShimDir, installShims, type ShimDeps } from "./shims.ts";
 import { VERSION } from "./version.ts";
 
@@ -135,7 +136,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     return 0;
   }
   if (first === "guard") {
-    const verdict = guard(rest, env, defaultConfigDir(), REGISTRY);
+    const verdict = guard(rest, env, defaultConfigDir(), REGISTRY, () => readGitConfig(process.cwd(), env));
     if (verdict.message !== undefined) console.error(verdict.message);
     return verdict.code;
   }
@@ -193,11 +194,29 @@ const main = async (argv: readonly string[]): Promise<number> => {
     return 0;
   }
   const identity = detectIdentity(env);
-  const [command, args] =
-    first === "git" ? (["git", rest] as const) : first === "gh" ? (["gh", rest] as const) : (["gh", argv] as const);
+  if (first === "git") {
+    if (rest.length === 0) {
+      console.error(USAGE);
+      return 1;
+    }
+    return runGit(
+      {
+        identity,
+        env,
+        api: GITHUB,
+        configDir: defaultConfigDir(),
+        registry: REGISTRY,
+        nowSeconds,
+        sleep: (ms) => Bun.sleep(ms),
+        readGitConfig: (dir) => readGitConfig(dir, env),
+      },
+      rest,
+    );
+  }
+  const args = first === "gh" ? rest : argv;
   const context: Context = {
     identity,
-    repo: await resolveRepo(first === "doctor" ? "git" : command, args, env, () => originUrl(process.cwd())),
+    repo: await resolveRepo(first === "doctor" ? "git" : "gh", args, env, () => originUrl(process.cwd())),
     env,
     api: GITHUB,
     configDir: defaultConfigDir(),
@@ -210,7 +229,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     console.error(USAGE);
     return 1;
   }
-  return runAs(context, [command, ...args]);
+  return runAs(context, ["gh", ...args]);
 };
 
 try {
