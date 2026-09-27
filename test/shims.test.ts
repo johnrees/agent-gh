@@ -142,8 +142,10 @@ test("the generated shims hold no path with a quote that could break out of the 
   expect(() => ghShim("/shims", "/it's/agent-gh", true)).toThrow("single quote");
 });
 
-/** The POSIX shells a shim meets: /bin/sh (bash on macOS, dash on Debian and Ubuntu) and dash, each once. */
-const SHELLS = [...new Set(["/bin/sh", "/bin/dash", "/usr/bin/dash"].filter((path) => existsSync(path)).map((path) => realpathSync(path)))];
+/** The shells a shim meets: /bin/sh (bash on macOS, Fedora, and Arch; dash on Debian and Ubuntu), dash, and bash, each once. */
+const SHELLS = [
+  ...new Set(["/bin/sh", "/bin/dash", "/usr/bin/dash", "/bin/bash"].filter((path) => existsSync(path)).map((path) => realpathSync(path))),
+];
 
 /** Writes `text` to `dir/name` as an executable script run by `shell`, as a test fixture copying `command -v git` would. */
 const place = (dir: string, name: string, text: string, shell: string) => {
