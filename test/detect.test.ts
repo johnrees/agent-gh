@@ -34,6 +34,12 @@ test("an IDE terminal's CLAUDECODE alone is a person, not an agent", () => {
   expect(inAgentSession(CLAUDE)).toBe(true);
 });
 
+test("a runner that names its harness is an agent session, so its commits are credited", () => {
+  expect(inAgentSession({ AGENT_GH_HARNESS: "codex" })).toBe(true);
+  expect(inAgentSession({ AGENT_GH_HARNESS: "nope" })).toBe(false);
+  expect(inAgentSession({ AGENT_GH_HARNESS: "" })).toBe(false);
+});
+
 test("no harness, or two, is refused", () => {
   expect(refusal(() => detectHarness({}))).toBe(
     "detecting the harness: no agent harness detected; run gh yourself, agent-gh is for agent sessions",

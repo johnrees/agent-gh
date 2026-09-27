@@ -15,7 +15,7 @@ import { guard } from "./guard.ts";
 import { familyNames } from "./family.ts";
 import { detectIdentity, inAgentSession } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
-import { formatLine, latestRelease, machineDoctor } from "./machine.ts";
+import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
 import { originUrl, resolveRepo } from "./repo.ts";
 import { type Context, runAs } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
@@ -127,6 +127,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
       ...shimDeps(env),
       version: VERSION,
       latest: () => latestRelease(GITHUB, "johnrees/agent-gh"),
+      ssh: sshToGitHub,
     });
     for (const line of lines) console.log(formatLine(line));
     const failed = lines.some((line) => line.state === "FAIL");

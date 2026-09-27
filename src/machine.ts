@@ -8,6 +8,26 @@ import { agentMachineGit, findReal, holds, isShim, personalGhLogin, readMachine,
 
 export const RERUN = "rerun the install line";
 
+/** What GitHub tells this machine's SSH keys: one logs in, none does, or no answer. */
+export type SshAnswer = "authenticates" | "refused" | "unknown";
+
+/**
+ * Asks GitHub whether any SSH key here logs in, without a terminal. On an
+ * agent machine one that does could push over SSH, which no URL rule can
+ * route through agent-gh (an ssh Host alias, a spelling git does not match).
+ */
+export const sshToGitHub = (): SshAnswer => {
+  try {
+    const options = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new"];
+    const result = Bun.spawnSync(["ssh", ...options, "git@github.com"], { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 15_000 });
+    const said = `${result.stdout.toString()}${result.stderr.toString()}`;
+    if (said.includes("successfully authenticated")) return "authenticates";
+    return said.includes("Permission denied") ? "refused" : "unknown";
+  } catch {
+    return "unknown";
+  }
+};
+
 type Line = { readonly state: "ok" | "FAIL" | "note"; readonly name: string; readonly detail: string };
 
 /** The newest release's tag, or undefined when GitHub does not say (a private repository, or offline). */
@@ -33,7 +53,7 @@ export const latestRelease = async (api: Api, repo: string): Promise<string | un
  * always the install line. Exit 0 only with no failure.
  */
 export const machineDoctor = async (
-  deps: ShimDeps & { readonly version: string; readonly latest: () => Promise<string | undefined> },
+  deps: ShimDeps & { readonly version: string; readonly latest: () => Promise<string | undefined>; readonly ssh: () => SshAnswer },
 ): Promise<Line[]> => {
   const lines: Line[] = [];
   const add = (state: Line["state"], name: string, detail: string) => lines.push({ state, name, detail });
@@ -78,6 +98,14 @@ export const machineDoctor = async (
       wrong.length === 0
         ? "an agent session uses its family App where installed, and anyone else the read App"
         : `not as install-shims sets them: ${wrong.join(", ")}; ${RERUN} with --agent-machine`,
+    );
+    const ssh = deps.ssh();
+    add(
+      ssh === "authenticates" ? "FAIL" : ssh === "refused" ? "ok" : "note",
+      "ssh",
+      ssh === "authenticates"
+        ? "a key here logs in to GitHub, and SSH can push without agent-gh; remove it from this machine or from your GitHub account"
+        : ssh === "refused" ? "no key here logs in to GitHub" : "GitHub did not answer over SSH",
     );
     const personal = personalGhLogin(deps);
     add(personal ? "FAIL" : "ok", "gh login", personal ? "gh holds your personal login; run `gh auth logout --hostname github.com`" : "no personal login");

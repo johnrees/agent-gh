@@ -73,8 +73,8 @@ test("on an agent machine a person's gh reads with the read App's token, and nev
 });
 
 test("the shims' session test agrees with agent-gh's harness table", () => {
-  const names = [...new Set(HARNESSES.flatMap((harness) => harness.rules.flat().map((condition) => condition.name)))];
-  const values = [undefined, "", " ", "1", "x"];
+  const names = [...new Set(HARNESSES.flatMap((harness) => harness.rules.flat().map((condition) => condition.name))), "AGENT_GH_HARNESS"];
+  const values = [undefined, "", " ", "1", "x", "codex", " codex", "claude"];
   const fn = sessionFunction();
   const cases: Record<string, string>[] = [];
   for (const name of names) for (const value of values) cases.push(value === undefined ? {} : { [name]: value });

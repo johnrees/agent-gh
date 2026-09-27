@@ -5,7 +5,7 @@ import { READ_APP, readConfig, type Registry } from "./config.ts";
 import { PUSH_USER } from "./credential.ts";
 import { CHILD_MARKER } from "./env.ts";
 import { Failure } from "./failure.ts";
-import { type Env, HARNESSES } from "./harness.ts";
+import { type Env, HARNESSES, harnessNames } from "./harness.ts";
 import { loginUsable } from "./login.ts";
 import { VERSION } from "./version.ts";
 
@@ -59,6 +59,7 @@ export const sessionFunction = (): string => {
     "agh_set() { case $1 in *[![:space:]]*) return 0 ;; esac; return 1; }",
     "agh_session() {",
     ...rules,
+    `  case \${AGENT_GH_HARNESS-} in ${harnessNames().map(quote).join(" | ")}) return 0 ;; esac # a runner that names its harness`,
     "  return 1",
     "}",
   ].join("\n");

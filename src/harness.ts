@@ -59,8 +59,13 @@ export const detects = (harness: Harness, env: Env): boolean =>
 
 export const harnessNames = (): string[] => HARNESSES.map((harness) => harness.name);
 
-/** True inside any agent harness's tool process: setup refuses there. */
-export const inAgentSession = (env: Env): boolean => HARNESSES.some((harness) => detects(harness, env));
+/**
+ * True inside any agent harness's tool process, or in a runner that names a
+ * harness with AGENT_GH_HARNESS: setup refuses there, and the gh shim, the
+ * commit hook, and an agent machine's git act for it.
+ */
+export const inAgentSession = (env: Env): boolean =>
+  HARNESSES.some((harness) => detects(harness, env)) || harnessNames().includes(env.AGENT_GH_HARNESS ?? "");
 
 /**
  * The harness this process runs under. `AGENT_GH_HARNESS` names one only when

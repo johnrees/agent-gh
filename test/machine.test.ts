@@ -8,7 +8,7 @@ import { childEnv } from "../src/env.ts";
 import { Failure } from "../src/failure.ts";
 import { familyNames } from "../src/family.ts";
 import { loginAll, loginTargets } from "../src/login.ts";
-import { formatLine, machineDoctor } from "../src/machine.ts";
+import { formatLine, machineDoctor, type SshAnswer } from "../src/machine.ts";
 import { ghShim, installShims, RC_FILES, type ShimDeps } from "../src/shims.ts";
 import { CONFIG, fakeGitHub, HAPPY, loggedIn, reply } from "./fake-github.ts";
 
@@ -341,8 +341,9 @@ test("install-shims on a person's own machine leaves git credentials and gh's lo
 test("doctor --machine passes a set-up agent machine and names the fix for each failure", async () => {
   const { home, bin, deps } = machine();
   installShims(deps, true, ["claude"]);
+  let ssh: SshAnswer = "refused";
   const doctor = async (overrides: Partial<ShimDeps> = {}, version = "v0.1.0", latest: string | null = "v0.1.0") =>
-    (await machineDoctor({ ...deps, ...overrides, version, latest: async () => latest ?? undefined })).map(formatLine);
+    (await machineDoctor({ ...deps, ...overrides, version, latest: async () => latest ?? undefined, ssh: () => ssh })).map(formatLine);
 
   const healthy = await doctor();
   expect(healthy).toEqual([
@@ -352,8 +353,16 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
     "ok   login read: usable",
     `ok   gh shim: ${join(deps.shims, "gh")} is first on PATH`,
     "ok   git credentials: an agent session uses its family App where installed, and anyone else the read App",
+    "ok   ssh: no key here logs in to GitHub",
     "ok   gh login: no personal login",
   ]);
+  ssh = "authenticates";
+  expect(await doctor()).toContain(
+    "FAIL ssh: a key here logs in to GitHub, and SSH can push without agent-gh; remove it from this machine or from your GitHub account",
+  );
+  ssh = "unknown";
+  expect(await doctor()).toContain("note ssh: GitHub did not answer over SSH");
+  ssh = "refused";
 
   expect((await doctor({}, "v0.1.0", "v0.2.0"))[0]).toBe("FAIL agent-gh: v0.1.0, and v0.2.0 is out; rerun the install line");
   expect((await doctor({}, "dev"))[0]).toBe("note agent-gh: a local build, not a release");

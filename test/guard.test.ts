@@ -155,6 +155,12 @@ test("a message git keeps is credited, whatever looks like a comment in it", () 
   expect(run(["git", "commit", "-q"], { ...agent, GIT_EDITOR: "true" }).code).not.toBe(0);
 });
 
+test("a runner that names its harness is credited like any agent session", () => {
+  const { person, run, last } = world();
+  expect(run(["git", "commit", "-q", "-m", "runner"], { ...person, AGENT_GH_HARNESS: "codex" }).code).toBe(0);
+  expect(last("%B")).toBe(`runner\n\nAgent-Harness: codex\n${app("codex")}`);
+});
+
 test("a person's commit, and any commit in a repository with no github.com remote, is left exactly as written", () => {
   const { person, run, last } = world();
   expect(run(["git", "commit", "-q", "-m", "mine"], person)).toEqual({ code: 0, stderr: "" });
