@@ -1,4 +1,4 @@
-import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { READ_APP, readConfig, type Registry } from "./config.ts";
@@ -66,19 +66,47 @@ export const sessionFunction = (): string => {
   ].join("\n");
 };
 
-/** Finds the next `$1` on PATH outside the shim directory, into AGH_REAL, without a subshell. */
-const realFunction = (shims: string) =>
+/** How many agent-gh shims one process may run in turn before the next refuses. */
+export const SHIM_HOPS = 3;
+
+/**
+ * Finds the next `$1` on PATH into AGH_REAL, without a subshell. It skips the
+ * shim directory and the running script itself (its own directory when the
+ * names match, and any path to the same file), so a copy of the shim, such as
+ * a test fixture's copy of `command -v git`, finds the real program instead of
+ * itself. A shim that reaches another shim execs it in the same process, so
+ * AGH_SHIM_PID equal to `$$` counts one more hop, and shims that keep reaching
+ * each other fail loudly instead of looping. Real git running git again
+ * (hooks, aliases, `git -C`) starts a new process, which starts a new count.
+ */
+export const realFunction = (shims: string) =>
   [
     `AGH_SHIMS=${quote(shims)}`,
     "agh_real() {",
+    '  if [ "${AGH_SHIM_PID-}" = "$$" ]; then',
+    "    AGH_SHIM_HOPS=$(( ${AGH_SHIM_HOPS:-0} + 1 ))",
+    '    AGH_SHIM_TRAIL="${AGH_SHIM_TRAIL-}, $0"',
+    "  else",
+    "    AGH_SHIM_HOPS=0",
+    "    AGH_SHIM_TRAIL=$0",
+    "  fi",
+    `  if [ "$AGH_SHIM_HOPS" -ge ${SHIM_HOPS} ]; then`,
+    '    echo "agent-gh shim: $AGH_SHIM_TRAIL ran in turn and never reached the real $1: a copy of the shim, or a wrapper that runs $1 from PATH, is ahead of it. Copy the real $1 instead: \\$(agent-gh which $1)" >&2',
+    "    exit 127",
+    "  fi",
+    "  AGH_SHIM_PID=$$",
+    "  export AGH_SHIM_PID AGH_SHIM_HOPS AGH_SHIM_TRAIL",
+    "  case $0 in */*) agh_here=${0%/*}/ ;; *) agh_here=./ ;; esac",
     '  agh_rest="$PATH:"',
     '  while [ -n "$agh_rest" ]; do',
     '    agh_dir=${agh_rest%%:*}',
     '    agh_rest=${agh_rest#*:}',
     '    case $agh_dir in "" | "$AGH_SHIMS" | "$AGH_SHIMS/") continue ;; esac',
-    '    if [ -f "$agh_dir/$1" ] && [ -x "$agh_dir/$1" ]; then AGH_REAL=$agh_dir/$1; return 0; fi',
+    '    case $agh_dir/ in "$agh_here" | "$agh_here/") [ "${0##*/}" = "$1" ] && continue ;; esac',
+    '    if [ -f "$agh_dir/$1" ] && [ -x "$agh_dir/$1" ] && ! [ "$agh_dir/$1" -ef "$0" ]; then AGH_REAL=$agh_dir/$1; return 0; fi',
     "  done",
-    '  echo "agent-gh shim: no $1 on PATH outside $AGH_SHIMS" >&2',
+    '  if [ "$0" -ef "$AGH_SHIMS/$1" ]; then echo "agent-gh shim: no $1 on PATH outside $AGH_SHIMS" >&2; exit 127; fi',
+    '  echo "agent-gh shim: $0 is a copy of the $1 shim in $AGH_SHIMS, and no real $1 follows it on PATH. Copy the real $1 instead: \\$(agent-gh which $1)" >&2',
     "  exit 127",
     "}",
   ].join("\n");
@@ -215,20 +243,50 @@ export const updateStartupFiles = (home: string, shims: string, bin: string): st
   return targets;
 };
 
-/** The first `name` on `path` outside `skip`, as the shims find it. */
-export const findReal = (name: string, path: string | undefined, skip: string): string | undefined => {
+/** The first `name` on `path` outside `skip`, as the shims find it, that `accept` takes. */
+export const findReal = (
+  name: string,
+  path: string | undefined,
+  skip: string,
+  accept: (candidate: string) => boolean = () => true,
+): string | undefined => {
   for (const dir of (path ?? "").split(delimiter)) {
     if (dir === "" || dir === skip || dir === `${skip}/`) continue;
     const candidate = join(dir, name);
     try {
       accessSync(candidate, constants.X_OK);
-      if (statSync(candidate).isFile()) return candidate;
+      if (statSync(candidate).isFile() && accept(candidate)) return candidate;
     } catch {
       // Not there, or not executable: keep looking.
     }
   }
   return undefined;
 };
+
+const SHIM_HEADER = /^#!\/bin\/sh\n# \S+ shim from agent-gh /;
+
+/** Whether `path` is an agent-gh shim, installed or copied, by its first line of comment. */
+export const isShim = (path: string): boolean => {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return false; // Executable but unreadable: a binary, not a shell script.
+  }
+  try {
+    const head = Buffer.alloc(64);
+    return SHIM_HEADER.test(head.toString("utf8", 0, readSync(fd, head, 0, head.length, 0)));
+  } finally {
+    closeSync(fd);
+  }
+};
+
+/**
+ * `agent-gh which <gh|git>`: the real program, never a shim or a copy of one,
+ * for a script or test fixture that copies git or gh somewhere.
+ */
+export const whichReal = (name: string, path: string | undefined, shims: string): string | undefined =>
+  findReal(name, path, shims, (candidate) => !isShim(candidate));
 
 export type ShimDeps = {
   readonly home: string;
