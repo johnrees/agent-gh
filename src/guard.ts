@@ -24,41 +24,49 @@ const AUTO = "#;@!$%^&|:";
  * The prefix git's comment lines start with: `core.commentString`, else
  * `core.commentChar`, else `#`. For `auto`, git chose a character no line of
  * the starting message began with and wrote its template with it, so it is
- * read back from the `-v` scissors line or the template's last line.
+ * read back from the `-v` scissors line or the template's last two lines;
+ * with neither (an editor replaced the whole buffer), no line is a comment.
  */
-export const commentPrefix = (config: GitConfig, text: string): string => {
+export const commentPrefix = (config: GitConfig, text: string): string | undefined => {
   const prefix = config.get("core.commentString") ?? config.get("core.commentChar");
   if (prefix !== "auto") return prefix ?? "#";
   const lines = text.split("\n");
   const scissors = lines.find((line) => /^. -{24} >8 -{24}$/.test(line) && AUTO.includes(line[0] as string));
   if (scissors !== undefined) return scissors[0] as string;
-  const last = lines.findLast((line) => line.trim() !== "");
-  return last !== undefined && AUTO.includes(last[0] as string) && (last.length === 1 || /\s/.test(last[1] as string)) ? (last[0] as string) : "#";
+  const [last, previous] = lines.filter((line) => line.trim() !== "").reverse();
+  const char = last?.[0];
+  return char !== undefined && AUTO.includes(char) && commentLine(last, char) && commentLine(previous, char) ? char : undefined;
 };
+
+/** A line as git's own template writes a comment: the prefix alone, or followed by a space or tab. */
+const commentLine = (line: string | undefined, prefix: string): boolean =>
+  line !== undefined && (line === prefix || line.startsWith(`${prefix} `) || line.startsWith(`${prefix}\t`));
 
 /**
  * Whether a commit message has any text of its own: something before the
  * `git commit -v` scissors line that is not blank, and not a comment when
- * git's cleanup strips comments (an edited message, or `commit.cleanup=strip`).
- * git aborts an empty message only after commit-msg runs, so a hook that added
- * trailers to one would commit a message made of trailers alone.
+ * git's cleanup strips comments. git aborts an empty message only after
+ * commit-msg runs, so a hook that added trailers to one would commit a
+ * message made of trailers alone.
  */
-export const hasMessage = (text: string, prefix: string, stripsComments: boolean): boolean => {
+export const hasMessage = (text: string, prefix: string | undefined, stripsComments: boolean): boolean => {
   const lines = text.split("\n");
-  const scissors = lines.indexOf(`${prefix} ------------------------ >8 ------------------------`);
+  const scissors = prefix === undefined ? -1 : lines.indexOf(`${prefix} ------------------------ >8 ------------------------`);
   return (scissors === -1 ? lines : lines.slice(0, scissors)).some(
-    (line) => line.trim() !== "" && !(stripsComments && line.startsWith(prefix)),
+    (line) => line.trim() !== "" && !(stripsComments && prefix !== undefined && line.startsWith(prefix)),
   );
 };
 
 /**
- * Whether git strips comment lines from this message. git sets GIT_EDITOR to
- * `:` for the hook when no editor runs (`-m`, `-F`, `--no-edit`), and then
- * keeps comment lines unless `commit.cleanup` is `strip`.
+ * Whether git strips comment lines from this message: with `commit.cleanup`
+ * at its default, only from an edited one. git sets GIT_EDITOR to `:` for the
+ * hook when no editor runs (`-m`, `-F`, `--no-edit`), but a `:` editor someone
+ * configured still gets git's template, which comment lines of its own mark.
  */
-const stripsComments = (config: GitConfig, env: Env): boolean => {
+export const stripsComments = (config: GitConfig, env: Env, text: string, prefix: string | undefined): boolean => {
   const cleanup = config.get("commit.cleanup") ?? "default";
-  return cleanup === "strip" || (cleanup === "default" && env.GIT_EDITOR !== ":");
+  if (cleanup !== "default") return cleanup === "strip";
+  return env.GIT_EDITOR !== ":" || (prefix !== undefined && text.split("\n").some((line) => commentLine(line, prefix)));
 };
 
 /**
@@ -87,7 +95,8 @@ export const guard = (
     const config = repository();
     if (!onGitHub(config)) return PASS;
     const text = readFileSync(file, "utf8");
-    if (!hasMessage(text, commentPrefix(config, text), stripsComments(config, env))) return PASS;
+    const prefix = commentPrefix(config, text);
+    if (!hasMessage(text, prefix, stripsComments(config, env, text, prefix))) return PASS;
     const identity = detectIdentity(env);
     const app = readConfig(configDir, identity.family, registry);
     const result = Bun.spawnSync(["git", "interpret-trailers", "--in-place", "--no-divider", ...trailerArgs(identity, app), file], {

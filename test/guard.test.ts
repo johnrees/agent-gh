@@ -112,6 +112,8 @@ test("an empty message still aborts the commit: no trailers make it a message", 
   const before = count();
   expect(run(["git", "commit", "-q", "-m", ""], agent).code).not.toBe(0);
   expect(run(["git", "commit", "-q", "-v"], { ...agent, GIT_EDITOR: "true" }).code).not.toBe(0);
+  // A configured `:` editor looks like no editor to the hook, but git's template still says the message is empty.
+  expect(run(["git", "commit", "-q"], { ...agent, GIT_EDITOR: ":" }).code).not.toBe(0);
   expect(count()).toBe(before);
   expect(hasMessage("\n# only a comment\n", "#", true)).toBe(false);
   expect(hasMessage("#123 fix\n", "#", true)).toBe(false);
@@ -137,6 +139,13 @@ test("a message git keeps is credited, whatever looks like a comment in it", () 
     expect([char, message, run(["git", "commit", "-q", "-e", "-m", message], { ...agent, GIT_EDITOR: "true" }).code]).toEqual([char, message, 0]);
     expect([char, last("%B")]).toEqual([char, `${message}\n\n${CLAUDE_TRAILERS}`]);
   }
+  // With auto, an editor that replaces the whole buffer leaves no comment character behind: its text is the message.
+  const replacer = join(home, "replacer");
+  writeFileSync(replacer, `#!/bin/sh\nprintf '#new subject\\n' > "$1"\n`);
+  chmodSync(replacer, 0o755);
+  stage("replaced\n");
+  expect(run(["git", "commit", "-q", "-e", "-m", "#old"], { ...agent, GIT_EDITOR: replacer }).code).toBe(0);
+  expect(last("%B")).toBe(`#new subject\n\n${CLAUDE_TRAILERS}`);
   // With auto, an emptied message is still empty, whichever character git chose.
   const emptier = join(home, "emptier");
   writeFileSync(emptier, `#!/bin/sh\ngrep '^;' "$1" > "$1.new"; mv "$1.new" "$1"\n`);

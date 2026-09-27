@@ -263,7 +263,9 @@ test("install-shims --agent-machine: git reads with the read App and pushes with
   expect(readFileSync(join(home, ".gitconfig"), "utf8")).toBe(gitconfig);
   git(["config", "--global", "--unset", "url.https://github.com/.insteadOf", "^git@"]);
   installShims(deps, true, ["claude"]);
-  expect(git(["config", "--global", "--get-all", "url.https://github.com/.insteadOf"]).stdout).toBe("ssh://git@github.com/\ngh:\ngit@github.com:\n");
+  expect(git(["config", "--global", "--get-all", "url.https://github.com/.insteadOf"]).stdout).toBe(
+    "ssh://git@github.com/\ngit+ssh://git@github.com/\nssh+git://git@github.com/\nssh://git@ssh.github.com:443/\ngh:\ngit@github.com:\n",
+  );
   expect(readFileSync(join(home, ".zshrc"), "utf8")).toBe(zshrc);
   expect(printed.at(-1)).toBe("gh: no personal login on this machine");
 
@@ -277,7 +279,14 @@ test("install-shims --agent-machine: git reads with the read App and pushes with
   // Every GitHub remote uses HTTPS, and pushes, and only pushes, name PUSH_USER, whichever way the remote is written.
   const repo = join(home, "repo");
   git(["init", "-q", repo]);
-  for (const [name, url] of [["https", "https://github.com/johnrees/penmon.git"], ["scp", "git@github.com:johnrees/penmon.git"], ["ssh", "ssh://git@github.com/johnrees/penmon.git"]]) {
+  for (const [name, url] of [
+    ["https", "https://github.com/johnrees/penmon.git"],
+    ["scp", "git@github.com:johnrees/penmon.git"],
+    ["ssh", "ssh://git@github.com/johnrees/penmon.git"],
+    ["gitssh", "git+ssh://git@github.com/johnrees/penmon.git"],
+    ["sshgit", "ssh+git://git@github.com/johnrees/penmon.git"],
+    ["port443", "ssh://git@ssh.github.com:443/johnrees/penmon.git"],
+  ]) {
     git(["-C", repo, "remote", "add", name as string, url as string]);
     expect(git(["-C", repo, "remote", "get-url", "--push", name as string]).stdout).toBe(`https://${PUSH_USER}@github.com/johnrees/penmon.git\n`);
     expect(git(["-C", repo, "remote", "get-url", name as string]).stdout).toBe("https://github.com/johnrees/penmon.git\n");
@@ -363,7 +372,7 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
   writeFileSync(join(deps.shims, "git"), ghShim(deps.shims, deps.agentGh, true).replace("# gh shim", "# git shim"));
   expect(await doctor()).toContain(`FAIL git shim: ${join(deps.shims, "git")} is left from an older agent-gh; rerun the install line`);
   Bun.spawnSync(["git", "config", "--global", "--unset-all", `url.https://${PUSH_USER}@github.com/.pushInsteadOf`], { env: deps.env });
-  Bun.spawnSync(["git", "config", "--global", "--unset", "url.https://github.com/.insteadOf", "^ssh:"], { env: deps.env });
+  Bun.spawnSync(["git", "config", "--global", "--unset", "url.https://github.com/.insteadOf", "^ssh://git@github"], { env: deps.env });
   expect(await doctor()).toContain(
     `FAIL git credentials: not as install-shims sets them: url.https://${PUSH_USER}@github.com/.pushInsteadOf, url.https://github.com/.insteadOf; rerun the install line with --agent-machine`,
   );

@@ -270,6 +270,19 @@ const real = (deps: ShimDeps, name: string, args: string[], stdin: "inherit" | "
   return { code: result.exitCode ?? 1, stdout: result.stdout.toString() };
 };
 
+/**
+ * The ways a remote spells github.com over SSH, as git parses them (connect.c
+ * takes `git+ssh` and `ssh+git` as `ssh`), including SSH over port 443. An ssh
+ * `Host` alias cannot be matched by prefix.
+ */
+const SSH_GITHUB = [
+  "git@github.com:",
+  "ssh://git@github.com/",
+  "git+ssh://git@github.com/",
+  "ssh+git://git@github.com/",
+  "ssh://git@ssh.github.com:443/",
+] as const;
+
 /** One global git setting: every value in order (`exact`), or values it must include among others. */
 export type GitSetting = { readonly key: string; readonly values: readonly string[]; readonly exact: boolean };
 
@@ -284,8 +297,8 @@ export type GitSetting = { readonly key: string; readonly values: readonly strin
 export const agentMachineGit = (agentGh: string): readonly GitSetting[] => [
   { key: "credential.https://github.com.helper", values: ["", `!${/\s/.test(agentGh) ? quote(agentGh) : agentGh} credential`], exact: true },
   { key: "credential.https://github.com.useHttpPath", values: ["true"], exact: true },
-  { key: `url.https://${PUSH_USER}@github.com/.pushInsteadOf`, values: ["https://github.com/", "git@github.com:", "ssh://git@github.com/"], exact: true },
-  { key: "url.https://github.com/.insteadOf", values: ["git@github.com:", "ssh://git@github.com/"], exact: false },
+  { key: `url.https://${PUSH_USER}@github.com/.pushInsteadOf`, values: ["https://github.com/", ...SSH_GITHUB], exact: true },
+  { key: "url.https://github.com/.insteadOf", values: SSH_GITHUB, exact: false },
 ];
 
 /** Every value of a global git setting, in order. */
