@@ -38,7 +38,7 @@ const get = async (api: Api, stage: Stage, path: string, token: string): Promise
       signal: AbortSignal.timeout(api.timeoutMs),
     });
   } catch {
-    throw new Failure(stage, `could not reach ${host(api.base)}`);
+    throw new Failure(stage, `could not reach ${host(api.base)}`, true);
   }
 };
 
@@ -74,7 +74,7 @@ export const oauthPost = async (
       signal: AbortSignal.timeout(api.timeoutMs),
     });
   } catch {
-    throw new Failure(stage, `could not reach ${host(api.web)}`);
+    throw new Failure(stage, `could not reach ${host(api.web)}`, true);
   }
   return json(response, stage);
 };

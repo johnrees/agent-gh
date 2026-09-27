@@ -1,11 +1,10 @@
 /**
- * Finds commands that would skip agent-gh and act with John's own login: GitHub
- * writes through gh, and git commands that create or rewrite commits or push,
- * unless they run through agent-gh. The check behind hooks/deny-bare-gh.ts.
- * It is a guard against the easy mistake, not a security boundary: `eval`,
- * aliases, and scripts get past it.
+ * Finds GitHub writes through gh that skip agent-gh and would act with John's
+ * own login, for machines without the gh shim. The check behind
+ * hooks/deny-bare-gh.ts. It is a guard against the easy mistake, not a
+ * security boundary: `eval`, aliases, and scripts get past it. git is not
+ * checked: a repository's commit hook credits the App however git runs.
  */
-import { subcommand } from "./git.ts";
 
 /** gh subcommands that write, by command group. */
 const GH_WRITES: Readonly<Record<string, readonly string[]>> = {
@@ -19,13 +18,6 @@ const WRITE_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
 const API_FIELDS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
 /** Words that run the next word as the command. */
 const WRAPPERS = new Set(["command", "builtin", "exec", "env", "time", "nohup", "sudo", "xargs"]);
-/**
- * git subcommands that create or rewrite commits, which a bare git would
- * author as John, and push, which would publish as John. `--abort` and
- * `--quit` only stop an operation, so they stay allowed.
- */
-export const GIT_AUTHORS = new Set(["commit", "merge", "pull", "cherry-pick", "revert", "rebase", "am"]);
-export const GIT_STOPS = new Set(["--abort", "--quit"]);
 
 /** Splits a command line into simple commands of words, honouring quotes. */
 export const simpleCommands = (line: string): string[][] => {
@@ -116,36 +108,16 @@ const ghWrites = (args: readonly string[]): string | undefined => {
   return undefined;
 };
 
-const gitWrites = (args: readonly string[]): string | undefined => {
-  const name = subcommand(args);
-  if (name === "push") return "git push";
-  if (name !== undefined && GIT_AUTHORS.has(name) && !args.some((arg) => GIT_STOPS.has(arg))) return `git ${name}`;
-  return undefined;
-};
-
 /** The first command in `line` that would act as John, or undefined. */
 export const bareWrite = (line: string): string | undefined => {
   for (const words of simpleCommands(line)) {
     const found = program(words);
     if (found === undefined || found.name === "agent-gh") continue;
-    if (found.name === "gh") {
-      const write = ghWrites(found.args);
-      if (write !== undefined) return write;
-    }
-    if (found.name === "git") {
-      const write = gitWrites(found.args);
-      if (write !== undefined) return write;
-    }
+    const write = found.name === "gh" ? ghWrites(found.args) : undefined;
+    if (write !== undefined) return write;
   }
   return undefined;
 };
 
-export const denyReason = (write: string): string => {
-  if (write === "git push") {
-    return "git push would publish with John's own login, without this agent's App. Run it through agent-gh: `agent-gh git push ...`.";
-  }
-  if (write.startsWith("git ")) {
-    return `${write} would not credit this agent. Run it as \`agent-gh ${write} ...\` so a commit carries the Agent-* trailers and the family App as co-author.`;
-  }
-  return `${write} would publish with John's own login, without this agent's App badge. Run GitHub writes through agent-gh: \`agent-gh ${write.replace(/^gh /, "").replace(/ \(a write\)$/, "")} ...\`.`;
-};
+export const denyReason = (write: string): string =>
+  `${write} would publish with John's own login, without this agent's App badge. Run GitHub writes through agent-gh: \`agent-gh ${write.replace(/^gh /, "").replace(/ \(a write\)$/, "")} ...\`.`;

@@ -365,7 +365,7 @@ group("another machine needs only the committed registry and `agent-gh login`", 
     expect(() => readConfig(join(tmpdir(), "agent-gh-none"), "claude", bad)).toThrow("the claude entry in apps.json is not a valid App");
   });
 
-  test("git and doctor work with no private key on the machine", async () => {
+  test("gh and doctor work with no private key on the machine", async () => {
     const { context } = setup();
     const dir = loginOnly();
     const bin = mkdtempSync(join(tmpdir(), "agent-gh-bin-"));
@@ -375,7 +375,7 @@ group("another machine needs only the committed registry and `agent-gh login`", 
     script("gh", 'case "$2" in user) echo johnrees ;; user/installations) echo johnrees ;; esac');
     script("git", 'case "$1" in var) echo "John Rees <john@example.com> 1800000000 +0000" ;; ls-remote) echo "0000 HEAD" ;; --version) echo "git version 2" ;; esac');
     const machine: Context = { ...context, configDir: dir, registry: { claude: ENTRY }, env: { ...context.env, PATH: `${bin}:${process.env.PATH}` } };
-    expect(await runAs(machine, ["git", "--version"])).toBe(0);
+    expect(await runAs(machine, ["gh", "--version"])).toBe(0);
     const lines: string[] = [];
     expect(await doctor(machine, (line) => lines.push(line))).toBe(0);
     expect(lines).toContain("ok   acting user: johnrees");

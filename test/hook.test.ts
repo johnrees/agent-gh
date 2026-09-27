@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { bareWrite } from "../src/hook.ts";
 
-test("bare GitHub writes and commit-making git are found wherever they sit in a command line", () => {
+test("bare GitHub writes through gh are found wherever they sit in a command line", () => {
   const denied: [string, string][] = [
     ["gh pr create --draft --title x", "gh pr create"],
     ["gh pr edit 3 --body y", "gh pr edit"],
@@ -21,33 +21,18 @@ test("bare GitHub writes and commit-making git are found wherever they sit in a 
     ["gh api -XDELETE repos/a/b/labels/x", "gh api (a write)"],
     ["gh api repos/a/b/issues -f title=x", "gh api (a write)"],
     ["gh api graphql -f query='mutation { x }'", "gh api (a write)"],
-    ["git push origin main", "git push"],
-    ["git -C /tmp/repo push", "git push"],
-    ["git -c core.x=y push -u origin b", "git push"],
     ["cd crates && gh pr create", "gh pr create"],
     ["make test; gh issue comment 1 -b done", "gh issue comment"],
     ["FOO=1 gh pr ready 2", "gh pr ready"],
     ["env GH_REPO=a/b gh issue close 1", "gh issue close"],
     ["/opt/homebrew/bin/gh pr merge 1", "gh pr merge"],
     ["echo $(gh pr create --fill)", "gh pr create"],
-    ["git status\ngit push", "git push"],
-    ["git commit -m 'git push later'", "git commit"],
-    ["git -C /r commit --amend --no-edit", "git commit"],
-    ["git -c core.hooksPath=/dev/null commit -am x", "git commit"],
-    ["git merge feature", "git merge"],
-    ["git merge --continue", "git merge"],
-    ["git pull --rebase", "git pull"],
-    ["git cherry-pick abc123", "git cherry-pick"],
-    ["git revert HEAD", "git revert"],
-    ["git rebase -i main", "git rebase"],
-    ["git rebase --continue", "git rebase"],
-    ["git am < fix.patch", "git am"],
-    ["cargo test && git commit -m done", "git commit"],
+    ["git status\ngh pr ready 4", "gh pr ready"],
   ];
   for (const [command, write] of denied) expect([command, bareWrite(command)]).toEqual([command, write]);
 });
 
-test("reads, agent-gh, and mentions are allowed", () => {
+test("gh reads, agent-gh, mentions, and every git command are allowed", () => {
   for (const command of [
     "gh pr view 3",
     "gh pr checks 3 --watch",
@@ -72,6 +57,12 @@ test("reads, agent-gh, and mentions are allowed", () => {
     "agent-gh git commit -m 'git push later'",
     "agent-gh git rebase main",
     "rg 'gh pr merge' docs",
+    "git push origin main",
+    "git -C /r commit --amend --no-edit",
+    "git commit -m 'gh pr create later'",
+    "cargo test && git commit -m done",
+    "git merge feature",
+    "git rebase --continue",
   ]) {
     expect([command, bareWrite(command)]).toEqual([command, undefined]);
   }
@@ -99,11 +90,8 @@ test("the hook script denies with Claude Code's PreToolUse decision", async () =
   expect(output.permissionDecision).toBe("deny");
   expect(output.permissionDecisionReason).toContain("agent-gh pr create");
 
-  const commit = await hook(JSON.stringify({ tool_name: "Bash", tool_input: { command: "git commit -m x" } }));
-  const commitReason = JSON.parse(commit.stdout).hookSpecificOutput.permissionDecisionReason;
-  expect(commitReason).toBe(
-    "git commit would not credit this agent. Run it as `agent-gh git commit ...` so a commit carries the Agent-* trailers and the family App as co-author.",
-  );
+  const commit = await hook(JSON.stringify({ tool_name: "Bash", tool_input: { command: "git commit -m x && git push" } }));
+  expect([commit.code, commit.stdout]).toEqual([0, ""]);
 
   const allowed = await hook(JSON.stringify({ tool_name: "Bash", tool_input: { command: "agent-gh pr create" } }));
   expect([allowed.code, allowed.stdout]).toEqual([0, ""]);

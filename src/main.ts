@@ -1,26 +1,15 @@
 #!/usr/bin/env bun
 /**
- * agent-gh: run gh or git as John through the GitHub App of the model family
- * driving this agent session (johnrees-<family>), whatever harness runs it.
- * GitHub shows each action as John with the App's badge.
- *
- *   agent-gh <gh arguments...>     gh through the App, e.g. agent-gh pr create --draft
- *   agent-gh git <git arguments...>
- *   agent-gh doctor                who is acting, then user, App, git author, and repository access
- *   agent-gh setup <family>        create johnrees-<family> (run in your own terminal)
- *   agent-gh login <family>        authorize the App to act as John (run in your own terminal)
- *   agent-gh settings [family...]  print where each family App's permissions and repositories are changed
- *   agent-gh guard <hook> [args]   decide a repository's git hook: commit-msg, pre-push
- *   agent-gh login --all           log in every App this machine lacks (the install line runs it)
- *   agent-gh install-shims         gh and git shims first on PATH; --agent-machine also removes personal write access
- *   agent-gh doctor --machine      is this machine set up so agents use agent-gh for everything
- *   agent-gh credential <action>   git's credential helper on an agent machine: the read App's token
- *   agent-gh which <gh|git>        the real program behind the shim, for a script that copies it
+ * agent-gh: run gh as John through the GitHub App of the model family driving
+ * this agent session (johnrees-<family>), whatever harness runs it, and credit
+ * that App on the session's commits. GitHub shows each action as John with
+ * the App's badge. The usage below lists every command.
  */
+import { runChild } from "./child.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
-import { credential, readToken } from "./credential.ts";
+import { credential, pushToken, readToken } from "./credential.ts";
 import { doctor } from "./doctor.ts";
-import { describe, Failure } from "./failure.ts";
+import { describe, Failure, NEXT_STEP } from "./failure.ts";
 import { GITHUB } from "./github.ts";
 import { guard } from "./guard.ts";
 import { familyNames } from "./family.ts";
@@ -28,7 +17,7 @@ import { detectIdentity, inAgentSession } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor } from "./machine.ts";
 import { originUrl, resolveRepo } from "./repo.ts";
-import { type Context, runAs, runGit } from "./run.ts";
+import { type Context, runAs } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
 import { readGitConfig } from "./target.ts";
@@ -37,19 +26,18 @@ import { VERSION } from "./version.ts";
 
 const USAGE = `usage:
   agent-gh <gh arguments...>        run gh as John through this agent's family App
-  agent-gh git <git arguments...>   run git the same way; commits credit the App as co-author
   agent-gh doctor                   show who is acting, then check the user, App, git author, and repository access
   agent-gh setup <family>           create johnrees-<family> (${familyNames().join(", ")}, or read); run it yourself, not from an agent
   agent-gh login <family>|--all     authorize johnrees-<family> to act as you (device flow); --all: every App not yet logged in
-  agent-gh install-shims [--agent-machine]  gh and git shims first on PATH; --agent-machine: clone with the read App, gh logged out
+  agent-gh install-shims [--agent-machine]  the gh shim first on PATH; --agent-machine: git reads with the read App and pushes with the family App, gh logged out
   agent-gh doctor --machine         check this machine: release, gitleaks, logins, shims, and agent-machine settings
   agent-gh --version
-  agent-gh credential get           git's credential helper on agent machines: the read App's token, for github.com only
+  agent-gh credential get           git's credential helper on agent machines: the read App's token, or an agent session's family App's for a push
   agent-gh read-token               print the read App's token (the gh shim's GH_TOKEN on agent machines)
   agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)
-  agent-gh guard commit-msg <file>  from a git hook: refuse an agent session's commit that does not credit its family App
-  agent-gh guard pre-push           from a git hook: refuse an agent session's push that did not come through agent-gh
-  agent-gh which <gh|git>           print the real program behind the shim; copy this, never \`command -v git\`, into a test's PATH`;
+  agent-gh guard commit-msg <file>  from a git hook: in an agent session, add its Agent-* trailers and credit its family App
+  agent-gh guard pre-push           from a git hook: passes (kept so existing hooks keep working)
+  agent-gh which <gh|git>           print the real program, past any agent-gh shim; copy this, never \`command -v gh\`, into a test's PATH`;
 
 /** Opens a URL in a local browser if there is one; the printed URL is always the fallback. */
 const openUrl = (url: string) => {
@@ -105,8 +93,14 @@ const main = async (argv: readonly string[]): Promise<number> => {
   if (first === "credential") {
     // git runs this for every github.com request once --agent-machine set it up, agent sessions included.
     const input = await new Response(Bun.stdin.stream()).text();
+    const deps = { api: GITHUB, dir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms: number) => Bun.sleep(ms), env };
     process.stdout.write(
-      await credential(rest[0], input, () => readToken({ api: GITHUB, dir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) })),
+      await credential(rest[0], input, {
+        inAgentSession: inAgentSession(env),
+        read: () => readToken(deps),
+        push: (repo) => pushToken(deps, repo),
+        print: (line) => console.error(line),
+      }),
     );
     return 0;
   }
@@ -150,6 +144,18 @@ const main = async (argv: readonly string[]): Promise<number> => {
     }
     installShims(shimDeps(env), agentMachine, limitedFamilies(familyNames(), env.AGENT_GH_FAMILIES));
     return 0;
+  }
+  if (first === "git") {
+    // Older releases ran git through agent-gh; now a repository's commit hook credits the App.
+    const git = whichReal("git", env.PATH, defaultShimDir());
+    if (git === undefined) {
+      console.error("agent-gh: no git on PATH");
+      return 127;
+    }
+    console.error("agent-gh: `agent-gh git` is plain git now; run git directly (the repository's commit hook credits the App)");
+    const plain: Record<string, string> = {};
+    for (const [name, value] of Object.entries(env)) if (value !== undefined) plain[name] = value;
+    return (await runChild([git, ...rest], plain)).code;
   }
   if (first === "guard") {
     const verdict = guard(rest, env, defaultConfigDir(), REGISTRY, () => readGitConfig(process.cwd(), env));
@@ -210,25 +216,6 @@ const main = async (argv: readonly string[]): Promise<number> => {
     return 0;
   }
   const identity = detectIdentity(env);
-  if (first === "git") {
-    if (rest.length === 0) {
-      console.error(USAGE);
-      return 1;
-    }
-    return runGit(
-      {
-        identity,
-        env,
-        api: GITHUB,
-        configDir: defaultConfigDir(),
-        registry: REGISTRY,
-        nowSeconds,
-        sleep: (ms) => Bun.sleep(ms),
-        readGitConfig: (dir) => readGitConfig(dir, env),
-      },
-      rest,
-    );
-  }
   const args = first === "gh" ? rest : argv;
   const context: Context = {
     identity,
@@ -254,7 +241,7 @@ try {
   console.error(
     error instanceof Failure
       ? describe(error)
-      : `agent-gh: unexpected ${error instanceof Error ? error.name : "error"}. No personal-login fallback was used.`,
+      : `agent-gh: unexpected ${error instanceof Error ? error.name : "error"}.\n${NEXT_STEP}`,
   );
   process.exitCode = 1;
 }

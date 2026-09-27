@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const main = join(import.meta.dir, "..", "src", "main.ts");
+const NEXT = "\nFix what this names, or report it to John; never publish another way (John's own login, gh without agent-gh, or a connector).";
 
 /** Runs the CLI offline: these cases all stop before any request. */
 const cli = async (args: string[], env: Record<string, string>) => {
@@ -14,15 +15,15 @@ const cli = async (args: string[], env: Record<string, string>) => {
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-  return { code, stderr: stderr.trim() };
+  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  return { code, stderr: stderr.trim(), stdout };
 };
 
 test("outside an agent session, agent-gh refuses", async () => {
-  expect(await cli(["pr", "view"], {})).toEqual({
+  expect(await cli(["pr", "view"], {})).toMatchObject({
     code: 1,
     stderr:
-      "agent-gh: detecting the harness failed: no agent harness detected; run gh yourself, agent-gh is for agent sessions. No personal-login fallback was used.",
+      `agent-gh: detecting the harness failed: no agent harness detected; run gh yourself, agent-gh is for agent sessions.${NEXT}`,
   });
 });
 
@@ -47,19 +48,19 @@ test("an IDE terminal's CLAUDECODE is a person, and opencode must declare its mo
 
 test("agents cannot run setup, for any family", async () => {
   const result = await cli(["setup", "glm"], { CODEX_THREAD_ID: "t" });
-  expect(result).toEqual({
+  expect(result).toMatchObject({
     code: 1,
     stderr:
-      "agent-gh: setting up failed: agents do not create their own credentials; run `agent-gh setup` in your own terminal. No personal-login fallback was used.",
+      `agent-gh: setting up failed: agents do not create their own credentials; run \`agent-gh setup\` in your own terminal.${NEXT}`,
   });
 });
 
 test("an agent cannot authorize itself to act as John", async () => {
   for (const env of [{ CODEX_THREAD_ID: "t" }, { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1" }, { PI_SESSION_ID: "p" }]) {
-    expect(await cli(["login", "claude"], env)).toEqual({
+    expect(await cli(["login", "claude"], env)).toMatchObject({
       code: 1,
       stderr:
-        "agent-gh: logging in failed: an agent cannot authorize itself to act as John; run `agent-gh login` in your own terminal. No personal-login fallback was used.",
+        `agent-gh: logging in failed: an agent cannot authorize itself to act as John; run \`agent-gh login\` in your own terminal.${NEXT}`,
     });
   }
   const unknown = await cli(["login", "mistral"], {});
@@ -72,4 +73,14 @@ test("an unknown family for setup prints usage listing the families", async () =
   expect(result.code).toBe(1);
   expect(result.stderr).toStartWith("usage:");
   expect(result.stderr).toContain("(claude, codex, glm, deepseek, kimi, qwen, or read)");
+});
+
+test("agent-gh git, from older releases, is plain git with a note, in or out of an agent session", async () => {
+  for (const env of [{}, { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1" }]) {
+    const result = await cli(["git", "--version"], env);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toStartWith("git version ");
+    expect(result.stderr).toBe("agent-gh: `agent-gh git` is plain git now; run git directly (the repository's commit hook credits the App)");
+  }
+  expect((await cli(["git", "no-such-subcommand"], {})).code).toBe(1);
 });

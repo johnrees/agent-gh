@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
- * Claude Code PreToolUse hook: denies a Bash command that writes to GitHub
- * with gh or pushes with git without going through agent-gh. Register it in
- * ~/.claude/settings.json (README). Unreadable input is reported and allowed:
- * this is a guard, not a boundary.
+ * Claude Code PreToolUse hook, for a machine without the gh shim: denies a
+ * Bash command that writes to GitHub with gh without going through agent-gh.
+ * Register it in ~/.claude/settings.json (README). Unreadable input is
+ * reported and allowed: this is a guard, not a boundary.
  */
 import { bareWrite, denyReason } from "../src/hook.ts";
 

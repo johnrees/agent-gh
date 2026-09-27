@@ -1,8 +1,10 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { isConfigured, READ_APP } from "./config.ts";
 import { familyNames } from "./family.ts";
 import type { Api } from "./github.ts";
 import { loginUsable } from "./login.ts";
-import { credentialHelpers, findReal, helperValues, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
+import { agentMachineGit, findReal, globalGit, isShim, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
 
 export const RERUN = "rerun the install line";
 
@@ -60,21 +62,26 @@ export const machineDoctor = async (
     add(usable ? "ok" : machine.agent_machine ? "FAIL" : "note", "login read", usable ? "usable" : `not logged in; ${RERUN} (or \`agent-gh login read\`)`);
   }
 
-  for (const name of ["gh", "git"]) {
-    const first = findReal(name, deps.env.PATH, "");
-    const shimmed = first !== undefined && first.startsWith(`${deps.shims}/`);
-    add(
-      shimmed ? "ok" : "FAIL",
-      `${name} shim`,
-      shimmed ? `${first} is first on PATH` : `${first ?? `no ${name}`} comes first, not the shim; open a new shell, or ${RERUN}`,
-    );
-  }
+  const gh = findReal("gh", deps.env.PATH, "");
+  const shimmed = gh !== undefined && gh.startsWith(`${deps.shims}/`);
+  add(shimmed ? "ok" : "FAIL", "gh shim", shimmed ? `${gh} is first on PATH` : `${gh ?? "no gh"} comes first, not the shim; open a new shell, or ${RERUN}`);
+  const git = join(deps.shims, "git");
+  if (existsSync(git) && isShim(git)) add("FAIL", "git shim", `${git} is left from an older agent-gh; ${RERUN}`);
 
   if (machine.agent_machine) {
-    const helpers = credentialHelpers(deps);
-    const want = helperValues(deps.agentGh);
-    const helped = helpers.length === want.length && helpers.every((value, index) => value === want[index]);
-    add(helped ? "ok" : "FAIL", "git credentials", helped ? "github.com uses the read App" : `github.com does not use the read App; ${RERUN} with --agent-machine`);
+    const wrong = agentMachineGit(deps.agentGh)
+      .filter(([key, want]) => {
+        const values = globalGit(deps, key);
+        return values.length !== want.length || values.some((value, index) => value !== want[index]);
+      })
+      .map(([key]) => key);
+    add(
+      wrong.length === 0 ? "ok" : "FAIL",
+      "git credentials",
+      wrong.length === 0
+        ? "github.com reads use the read App, and an agent session's push its family App"
+        : `${wrong.join(", ")} not as install-shims sets it; ${RERUN} with --agent-machine`,
+    );
     const personal = personalGhLogin(deps);
     add(personal ? "FAIL" : "ok", "gh login", personal ? "gh holds your personal login; run `gh auth logout --hostname github.com`" : "no personal login");
   }
