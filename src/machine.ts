@@ -79,7 +79,7 @@ export const machineDoctor = async (
       wrong.length === 0 ? "ok" : "FAIL",
       "git credentials",
       wrong.length === 0
-        ? "github.com reads use the read App, and an agent session's push its family App"
+        ? "an agent session uses its family App where installed, and anyone else the read App"
         : `${wrong.join(", ")} not as install-shims sets it; ${RERUN} with --agent-machine`,
     );
     const personal = personalGhLogin(deps);

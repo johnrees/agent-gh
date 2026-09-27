@@ -7,7 +7,7 @@
  */
 import { runChild } from "./child.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
-import { credential, pushToken, readToken } from "./credential.ts";
+import { credential, familyToken, readToken } from "./credential.ts";
 import { doctor } from "./doctor.ts";
 import { describe, Failure, NEXT_STEP } from "./failure.ts";
 import { GITHUB } from "./github.ts";
@@ -32,7 +32,7 @@ const USAGE = `usage:
   agent-gh install-shims [--agent-machine]  the gh shim first on PATH; --agent-machine: git reads with the read App and pushes with the family App, gh logged out
   agent-gh doctor --machine         check this machine: release, gitleaks, logins, shims, and agent-machine settings
   agent-gh --version
-  agent-gh credential get           git's credential helper on agent machines: the read App's token, or an agent session's family App's for a push
+  agent-gh credential get           git's credential helper on agent machines: an agent session's family App where installed, else the read App
   agent-gh read-token               print the read App's token (the gh shim's GH_TOKEN on agent machines)
   agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)
   agent-gh guard commit-msg <file>  from a git hook: in an agent session, add its Agent-* trailers and credit its family App
@@ -98,7 +98,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
       await credential(rest[0], input, {
         inAgentSession: inAgentSession(env),
         read: () => readToken(deps),
-        push: (repo) => pushToken(deps, repo),
+        family: (repo) => familyToken(deps, repo),
         print: (line) => console.error(line),
       }),
     );

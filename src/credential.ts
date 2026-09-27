@@ -22,11 +22,11 @@ export const readToken = async (deps: TokenDeps): Promise<string> =>
   userToken(readConfig(deps.dir, READ_APP, deps.registry), READ_APP, deps);
 
 /**
- * The session family's user token for a push, after checking that its App is
- * installed on the repository when git names one: GitHub's own refusal does
- * not say why.
+ * The session family's user token for a repository, after checking that its
+ * App is installed there when git names one: GitHub's own refusal does not
+ * say why.
  */
-export const pushToken = async (deps: TokenDeps & { readonly env: Env }, repo: Repo | undefined): Promise<string> => {
+export const familyToken = async (deps: TokenDeps & { readonly env: Env }, repo: Repo | undefined): Promise<string> => {
   const { family } = detectIdentity(deps.env);
   const config = readConfig(deps.dir, family, deps.registry);
   const token = await userToken(config, family, deps);
@@ -48,35 +48,51 @@ export const parseCredential = (input: string): Record<string, string> => {
 export type Answers = {
   readonly inAgentSession: boolean;
   readonly read: () => Promise<string>;
-  readonly push: (repo: Repo | undefined) => Promise<string>;
+  readonly family: (repo: Repo | undefined) => Promise<string>;
   readonly print: (line: string) => void;
 };
 
 /**
  * `agent-gh credential <get|store|erase>`, git's credential-helper protocol,
  * set up by `install-shims --agent-machine`. A `get` for https://github.com
- * is answered with the read App's token, or, for a push (username
- * PUSH_USER) from an agent session, with that session family's token. A push
- * from outside an agent session, or a request agent-gh cannot answer, gets
- * `quit`, so git neither prompts nor tries another login. Anything else gets
- * no answer, so git moves on. `store` and `erase` do nothing: the token is
- * agent-gh's to manage.
+ * from an agent session is answered with the session family's token wherever
+ * that family's App is installed, and with the read App's token elsewhere; a
+ * person's gets the read App's. A push (username PUSH_USER) that the family's
+ * App cannot make, or one from a person, gets `quit` with the reason, so git
+ * neither prompts nor tries another login; so does a read agent-gh cannot
+ * answer. Anything else gets no answer, so git moves on. `store` and `erase`
+ * do nothing: the token is agent-gh's to manage.
  */
 export const credential = async (action: string | undefined, input: string, answers: Answers): Promise<string> => {
   if (action !== "get") return "";
   const fields = parseCredential(input);
   if (fields.protocol !== "https" || fields.host !== "github.com") return "";
-  const push = fields.username === PUSH_USER;
-  if (push && !answers.inAgentSession) {
-    answers.print(`agent-gh: this is an agent machine, and only an agent session pushes to GitHub from it.\n${NEXT_STEP}`);
+  const repo = fields.path === undefined ? undefined : parseRepo(fields.path);
+  const quit = (line: string) => {
+    answers.print(line);
     return "quit=1\n";
+  };
+  if (fields.username === PUSH_USER) {
+    if (!answers.inAgentSession) return quit(`agent-gh: this is an agent machine, and only an agent session pushes to GitHub from it.\n${NEXT_STEP}`);
+    try {
+      return `password=${await answers.family(repo)}\n`;
+    } catch (error) {
+      if (!(error instanceof Failure)) throw error;
+      return quit(describe(error));
+    }
+  }
+  // A push to a remote's explicit pushurl, which pushInsteadOf leaves alone, arrives here too.
+  if (answers.inAgentSession && repo !== undefined) {
+    try {
+      return `username=x-access-token\npassword=${await answers.family(repo)}\n`;
+    } catch (error) {
+      if (!(error instanceof Failure)) throw error;
+    }
   }
   try {
-    if (!push) return `username=x-access-token\npassword=${await answers.read()}\n`;
-    return `password=${await answers.push(fields.path === undefined ? undefined : parseRepo(fields.path))}\n`;
+    return `username=x-access-token\npassword=${await answers.read()}\n`;
   } catch (error) {
     if (!(error instanceof Failure)) throw error;
-    answers.print(describe(error));
-    return "quit=1\n";
+    return quit(describe(error));
   }
 };

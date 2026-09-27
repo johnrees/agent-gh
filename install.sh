@@ -5,9 +5,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/johnrees/agent-gh/main/install.sh | bash
 #   curl -fsSL https://raw.githubusercontent.com/johnrees/agent-gh/main/install.sh | bash -s -- --agent-machine
 #
-# --agent-machine, for a machine that only runs agents: git reads with the
-# read-only App and pushes (from agent sessions only) with the family App,
-# and gh is logged out of your personal login, so nothing but agent-gh's
+# --agent-machine, for a machine that only runs agents: an agent session's
+# git uses its family App where installed and anyone else's the read-only
+# App, and gh is logged out of your personal login, so nothing but agent-gh's
 # Apps can write to GitHub from it.
 #
 # The only thing you do is enter the device-flow codes it prints. It needs no

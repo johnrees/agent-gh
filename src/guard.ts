@@ -1,7 +1,7 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { readConfig, type Registry } from "./config.ts";
 import { NEXT_STEP } from "./failure.ts";
-import { trailerArgs } from "./git.ts";
+import { trailerArgs, withoutAbsent } from "./git.ts";
 import { detectIdentity, type Env, inAgentSession } from "./harness.ts";
 import { type GitConfig, onGitHub } from "./target.ts";
 
@@ -67,7 +67,10 @@ export const guard = (
       stdout: "ignore",
       stderr: "pipe",
     });
-    if (result.exitCode === 0) return PASS;
+    if (result.exitCode === 0) {
+      writeFileSync(file, withoutAbsent(readFileSync(file, "utf8")));
+      return PASS;
+    }
     return {
       code: 1,
       message: `agent-gh guard: git interpret-trailers exited ${result.exitCode}, so this commit would not credit ${app.slug}[bot]: ${result.stderr.toString().trim()}\n${NEXT_STEP}`,

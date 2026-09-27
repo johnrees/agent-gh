@@ -273,9 +273,10 @@ const real = (deps: ShimDeps, name: string, args: string[], stdin: "inherit" | "
 /**
  * The global git settings that make an agent machine's git use agent-gh's
  * credential helper for github.com, each key with its exact values in order:
- * a reset, then the helper; the repository's path, so a push can check the
- * App's installation; and a push URL naming PUSH_USER, which is how the helper
- * tells a push, which gets the session family's App, from a read.
+ * a reset, then the helper; the repository's path, so the helper can check
+ * the family App's installation; and a push URL naming PUSH_USER, so a push
+ * the family App cannot make, or a person's, fails with the reason, and an
+ * SSH remote pushes over HTTPS.
  */
 export const agentMachineGit = (agentGh: string): readonly (readonly [string, readonly string[]])[] => [
   ["credential.https://github.com.helper", ["", `!${/\s/.test(agentGh) ? quote(agentGh) : agentGh} credential`]],
@@ -297,9 +298,9 @@ export const personalGhLogin = (deps: ShimDeps): boolean =>
  * `agent-gh install-shims [--agent-machine]`: writes the gh shim and puts it
  * first on PATH in the shell startup files, and removes the git shim older
  * releases wrote. With --agent-machine it also makes agent-gh the only way to
- * write from this machine: git's credential helper for github.com answers
- * reads with the read App and an agent session's pushes with its family App,
- * and gh is logged out of John's personal login. It refuses that until the
+ * write from this machine: git's credential helper for github.com answers an
+ * agent session with its family App where installed and anyone else with the
+ * read App, and gh is logged out of John's personal login. It refuses that until the
  * read App is logged in, so the machine is never left unable to clone.
  */
 export const installShims = (deps: ShimDeps, agentMachine: boolean, families: readonly string[] | undefined): void => {
@@ -337,7 +338,7 @@ export const installShims = (deps: ShimDeps, agentMachine: boolean, families: re
       }
     }
   }
-  deps.print("git: github.com reads use the read App, and an agent session's push uses its family App");
+  deps.print("git: an agent session uses its family App where installed, and anyone else the read App");
   if (personalGhLogin(deps)) {
     const out = real(deps, "gh", ["auth", "logout", "--hostname", "github.com"], "inherit");
     if (out.code !== 0 || personalGhLogin(deps)) {

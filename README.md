@@ -4,7 +4,7 @@ Agents publish to GitHub as John through one GitHub App per model family (claude
 
 - **gh**: in an agent session, the gh shim runs every `gh` command through the session family's App. It never falls back to John's own login.
 - **Commits**: a repository's `commit-msg` hook adds `Agent-Harness` (with `Agent-Model` and `Agent-Effort` when the harness reports them) and `Co-authored-by: johnrees-<family>[bot]` to an agent session's commits. A person's commits, and repositories with no github.com remote, are left as written.
-- **Pushes**: on a machine you use, git pushes with your own login. On an agent machine, git reads with the read-only App (`johnrees-read`), an agent session's push uses its family's App, and nothing else can write.
+- **Pushes**: on a machine you use, git pushes with your own login. On an agent machine, an agent session's git uses its family's App wherever that App is installed and the read-only App (`johnrees-read`) elsewhere; anyone else's git only reads.
 
 ## Install
 

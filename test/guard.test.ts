@@ -93,6 +93,8 @@ test("an amend replaces the agent trailers, credits each App once, and keeps oth
   expect(body).toContain("Agent-Model: glm-4.6\n");
   expect(body).toContain("Agent-Harness: pi\n");
   expect(body).not.toContain("claude-opus-5-5");
+  // pi reports no effort here, so the Claude session's is gone rather than credited to GLM.
+  expect(body).not.toContain("Agent-Effort");
   expect(body.split("\n").filter((line) => line.startsWith("Co-authored-by:"))).toEqual(["Co-authored-by: Ada <ada@example.com>", CLAUDE, app("glm")]);
 });
 
