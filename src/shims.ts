@@ -1,16 +1,15 @@
-import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { READ_APP, readConfig, type Registry } from "./config.ts";
+import { PUSH_USER } from "./credential.ts";
+import { CHILD_MARKER } from "./env.ts";
 import { Failure } from "./failure.ts";
-import { GIT_VALUE_OPTIONS } from "./git.ts";
-import { CHILD_MARKER } from "./guard.ts";
-import { type Env, HARNESSES } from "./harness.ts";
-import { GIT_AUTHORS, GIT_STOPS } from "./hook.ts";
+import { type Env, HARNESSES, harnessNames } from "./harness.ts";
 import { loginUsable } from "./login.ts";
 import { VERSION } from "./version.ts";
 
-/** Where `install-shims` writes the gh and git shims; first on PATH. */
+/** Where `install-shims` writes the gh shim; first on PATH. */
 export const defaultShimDir = (): string => join(homedir(), ".local", "share", "agent-gh", "shims");
 export const defaultBinDir = (): string => join(homedir(), ".local", "bin");
 
@@ -40,10 +39,9 @@ const quote = (value: string): string => {
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
- * The harness table as a POSIX shell function, so the shims decide exactly as
+ * The harness table as a POSIX shell function, so the shim decides exactly as
  * agent-gh does, with shell builtins only: no process starts on a person's
- * git, which shell prompts call constantly. `agh_set` mirrors agent-gh's
- * "set": present and not blank.
+ * gh. `agh_set` mirrors agent-gh's "set": present and not blank.
  */
 export const sessionFunction = (): string => {
   const rules = HARNESSES.flatMap((harness) =>
@@ -61,6 +59,7 @@ export const sessionFunction = (): string => {
     "agh_set() { case $1 in *[![:space:]]*) return 0 ;; esac; return 1; }",
     "agh_session() {",
     ...rules,
+    `  case \${AGENT_GH_HARNESS-} in ${harnessNames().map(quote).join(" | ")}) return 0 ;; esac # a runner that names its harness`,
     "  return 1",
     "}",
   ].join("\n");
@@ -73,11 +72,11 @@ export const SHIM_HOPS = 3;
  * Finds the next `$1` on PATH into AGH_REAL, without a subshell. It skips the
  * shim directory and the running script itself (its own directory when the
  * names match, and any path to the same file), so a copy of the shim, such as
- * a test fixture's copy of `command -v git`, finds the real program instead of
+ * a test fixture's copy of `command -v gh`, finds the real program instead of
  * itself. A shim that reaches another shim execs it in the same process, so
  * AGH_SHIM_PID equal to `$$` counts one more hop, and shims that keep reaching
- * each other fail loudly instead of looping. Real git running git again
- * (hooks, aliases, `git -C`) starts a new process, which starts a new count.
+ * each other fail loudly instead of looping. A program that runs gh again
+ * starts a new process, which starts a new count.
  */
 export const realFunction = (shims: string) =>
   [
@@ -115,48 +114,7 @@ const header = (name: string) =>
   [
     "#!/bin/sh",
     `# ${name} shim from agent-gh ${VERSION} (install-shims). In an agent session of any harness it runs`,
-    "# GitHub writes through agent-gh; otherwise it is the real one. Regenerate with `agent-gh install-shims`.",
-  ].join("\n");
-
-const alternatives = (values: Iterable<string>) => [...values].join(" | ");
-
-/**
- * The git shim. In an agent session, commit-creating commands and push go
- * through `agent-gh git` (John as author, the family App as co-author, the
- * App's token for the push); `--abort` and `--quit` only stop an operation,
- * and everything else, reads included, is the real git. The subcommand is
- * found past git's global options exactly as agent-gh finds it.
- */
-export const gitShim = (shims: string, agentGh: string): string =>
-  [
-    header("git"),
-    realFunction(shims),
-    sessionFunction(),
-    "agh_route() {",
-    '  agh_sub=""',
-    '  agh_skip=""',
-    '  for agh_arg in "$@"; do',
-    '    if [ -n "$agh_skip" ]; then agh_skip=""; continue; fi',
-    '    if [ -z "$agh_sub" ]; then',
-    "      case $agh_arg in",
-    `        ${alternatives(GIT_VALUE_OPTIONS)}) agh_skip=1; continue ;;`,
-    "        -*) continue ;;",
-    "      esac",
-    '      agh_sub=$agh_arg',
-    "      case $agh_sub in",
-    "        push) return 0 ;;",
-    `        ${alternatives(GIT_AUTHORS)}) ;;`,
-    "        *) return 1 ;;",
-    "      esac",
-    "    fi",
-    `    case $agh_arg in ${alternatives(GIT_STOPS)}) return 1 ;; esac`,
-    "  done",
-    '  [ -n "$agh_sub" ]',
-    "}",
-    `if [ "\${${CHILD_MARKER}-}" != 1 ] && agh_session && agh_route "$@"; then exec ${quote(agentGh)} git "$@"; fi`,
-    "agh_real git",
-    'exec "$AGH_REAL" "$@"',
-    "",
+    `# ${name} through agent-gh; otherwise it is the real one. Regenerate with \`agent-gh install-shims\`.`,
   ].join("\n");
 
 /**
@@ -199,7 +157,7 @@ const END = "# <<< agent-gh <<<";
 export const rcBlock = (shims: string, bin: string): string =>
   [
     BEGIN,
-    "# Managed by `agent-gh install-shims`: its gh and git shims, then agent-gh, first on PATH.",
+    "# Managed by `agent-gh install-shims`: its gh shim, then agent-gh, first on PATH.",
     'agh_path=""; agh_rest="$PATH:"',
     'while [ -n "$agh_rest" ]; do',
     '  agh_dir=${agh_rest%%:*}; agh_rest=${agh_rest#*:}',
@@ -313,13 +271,49 @@ const real = (deps: ShimDeps, name: string, args: string[], stdin: "inherit" | "
   return { code: result.exitCode ?? 1, stdout: result.stdout.toString() };
 };
 
-/** The credential helpers an agent machine sets for github.com: a reset, then agent-gh's read App. */
-export const helperValues = (agentGh: string): string[] => ["", `!${/\s/.test(agentGh) ? quote(agentGh) : agentGh} credential`];
-const HELPER_KEY = "credential.https://github.com.helper";
+/**
+ * The ways a remote spells github.com over SSH, as git parses them (connect.c
+ * takes `git+ssh` and `ssh+git` as `ssh`), including SSH over port 443. An ssh
+ * `Host` alias cannot be matched by prefix.
+ */
+const SSH_GITHUB = [
+  "git@github.com:",
+  "ssh://git@github.com/",
+  "git+ssh://git@github.com/",
+  "ssh+git://git@github.com/",
+  "ssh://git@ssh.github.com:443/",
+] as const;
 
-export const credentialHelpers = (deps: ShimDeps): string[] => {
-  const result = real(deps, "git", ["config", "--global", "--get-all", HELPER_KEY]);
+/** One global git setting: every value in order (`exact`), or values it must include among others. */
+export type GitSetting = { readonly key: string; readonly values: readonly string[]; readonly exact: boolean };
+
+/**
+ * The global git settings that make an agent machine's git use agent-gh's
+ * credential helper for github.com: a reset, then the helper; the
+ * repository's path, so the helper can check the family App's installation;
+ * a push URL naming PUSH_USER, so a push the family App cannot make, or a
+ * person's, fails with the reason; and HTTPS for SSH remotes, fetch and
+ * explicit pushurl alike, so no SSH key writes.
+ */
+export const agentMachineGit = (agentGh: string): readonly GitSetting[] => [
+  { key: "credential.https://github.com.helper", values: ["", `!${/\s/.test(agentGh) ? quote(agentGh) : agentGh} credential`], exact: true },
+  { key: "credential.https://github.com.useHttpPath", values: ["true"], exact: true },
+  { key: `url.https://${PUSH_USER}@github.com/.pushInsteadOf`, values: ["https://github.com/", ...SSH_GITHUB], exact: true },
+  { key: "url.https://github.com/.insteadOf", values: SSH_GITHUB, exact: false },
+];
+
+/** Every value of a global git setting, in order. */
+export const globalGit = (deps: ShimDeps, key: string): string[] => {
+  const result = real(deps, "git", ["config", "--global", "--get-all", key]);
   return result.code === 0 ? result.stdout.replace(/\n$/, "").split("\n") : [];
+};
+
+/** Whether the machine's global git config holds a setting as install-shims writes it. */
+export const holds = (deps: ShimDeps, setting: GitSetting): boolean => {
+  const values = globalGit(deps, setting.key);
+  return setting.exact
+    ? values.length === setting.values.length && values.every((value, index) => value === setting.values[index])
+    : setting.values.every((value) => values.includes(value));
 };
 
 /** Whether gh itself holds John's personal login for github.com (a token in the environment is not asked about). */
@@ -327,12 +321,13 @@ export const personalGhLogin = (deps: ShimDeps): boolean =>
   real(deps, "gh", ["auth", "status", "--hostname", "github.com"]).code === 0;
 
 /**
- * `agent-gh install-shims [--agent-machine]`: writes the gh and git shims and
- * puts them first on PATH in the shell startup files. With --agent-machine it
- * also makes agent-gh the only way to write from this machine: git's
- * credential helper for github.com becomes the read App, and gh is logged out
- * of John's personal login. It refuses that until the read App is logged in,
- * so the machine is never left unable to clone.
+ * `agent-gh install-shims [--agent-machine]`: writes the gh shim and puts it
+ * first on PATH in the shell startup files, and removes the git shim older
+ * releases wrote. With --agent-machine it also makes agent-gh the only way to
+ * write from this machine: git's credential helper for github.com answers an
+ * agent session with its family App where installed and anyone else with the
+ * read App, and gh is logged out of John's personal login. It refuses that until the
+ * read App is logged in, so the machine is never left unable to clone.
  */
 export const installShims = (deps: ShimDeps, agentMachine: boolean, families: readonly string[] | undefined): void => {
   if (agentMachine) {
@@ -345,36 +340,40 @@ export const installShims = (deps: ShimDeps, agentMachine: boolean, families: re
     }
   }
   mkdirSync(deps.shims, { recursive: true, mode: 0o755 });
-  for (const [name, text] of [
-    ["git", gitShim(deps.shims, deps.agentGh)],
-    ["gh", ghShim(deps.shims, deps.agentGh, agentMachine)],
-  ] as const) {
-    const path = join(deps.shims, name);
-    writeAtomic(path, text);
-    chmodSync(path, 0o755);
+  const gh = join(deps.shims, "gh");
+  writeAtomic(gh, ghShim(deps.shims, deps.agentGh, agentMachine));
+  chmodSync(gh, 0o755);
+  const git = join(deps.shims, "git");
+  if (existsSync(git) && isShim(git)) {
+    unlinkSync(git);
+    deps.print(`removed ${git}: git is plain git, and a repository's commit hook credits the App`);
   }
   const files = updateStartupFiles(deps.home, deps.shims, deps.bin);
-  deps.print(`shims: ${deps.shims} (gh, git), first on PATH in ${files.join(", ")}; open a new shell to use them`);
+  deps.print(`gh shim: ${gh}, first on PATH in ${files.join(", ")}; open a new shell to use it`);
   mkdirSync(deps.configDir, { recursive: true, mode: 0o700 });
   const machine: Machine = agentMachine
     ? { agent_machine: true, ...(families === undefined ? {} : { families }) }
     : { agent_machine: false };
   writeAtomic(join(deps.configDir, "machine.json"), `${JSON.stringify(machine)}\n`);
   if (!agentMachine) return;
-  const [reset, helper] = helperValues(deps.agentGh);
-  real(deps, "git", ["config", "--global", "--unset-all", HELPER_KEY]);
-  for (const value of [reset, helper] as string[]) {
-    if (real(deps, "git", ["config", "--global", "--add", HELPER_KEY, value]).code !== 0) {
-      throw new Failure("installing the shims", `git config --global could not set ${HELPER_KEY}`);
+  for (const setting of agentMachineGit(deps.agentGh)) {
+    if (holds(deps, setting)) continue;
+    // A shared key (the insteadOf rules) keeps its other values; agent-gh's own are rewritten whole.
+    if (setting.exact) real(deps, "git", ["config", "--global", "--unset-all", setting.key]);
+    const present = setting.exact ? [] : globalGit(deps, setting.key);
+    for (const value of setting.values.filter((value) => !present.includes(value))) {
+      if (real(deps, "git", ["config", "--global", "--add", setting.key, value]).code !== 0) {
+        throw new Failure("installing the shims", `git config --global could not set ${setting.key}`);
+      }
     }
   }
-  deps.print("git: github.com credentials come from the read App (clone, fetch, pull); pushes go through agent-gh");
+  deps.print("git: an agent session uses its family App where installed, and anyone else the read App");
   if (personalGhLogin(deps)) {
     const out = real(deps, "gh", ["auth", "logout", "--hostname", "github.com"], "inherit");
     if (out.code !== 0 || personalGhLogin(deps)) {
       throw new Failure("installing the shims", "gh is still logged in to your personal account; run `gh auth logout --hostname github.com` yourself");
     }
-    deps.print("gh: logged out of your personal login; a person's gh reads with the read App, agents write through agent-gh");
+    deps.print("gh: logged out of your personal login; a person's gh reads with the read App, and an agent's writes with its family App");
   } else {
     deps.print("gh: no personal login on this machine");
   }

@@ -166,7 +166,7 @@ const fetchJson = async (api: Api, path: string, method: string): Promise<Record
       signal: AbortSignal.timeout(api.timeoutMs),
     });
   } catch {
-    throw new Failure("setting up", `could not reach ${new URL(api.base).host}`);
+    throw new Failure("setting up", `could not reach ${new URL(api.base).host}`, true);
   }
   if (!response.ok) throw new Failure("setting up", `HTTP ${response.status} from ${path.split("/")[1]}`);
   try {

@@ -5,9 +5,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/johnrees/agent-gh/main/install.sh | bash
 #   curl -fsSL https://raw.githubusercontent.com/johnrees/agent-gh/main/install.sh | bash -s -- --agent-machine
 #
-# --agent-machine, for a machine that only runs agents: git clones with the
-# read-only App and gh is logged out of your personal login, so nothing but
-# agent-gh can write to GitHub from it.
+# --agent-machine, for a machine that only runs agents: an agent session's
+# git uses its family App where installed and anyone else's the read-only
+# App, and gh is logged out of your personal login, so nothing but agent-gh's
+# Apps can write to GitHub from it.
 #
 # The only thing you do is enter the device-flow codes it prints. It needs no
 # sudo. AGENT_GH_FAMILIES=claude,codex limits which family Apps it logs in.
@@ -95,7 +96,7 @@ if { : < /dev/tty; } 2> /dev/null; then tty=/dev/tty; fi
 login_ok=1
 "$BIN/agent-gh" login --all < "$tty" || login_ok=0
 
-# 4. The gh and git shims, and on an agent machine, no personal write access.
+# 4. The gh shim, and on an agent machine, git credentials and no personal write access.
 if [ "$agent_machine" = 1 ]; then
   "$BIN/agent-gh" install-shims --agent-machine < "$tty"
 else

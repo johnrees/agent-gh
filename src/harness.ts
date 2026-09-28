@@ -11,7 +11,7 @@ export type Condition = { readonly name: string; readonly equals?: string };
 
 type Harness = {
   readonly name: string;
-  /** Matches when every condition of any one rule holds. Data, so the gh and git shims test the same thing. */
+  /** Matches when every condition of any one rule holds. Data, so the gh shim tests the same thing. */
   readonly rules: readonly (readonly Condition[])[];
   /** Where the harness sets the variable, so the rule can be rechecked. */
   readonly source: string;
@@ -59,8 +59,13 @@ export const detects = (harness: Harness, env: Env): boolean =>
 
 export const harnessNames = (): string[] => HARNESSES.map((harness) => harness.name);
 
-/** True inside any agent harness's tool process: setup refuses there. */
-export const inAgentSession = (env: Env): boolean => HARNESSES.some((harness) => detects(harness, env));
+/**
+ * True inside any agent harness's tool process, or in a runner that names a
+ * harness with AGENT_GH_HARNESS: setup refuses there, and the gh shim, the
+ * commit hook, and an agent machine's git act for it.
+ */
+export const inAgentSession = (env: Env): boolean =>
+  HARNESSES.some((harness) => detects(harness, env)) || harnessNames().includes(env.AGENT_GH_HARNESS ?? "");
 
 /**
  * The harness this process runs under. `AGENT_GH_HARNESS` names one only when
@@ -237,7 +242,7 @@ export const detectIdentity = (env: Env, codexProvider: CodexProvider = readCode
     return declaredOnly(
       harness,
       env,
-      "opencode does not tell shell commands which model runs; start it with the model declared, e.g. `AGENT_GH_MODEL=zai/glm-4.6 opencode --standalone` (see the agent-gh README)",
+      "opencode does not tell shell commands which model runs; start a private server with it declared, one model per launch, e.g. `AGENT_GH_MODEL=zai/glm-4.6 opencode --standalone`, and restart it after switching models",
     );
   }
   if (harness !== "claude" && harness !== "pi") {

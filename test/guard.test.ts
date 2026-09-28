@@ -1,35 +1,34 @@
-import { afterEach, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { REGISTRY } from "../src/config.ts";
 import { coAuthorTrailer } from "../src/git.ts";
-import { guard, UPDATE } from "../src/guard.ts";
-import { runAs } from "../src/run.ts";
+import { guard, hasMessage, UPDATE } from "../src/guard.ts";
 import { bunVersionProblem } from "../scripts/bun-version.ts";
-import { CONFIG, credentials, fakeGitHub, HAPPY, loggedIn } from "./fake-github.ts";
 
 const root = join(import.meta.dir, "..");
 /** Byte-identical copies of johnrees/penmon's .githooks/commit-msg and pre-push. */
 const HOOKS = join(import.meta.dir, "penmon-hooks");
-/** A Claude Code agent session; a person's shell has neither variable. */
-const AGENT = { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1" };
-const claude = REGISTRY.claude;
-if (claude === undefined) throw new Error("the registry has no claude App");
-const CLAUDE_TRAILER = coAuthorTrailer(claude);
-
-let stops: (() => void)[] = [];
-afterEach(() => {
-  for (const stop of stops) stop();
-  stops = [];
-});
+/** A Claude Code agent session that reports its model and effort; a person's shell has none of these. */
+const AGENT = { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1", ANTHROPIC_MODEL: "claude-opus-5-5", CLAUDE_EFFORT: "xhigh" };
+/** A pi session driving GLM. */
+const GLM = { PI_SESSION_ID: "p", PI_PROVIDER: "zai", PI_MODEL: "glm-4.6" };
+const app = (family: string) => {
+  const entry = REGISTRY[family];
+  if (entry === undefined) throw new Error(`the registry has no ${family} App`);
+  return coAuthorTrailer(entry);
+};
+const CLAUDE = app("claude");
+const CLAUDE_TRAILERS = `Agent-Model: claude-opus-5-5\nAgent-Harness: claude\nAgent-Effort: xhigh\n${CLAUDE}`;
 
 /**
  * A clone with Penmon's hooks switched on, one staged file, and an `agent-gh`
- * on PATH that runs this checkout's source. Its `origin` is a github.com URL
- * that git rewrites to a local bare repository, so it is a GitHub repository
- * to agent-gh while pushes stay local; `onGitHub: false` makes `origin` the
- * bare path itself.
+ * on PATH that runs this checkout's source with an empty HOME, so every App
+ * comes from the committed registry and nothing is logged in. Its `origin` is
+ * a github.com URL that git rewrites to a local bare repository, so it is a
+ * GitHub repository to agent-gh while pushes stay local; `onGitHub: false`
+ * makes `origin` the bare path itself.
  */
 const world = ({ onGitHub = true } = {}) => {
   const home = mkdtempSync(join(tmpdir(), "agent-gh-guard-"));
@@ -41,89 +40,150 @@ const world = ({ onGitHub = true } = {}) => {
   const dir = join(home, "repo");
   Bun.spawnSync(["git", "init", "-q", "--bare", remote]);
   Bun.spawnSync(["git", "init", "-q", dir]);
-  for (const [key, value] of [["user.name", "John Rees"], ["user.email", "john@example.com"], ["core.hooksPath", HOOKS]]) {
-    Bun.spawnSync(["git", "-C", dir, "config", key as string, value as string]);
-  }
+  const config = (key: string, value: string) => Bun.spawnSync(["git", "-C", dir, "config", key, value]);
+  for (const [key, value] of [["user.name", "John Rees"], ["user.email", "john@example.com"], ["core.hooksPath", HOOKS]] as const) config(key, value);
   const url = onGitHub ? "https://github.com/johnrees/penmon.git" : remote;
   Bun.spawnSync(["git", "-C", dir, "remote", "add", "origin", url]);
-  if (onGitHub) Bun.spawnSync(["git", "-C", dir, "config", `url.${remote}.insteadOf`, url]);
-  writeFileSync(join(dir, "f"), "a\n");
-  Bun.spawnSync(["git", "-C", dir, "add", "f"]);
-  const person = { PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, GIT_CONFIG_NOSYSTEM: "1", GH_REPO: "johnrees/penmon" };
+  if (onGitHub) config(`url.${remote}.insteadOf`, url);
+  const stage = (text: string) => {
+    writeFileSync(join(dir, "f"), text);
+    Bun.spawnSync(["git", "-C", dir, "add", "f"]);
+  };
+  stage("a\n");
+  const person = { PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, GIT_CONFIG_NOSYSTEM: "1" };
   const agent = { ...person, ...AGENT };
   const run = (command: string[], env: Record<string, string>) => {
     const result = Bun.spawnSync(command, { cwd: dir, env, stdout: "pipe", stderr: "pipe" });
     return { code: result.exitCode, stderr: result.stderr.toString() };
   };
   const last = (format: string) => Bun.spawnSync(["git", "-C", dir, "log", "-1", `--format=${format}`]).stdout.toString().trim();
-  return { home, dir, person, agent, run, last };
+  const count = () => Number(Bun.spawnSync(["git", "-C", dir, "rev-list", "--count", "--all"]).stdout.toString().trim() || "0");
+  return { home, dir, person, agent, run, last, count, stage, config };
 };
 
-test("an agent session's bare commit is refused, and the same commit through agent-gh passes", () => {
+test("an agent session's plain commit keeps John as author and credits the session's App", () => {
   const { agent, run, last } = world();
-  const bare = run(["git", "commit", "-q", "-m", "bare"], agent);
-  expect(bare.code).not.toBe(0);
-  expect(bare.stderr).toContain("commit through agent-gh: `agent-gh git commit ...`");
-  expect(run(["agent-gh", "git", "commit", "-q", "-m", "through"], agent).code).toBe(0);
-  expect(last("%s|%an")).toBe("through|John Rees");
-  expect(last("%B")).toContain(CLAUDE_TRAILER);
+  expect(run(["git", "commit", "-q", "-m", "plain"], agent)).toEqual({ code: 0, stderr: "" });
+  expect(last("%an <%ae>|%cn")).toBe("John Rees <john@example.com>|John Rees");
+  expect(last("%B")).toBe(`plain\n\n${CLAUDE_TRAILERS}`);
 });
 
-test("git applies --trailer before commit-msg runs, so the trailer alone satisfies the guard", () => {
-  const { agent, run } = world();
-  expect(run(["git", "commit", "-q", "--trailer", CLAUDE_TRAILER, "-m", "trailer"], agent).code).toBe(0);
+test("trailers join a message's own trailer block, whatever the message form", () => {
+  const { dir, agent, run, last, stage } = world();
+  writeFileSync(join(dir, "..", "msg"), "from a file\n\nSigned-off-by: x <x@e>\n");
+  expect(run(["git", "commit", "-q", "-F", join(dir, "..", "msg")], agent).code).toBe(0);
+  expect(last("%B")).toBe(`from a file\n\nSigned-off-by: x <x@e>\n${CLAUDE_TRAILERS}`);
+  stage("b\n");
+  // A --- line is text in a commit message, not the end of it, as `git commit --trailer` treats it.
+  expect(run(["git", "commit", "-q", "-m", "above\n---\nbelow"], agent).code).toBe(0);
+  expect(last("%B")).toBe(`above\n---\nbelow\n\n${CLAUDE_TRAILERS}`);
 });
 
-test("an agent session's bare push is refused", () => {
+test("an amend replaces the agent trailers, credits each App once, and keeps other co-authors", () => {
+  const { dir, agent, run, last } = world();
+  writeFileSync(join(dir, "..", "msg"), "first\n\nCo-authored-by: Ada <ada@example.com>\n");
+  expect(run(["git", "commit", "-q", "-F", join(dir, "..", "msg")], agent).code).toBe(0);
+  expect(run(["git", "commit", "-q", "--amend", "--no-edit"], agent).code).toBe(0);
+  const once = last("%B");
+  expect(once.split("\n").filter((line) => line.startsWith("Co-authored-by:"))).toEqual(["Co-authored-by: Ada <ada@example.com>", CLAUDE]);
+  expect(once.split("\n").filter((line) => line.startsWith("Agent-Model:"))).toEqual(["Agent-Model: claude-opus-5-5"]);
+
+  expect(run(["git", "commit", "-q", "--amend", "--no-edit"], { ...agent, CLAUDECODE: "", ...GLM }).code).toBe(0);
+  const body = last("%B");
+  expect(body).toContain("Agent-Model: glm-4.6\n");
+  expect(body).toContain("Agent-Harness: pi\n");
+  expect(body).not.toContain("claude-opus-5-5");
+  // pi reports no effort here, so the Claude session's is gone rather than credited to GLM.
+  expect(body).not.toContain("Agent-Effort");
+  expect(body.split("\n").filter((line) => line.startsWith("Co-authored-by:"))).toEqual(["Co-authored-by: Ada <ada@example.com>", CLAUDE, app("glm")]);
+});
+
+test("a message written in the editor gets the trailers above its comments and the -v diff, and keeps them", () => {
+  const { home, agent, run, last } = world();
+  const editor = join(home, "editor");
+  writeFileSync(editor, `#!/bin/sh\n{ printf 'from the editor\\n'; cat "$1"; } > "$1.new" && mv "$1.new" "$1"\n`);
+  chmodSync(editor, 0o755);
+  expect(run(["git", "commit", "-q", "-v"], { ...agent, GIT_EDITOR: editor }).code).toBe(0);
+  expect(last("%B")).toBe(`from the editor\n\n${CLAUDE_TRAILERS}`);
+});
+
+test("an empty message still aborts the commit: no trailers make it a message", () => {
+  const { agent, run, count } = world();
+  const before = count();
+  expect(run(["git", "commit", "-q", "-m", ""], agent).code).not.toBe(0);
+  expect(run(["git", "commit", "-q", "-v"], { ...agent, GIT_EDITOR: "true" }).code).not.toBe(0);
+  // A configured `:` editor looks like no editor to the hook, but git's template still says the message is empty.
+  expect(run(["git", "commit", "-q"], { ...agent, GIT_EDITOR: ":" }).code).not.toBe(0);
+  expect(count()).toBe(before);
+  expect(hasMessage("\n# only a comment\n", "#", true)).toBe(false);
+  expect(hasMessage("#123 fix\n", "#", true)).toBe(false);
+  expect(hasMessage("#123 fix\n", "#", false)).toBe(true);
+  expect(hasMessage("#123 fix\n", ";", true)).toBe(true);
+  expect(hasMessage(`\n# ------------------------ >8 ------------------------\ndiff --git a/f b/f\n`, "#", true)).toBe(false);
+  // commit.cleanup=strip strips comments from a -m message too, so this one is empty.
+  const { agent: stripping, run: runStripping, count: counted, config } = world();
+  config("commit.cleanup", "strip");
+  expect(runStripping(["git", "commit", "-q", "-m", "# only a comment"], stripping).code).not.toBe(0);
+  expect(counted()).toBe(0);
+});
+
+test("a message git keeps is credited, whatever looks like a comment in it", () => {
+  // -m keeps comment lines: git strips them only from an edited message.
+  const { home, agent, run, last, stage, config } = world();
+  expect(run(["git", "commit", "-q", "-m", "#123 fix"], agent).code).toBe(0);
+  expect(last("%B")).toBe(`#123 fix\n\n${CLAUDE_TRAILERS}`);
+  // An edited message: the repository's comment character, set or chosen by git.
+  for (const [char, message] of [[";", "#123 fix"], ["auto", "#123 fix"], ["auto", "plain"]] as const) {
+    stage(`${char} ${message}\n`);
+    config("core.commentChar", char);
+    expect([char, message, run(["git", "commit", "-q", "-e", "-m", message], { ...agent, GIT_EDITOR: "true" }).code]).toEqual([char, message, 0]);
+    expect([char, last("%B")]).toEqual([char, `${message}\n\n${CLAUDE_TRAILERS}`]);
+  }
+  // With auto, an editor that replaces the whole buffer leaves no comment character behind: its text is the message.
+  const replacer = join(home, "replacer");
+  writeFileSync(replacer, `#!/bin/sh\nprintf '#new subject\\n' > "$1"\n`);
+  chmodSync(replacer, 0o755);
+  stage("replaced\n");
+  expect(run(["git", "commit", "-q", "-e", "-m", "#old"], { ...agent, GIT_EDITOR: replacer }).code).toBe(0);
+  expect(last("%B")).toBe(`#new subject\n\n${CLAUDE_TRAILERS}`);
+  // With auto, an emptied message is still empty, whichever character git chose.
+  const emptier = join(home, "emptier");
+  writeFileSync(emptier, `#!/bin/sh\ngrep '^;' "$1" > "$1.new"; mv "$1.new" "$1"\n`);
+  chmodSync(emptier, 0o755);
+  stage("emptied\n");
+  expect(run(["git", "commit", "-q", "-e", "-m", "#123 fix"], { ...agent, GIT_EDITOR: emptier }).code).not.toBe(0);
+  expect(run(["git", "commit", "-q"], { ...agent, GIT_EDITOR: "true" }).code).not.toBe(0);
+});
+
+test("a runner that names its harness is credited like any agent session", () => {
+  const { person, run, last } = world();
+  expect(run(["git", "commit", "-q", "-m", "runner"], { ...person, AGENT_GH_HARNESS: "codex" }).code).toBe(0);
+  expect(last("%B")).toBe(`runner\n\nAgent-Harness: codex\n${app("codex")}`);
+});
+
+test("a person's commit, and any commit in a repository with no github.com remote, is left exactly as written", () => {
+  const { person, run, last } = world();
+  expect(run(["git", "commit", "-q", "-m", "mine"], person)).toEqual({ code: 0, stderr: "" });
+  expect(last("%B")).toBe("mine");
+  const local = world({ onGitHub: false });
+  expect(local.run(["git", "commit", "-q", "-m", "local"], local.agent)).toEqual({ code: 0, stderr: "" });
+  expect(local.last("%B")).toBe("local");
+});
+
+test("pushes pass the hook, an agent's and a person's alike", () => {
   const { person, agent, run } = world();
   expect(run(["git", "commit", "-q", "-m", "mine"], person).code).toBe(0);
-  const push = run(["git", "push", "-q", "origin", "HEAD:main"], agent);
-  expect(push.code).not.toBe(0);
-  expect(push.stderr).toContain("pushes through agent-gh");
-});
-
-test("a push through agent-gh passes the pre-push guard", async () => {
-  const { dir, person, agent, run } = world();
-  expect(run(["git", "commit", "-q", "-m", "mine"], person).code).toBe(0);
-  const fake = fakeGitHub(HAPPY);
-  stops.push(fake.stop);
-  const creds = credentials("claude", CONFIG, { key: false });
-  loggedIn(creds.dir, 1_800_000_000);
-  const code = await runAs(
-    {
-      identity: { harness: "claude", family: "claude" },
-      repo: { owner: "johnrees", name: "penmon" },
-      env: agent,
-      api: fake.api,
-      configDir: creds.dir,
-      registry: {},
-      nowSeconds: () => 1_800_000_000,
-      sleep: async () => {},
-    },
-    ["git", "-C", dir, "push", "-q", "origin", "HEAD:main"],
-  );
-  expect(code).toBe(0);
-});
-
-test("a repository with no github.com remote is never refused: its hooks are its own business", () => {
-  const { agent, run, last } = world({ onGitHub: false });
-  expect(run(["git", "commit", "-q", "-m", "local"], agent)).toEqual({ code: 0, stderr: "" });
-  expect(last("%B")).toBe("local");
   expect(run(["git", "push", "-q", "origin", "HEAD:main"], agent).code).toBe(0);
+  expect(run(["git", "push", "-q", "origin", "HEAD:person"], person).code).toBe(0);
 });
 
-test("a pre-push hook told the push goes elsewhere lets it through, even in a GitHub repository", () => {
-  const { dir } = world();
-  const github = () => ({ urls: new Map([["origin", ["https://github.com/johnrees/penmon.git"]]]), pushUrls: new Map(), rewrites: [], sshHostname: () => undefined, branch: undefined, get: () => undefined });
-  expect(guard(["pre-push", "fixture", `${dir}/../remote.git`], AGENT, "/nonexistent", REGISTRY, github).code).toBe(0);
-  expect(guard(["pre-push", "origin", "https://github.com/johnrees/penmon.git"], AGENT, "/nonexistent", REGISTRY, github).code).toBe(1);
-  expect(guard(["pre-push"], AGENT, "/nonexistent", REGISTRY, github).code).toBe(1);
-});
-
-test("outside an agent session, both hooks pass", () => {
-  const { person, run } = world();
-  expect(run(["git", "commit", "-q", "-m", "mine"], person).code).toBe(0);
-  expect(run(["git", "push", "-q", "origin", "HEAD:main"], person).code).toBe(0);
+test("a session agent-gh cannot identify stops the commit with the fix, rather than crediting nobody", () => {
+  const { person, run, count } = world();
+  const before = count();
+  const commit = run(["git", "commit", "-q", "-m", "who"], { ...person, OPENCODE_TERMINAL: "1" });
+  expect(commit.code).not.toBe(0);
+  expect(commit.stderr).toContain("opencode does not tell shell commands which model runs");
+  expect(count()).toBe(before);
 });
 
 test("a hook this version does not understand fails with exit 2 and the update command, never a pass", () => {

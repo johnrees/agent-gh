@@ -3,14 +3,14 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AppConfig, Registry } from "../src/config.ts";
-import { credential, readToken } from "../src/credential.ts";
+import { type Answers, credential, familyToken, PUSH_USER, readToken } from "../src/credential.ts";
 import { childEnv } from "../src/env.ts";
 import { Failure } from "../src/failure.ts";
 import { familyNames } from "../src/family.ts";
 import { loginAll, loginTargets } from "../src/login.ts";
-import { formatLine, machineDoctor } from "../src/machine.ts";
-import { installShims, RC_FILES, type ShimDeps } from "../src/shims.ts";
-import { CONFIG, fakeGitHub, loggedIn, reply } from "./fake-github.ts";
+import { formatLine, machineDoctor, type SshAnswer } from "../src/machine.ts";
+import { ghShim, installShims, RC_FILES, type ShimDeps } from "../src/shims.ts";
+import { CONFIG, fakeGitHub, HAPPY, loggedIn, reply } from "./fake-github.ts";
 
 const NOW = 1_800_000_000;
 const REGISTRY: Registry = {};
@@ -98,21 +98,78 @@ const machine = ({ read = true, rc = [".zshrc", ".bashrc"] } = {}) => {
 
 const password = (fill: string) => fill.split("\n").find((line) => line.startsWith("password="))?.slice("password=".length);
 const GITHUB_FILL = "protocol=https\nhost=github.com\npath=johnrees/penmon.git\n\n";
+const PUSH_FILL = `protocol=https\nhost=github.com\nusername=${PUSH_USER}\n\n`;
+const AGENT = { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1" };
 
-test("git's credential helper answers only https://github.com's gets, and only with the read App's token", async () => {
-  let asked = 0;
-  const token = async () => {
-    asked += 1;
-    return READ_TOKEN;
+test("git's credential helper answers https://github.com's gets: an agent session with its family App where installed, else the read App", async () => {
+  const asked: string[] = [];
+  const printed: string[] = [];
+  const answers = (inAgentSession: boolean, family: Answers["family"] = async (repo) => `family for ${JSON.stringify(repo)}`): Answers => ({
+    inAgentSession,
+    read: async () => {
+      asked.push("read");
+      return READ_TOKEN;
+    },
+    family,
+    print: (line) => printed.push(line),
+  });
+  const reader = answers(false);
+  expect(await credential("get", "protocol=https\nhost=github.com\n\n", reader)).toBe(`username=x-access-token\npassword=${READ_TOKEN}\n`);
+  expect(await credential("get", "protocol=https\nhost=gitlab.com\n\n", reader)).toBe("");
+  expect(await credential("get", "protocol=http\nhost=github.com\n\n", reader)).toBe("");
+  expect(await credential("get", "host=github.com\n\nprotocol=https\n", reader)).toBe("");
+  expect(await credential("store", "protocol=https\nhost=github.com\nusername=x\npassword=y\n\n", reader)).toBe("");
+  expect(await credential("erase", "protocol=https\nhost=github.com\n\n", reader)).toBe("");
+  expect(await credential(undefined, "", reader)).toBe("");
+  expect(asked).toEqual(["read"]);
+
+  // A push: the family App for an agent session, checked against the repository git names.
+  expect(await credential("get", `${PUSH_FILL.trim()}\npath=johnrees/penmon.git\n\n`, answers(true))).toBe(
+    'password=family for {"owner":"johnrees","name":"penmon"}\n',
+  );
+  expect(await credential("get", PUSH_FILL, answers(true))).toBe("password=family for undefined\n");
+  // Anyone else's push quits, so git neither prompts nor tries another login.
+  expect(await credential("get", PUSH_FILL, answers(false))).toBe("quit=1\n");
+  expect(printed.pop()).toBe(
+    "agent-gh: this is an agent machine, and only an agent session pushes to GitHub from it.\nFix what this names, or report it to John; never publish another way (John's own login, gh without agent-gh, or a connector).",
+  );
+  const unreachable = answers(true, async () => {
+    throw new Failure("finding the installation", "could not reach api.github.com", true);
+  });
+  expect(await credential("get", PUSH_FILL, unreachable)).toBe("quit=1\n");
+  expect(printed.pop()).toBe(
+    "agent-gh: finding the installation failed: could not reach api.github.com.\nRetry the same command with the sandbox's network access; if it still fails, report it to John. Never publish another way (John's own login, gh without agent-gh, or a connector).",
+  );
+
+  // Without the push username (a remote's explicit pushurl, or a read), an agent session with a
+  // repository still gets its family App where that App is installed, and the read App where not.
+  expect(await credential("get", GITHUB_FILL, answers(true))).toBe(
+    'username=x-access-token\npassword=family for {"owner":"johnrees","name":"penmon"}\n',
+  );
+  const notInstalled = answers(true, async () => {
+    throw new Failure("finding the installation", "the johnrees-claude App is not installed on johnrees/penmon");
+  });
+  expect(await credential("get", GITHUB_FILL, notInstalled)).toBe(`username=x-access-token\npassword=${READ_TOKEN}\n`);
+  expect(await credential("get", GITHUB_FILL, unreachable)).toBe(`username=x-access-token\npassword=${READ_TOKEN}\n`);
+  expect(await credential("get", "protocol=https\nhost=github.com\n\n", answers(true))).toBe(`username=x-access-token\npassword=${READ_TOKEN}\n`);
+  expect(asked).toEqual(["read", "read", "read", "read"]);
+  asked.length = 0;
+  expect(printed).toEqual([]);
+  expect(await credential("get", PUSH_FILL, unreachable)).toBe("quit=1\n");
+  expect(printed.pop()).toBe(
+    "agent-gh: finding the installation failed: could not reach api.github.com.\nRetry the same command with the sandbox's network access; if it still fails, report it to John. Never publish another way (John's own login, gh without agent-gh, or a connector).",
+  );
+  const noRead: Answers = {
+    ...reader,
+    read: async () => {
+      throw new Failure("reading the login", "no login for read; run `agent-gh login read` in your own terminal");
+    },
   };
-  expect(await credential("get", "protocol=https\nhost=github.com\n\n", token)).toBe(`username=x-access-token\npassword=${READ_TOKEN}\n`);
-  expect(await credential("get", "protocol=https\nhost=gitlab.com\n\n", token)).toBe("");
-  expect(await credential("get", "protocol=http\nhost=github.com\n\n", token)).toBe("");
-  expect(await credential("get", "host=github.com\n\nprotocol=https\n", token)).toBe("");
-  expect(await credential("store", "protocol=https\nhost=github.com\nusername=x\npassword=y\n\n", token)).toBe("");
-  expect(await credential("erase", "protocol=https\nhost=github.com\n\n", token)).toBe("");
-  expect(await credential(undefined, "", token)).toBe("");
-  expect(asked).toBe(1);
+  expect(await credential("get", GITHUB_FILL, noRead)).toBe("quit=1\n");
+  expect(printed.pop()).toBe(
+    "agent-gh: reading the login failed: no login for read; run `agent-gh login read` in your own terminal.\nFix what this names, or report it to John; never publish another way (John's own login, gh without agent-gh, or a connector).",
+  );
+  expect(asked).toEqual([]);
 
   const { configDir } = machine();
   const deps = { api: { base: "http://127.0.0.1:9", web: "http://127.0.0.1:9", timeoutMs: 100 }, dir: configDir, registry: REGISTRY, nowSeconds: () => NOW, sleep: async () => {} };
@@ -170,12 +227,28 @@ test("AGENT_GH_FAMILIES limits the families, never drops the read App, and refus
   expect(() => loginTargets(families, "read", "read", all)).toThrow("AGENT_GH_FAMILIES names read");
 });
 
-test("install-shims --agent-machine: git clones with the read App, gh is logged out, and a rerun changes nothing", () => {
+test("a family token is the session family's, and only once its App is on the repository", async () => {
+  const fake = fakeGitHub(HAPPY);
+  stops.push(fake.stop);
+  const { configDir } = machine();
+  const deps = { api: fake.api, dir: configDir, registry: REGISTRY, nowSeconds: () => NOW, sleep: async () => {}, env: AGENT };
+  expect(await familyToken(deps, { owner: "johnrees", name: "penmon" })).toBe(FAMILY_TOKEN);
+  expect(fake.log.map((entry) => `${entry.method} ${entry.path}`)).toContain("GET /user/installations");
+  await expect(familyToken(deps, { owner: "johnrees", name: "elsewhere" })).rejects.toThrow("is not installed on johnrees/elsewhere");
+  await expect(familyToken({ ...deps, env: { OPENCODE_TERMINAL: "1" } }, undefined)).rejects.toThrow("opencode does not tell shell commands");
+});
+
+test("install-shims --agent-machine: git reads with the read App and pushes with the family App, gh is logged out, and a rerun changes nothing", () => {
   const { home, shims, deps, printed, git, ghLog, configDir } = machine();
+  // An older release's git shim is removed; anything else there is not ours to touch.
+  mkdirSync(shims, { recursive: true });
+  writeFileSync(join(shims, "git"), ghShim(shims, deps.agentGh, false).replace("# gh shim", "# git shim"));
   installShims(deps, true, ["claude"]);
-  expect(existsSync(join(shims, "git")) && existsSync(join(shims, "gh"))).toBe(true);
+  expect([existsSync(join(shims, "git")), existsSync(join(shims, "gh"))]).toEqual([false, true]);
+  expect(printed[0]).toBe(`removed ${join(shims, "git")}: git is plain git, and a repository's commit hook credits the App`);
   expect(JSON.parse(readFileSync(join(configDir, "machine.json"), "utf8"))).toEqual({ agent_machine: true, families: ["claude"] });
   expect(git(["config", "--global", "--get-all", "credential.https://github.com.helper"]).stdout).toBe(`\n!${deps.agentGh} credential\n`);
+  expect(git(["config", "--global", "--get-all", "credential.https://github.com.useHttpPath"]).stdout).toBe("true\n");
   expect(ghLog()).toContain("gh auth logout --hostname github.com");
   expect(existsSync(join(home, "gh-login"))).toBe(false);
   expect(existsSync(join(home, ".profile"))).toBe(false);
@@ -183,22 +256,57 @@ test("install-shims --agent-machine: git clones with the read App, gh is logged 
   expect(zshrc).toStartWith("export EDITOR=vi\n\n# >>> agent-gh >>>");
   expect(printed.join("\n")).toContain("gh: logged out of your personal login");
 
+  // A rerun changes nothing, and a shared key keeps its other values.
+  git(["config", "--global", "--add", "url.https://github.com/.insteadOf", "gh:"]);
   const gitconfig = readFileSync(join(home, ".gitconfig"), "utf8");
   installShims(deps, true, ["claude"]);
   expect(readFileSync(join(home, ".gitconfig"), "utf8")).toBe(gitconfig);
+  git(["config", "--global", "--unset", "url.https://github.com/.insteadOf", "^git@"]);
+  installShims(deps, true, ["claude"]);
+  expect(git(["config", "--global", "--get-all", "url.https://github.com/.insteadOf"]).stdout).toBe(
+    "ssh://git@github.com/\ngit+ssh://git@github.com/\nssh+git://git@github.com/\nssh://git@ssh.github.com:443/\ngh:\ngit@github.com:\n",
+  );
   expect(readFileSync(join(home, ".zshrc"), "utf8")).toBe(zshrc);
   expect(printed.at(-1)).toBe("gh: no personal login on this machine");
 
-  // A person's git (and an agent's reads) get the read App's token from agent-gh itself.
+  // A person's git, and an agent's reads, get the read App's token from agent-gh itself.
   const fill = git(["credential", "fill"], GITHUB_FILL);
   expect([fill.code, password(fill.stdout)]).toEqual([0, READ_TOKEN]);
+  // (An agent session's read names a repository, which would ask api.github.com: the unit test covers it.)
+  expect(password(git(["credential", "fill"], "protocol=https\nhost=github.com\n\n", AGENT).stdout)).toBe(READ_TOKEN);
   expect(git(["credential", "fill"], "protocol=https\nhost=example.com\n\n").code).not.toBe(0);
-  // agent-gh's children replace every inherited helper with the family token's.
+
+  // Every GitHub remote uses HTTPS, and pushes, and only pushes, name PUSH_USER, whichever way the remote is written.
+  const repo = join(home, "repo");
+  git(["init", "-q", repo]);
+  for (const [name, url] of [
+    ["https", "https://github.com/johnrees/penmon.git"],
+    ["scp", "git@github.com:johnrees/penmon.git"],
+    ["ssh", "ssh://git@github.com/johnrees/penmon.git"],
+    ["gitssh", "git+ssh://git@github.com/johnrees/penmon.git"],
+    ["sshgit", "ssh+git://git@github.com/johnrees/penmon.git"],
+    ["port443", "ssh://git@ssh.github.com:443/johnrees/penmon.git"],
+  ]) {
+    git(["-C", repo, "remote", "add", name as string, url as string]);
+    expect(git(["-C", repo, "remote", "get-url", "--push", name as string]).stdout).toBe(`https://${PUSH_USER}@github.com/johnrees/penmon.git\n`);
+    expect(git(["-C", repo, "remote", "get-url", name as string]).stdout).toBe("https://github.com/johnrees/penmon.git\n");
+  }
+  // git leaves an explicit pushurl alone for pushInsteadOf, but not for insteadOf: an SSH one uses HTTPS too.
+  git(["-C", repo, "remote", "set-url", "--push", "scp", "git@github.com:johnrees/penmon.git"]);
+  expect(git(["-C", repo, "remote", "get-url", "--push", "scp"]).stdout).toBe("https://github.com/johnrees/penmon.git\n");
+  // An agent session's push gets its family's token; a person's is stopped before git would prompt.
+  const push = git(["credential", "fill"], PUSH_FILL, AGENT);
+  expect([push.code, password(push.stdout)]).toEqual([0, FAMILY_TOKEN]);
+  const person = git(["credential", "fill"], PUSH_FILL, { GIT_TERMINAL_PROMPT: "1" });
+  expect(person.code).not.toBe(0);
+  expect(person.stderr).toContain("only an agent session pushes to GitHub from it");
+  expect(person.stderr).toContain("told us to quit");
+  // The gh agent-gh runs replaces every inherited helper with the family token's, for its git too.
   const child = childEnv({}, FAMILY_TOKEN, { owner: "johnrees", name: "penmon" });
-  const childFill = git(["credential", "fill"], GITHUB_FILL, child);
-  expect([childFill.code, password(childFill.stdout)]).toEqual([0, FAMILY_TOKEN]);
-  const noToken = git(["credential", "fill"], GITHUB_FILL, childEnv({}, undefined, { owner: "johnrees", name: "penmon" }));
-  expect(noToken.code).not.toBe(0);
+  for (const input of [GITHUB_FILL, PUSH_FILL]) {
+    const childFill = git(["credential", "fill"], input, child);
+    expect([childFill.code, password(childFill.stdout)]).toEqual([0, FAMILY_TOKEN]);
+  }
 });
 
 test("install-shims --agent-machine refuses, changing nothing, until the read App is logged in", () => {
@@ -233,8 +341,9 @@ test("install-shims on a person's own machine leaves git credentials and gh's lo
 test("doctor --machine passes a set-up agent machine and names the fix for each failure", async () => {
   const { home, bin, deps } = machine();
   installShims(deps, true, ["claude"]);
+  let ssh: SshAnswer = "refused";
   const doctor = async (overrides: Partial<ShimDeps> = {}, version = "v0.1.0", latest: string | null = "v0.1.0") =>
-    (await machineDoctor({ ...deps, ...overrides, version, latest: async () => latest ?? undefined })).map(formatLine);
+    (await machineDoctor({ ...deps, ...overrides, version, latest: async () => latest ?? undefined, ssh: () => ssh })).map(formatLine);
 
   const healthy = await doctor();
   expect(healthy).toEqual([
@@ -243,10 +352,17 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
     "ok   login claude: usable",
     "ok   login read: usable",
     `ok   gh shim: ${join(deps.shims, "gh")} is first on PATH`,
-    `ok   git shim: ${join(deps.shims, "git")} is first on PATH`,
-    "ok   git credentials: github.com uses the read App",
+    "ok   git credentials: an agent session uses its family App where installed, and anyone else the read App",
+    "ok   ssh: no key here logs in to GitHub",
     "ok   gh login: no personal login",
   ]);
+  ssh = "authenticates";
+  expect(await doctor()).toContain(
+    "FAIL ssh: a key here logs in to GitHub, and SSH can push without agent-gh; remove it from this machine or from your GitHub account",
+  );
+  ssh = "unknown";
+  expect(await doctor()).toContain("note ssh: GitHub did not answer over SSH");
+  ssh = "refused";
 
   expect((await doctor({}, "v0.1.0", "v0.2.0"))[0]).toBe("FAIL agent-gh: v0.1.0, and v0.2.0 is out; rerun the install line");
   expect((await doctor({}, "dev"))[0]).toBe("note agent-gh: a local build, not a release");
@@ -261,4 +377,12 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
   expect(broken).toContain("FAIL gh login: gh holds your personal login; run `gh auth logout --hostname github.com`");
   rmSync(join(deps.configDir, "read.token.json"));
   expect(await doctor()).toContain("FAIL login read: not logged in; rerun the install line (or `agent-gh login read`)");
+
+  writeFileSync(join(deps.shims, "git"), ghShim(deps.shims, deps.agentGh, true).replace("# gh shim", "# git shim"));
+  expect(await doctor()).toContain(`FAIL git shim: ${join(deps.shims, "git")} is left from an older agent-gh; rerun the install line`);
+  Bun.spawnSync(["git", "config", "--global", "--unset-all", `url.https://${PUSH_USER}@github.com/.pushInsteadOf`], { env: deps.env });
+  Bun.spawnSync(["git", "config", "--global", "--unset", "url.https://github.com/.insteadOf", "^ssh://git@github"], { env: deps.env });
+  expect(await doctor()).toContain(
+    `FAIL git credentials: not as install-shims sets them: url.https://${PUSH_USER}@github.com/.pushInsteadOf, url.https://github.com/.insteadOf; rerun the install line with --agent-machine`,
+  );
 });

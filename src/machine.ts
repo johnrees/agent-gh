@@ -1,10 +1,32 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { isConfigured, READ_APP } from "./config.ts";
 import { familyNames } from "./family.ts";
 import type { Api } from "./github.ts";
 import { loginUsable } from "./login.ts";
-import { credentialHelpers, findReal, helperValues, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
+import { agentMachineGit, findReal, holds, isShim, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
 
 export const RERUN = "rerun the install line";
+
+/** What GitHub tells this machine's SSH keys: one logs in, none does, or no answer. */
+export type SshAnswer = "authenticates" | "refused" | "unknown";
+
+/**
+ * Asks GitHub whether any SSH key here logs in, without a terminal. On an
+ * agent machine one that does could push over SSH, which no URL rule can
+ * route through agent-gh (an ssh Host alias, a spelling git does not match).
+ */
+export const sshToGitHub = (): SshAnswer => {
+  try {
+    const options = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new"];
+    const result = Bun.spawnSync(["ssh", ...options, "git@github.com"], { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 15_000 });
+    const said = `${result.stdout.toString()}${result.stderr.toString()}`;
+    if (said.includes("successfully authenticated")) return "authenticates";
+    return said.includes("Permission denied") ? "refused" : "unknown";
+  } catch {
+    return "unknown";
+  }
+};
 
 type Line = { readonly state: "ok" | "FAIL" | "note"; readonly name: string; readonly detail: string };
 
@@ -31,7 +53,7 @@ export const latestRelease = async (api: Api, repo: string): Promise<string | un
  * always the install line. Exit 0 only with no failure.
  */
 export const machineDoctor = async (
-  deps: ShimDeps & { readonly version: string; readonly latest: () => Promise<string | undefined> },
+  deps: ShimDeps & { readonly version: string; readonly latest: () => Promise<string | undefined>; readonly ssh: () => SshAnswer },
 ): Promise<Line[]> => {
   const lines: Line[] = [];
   const add = (state: Line["state"], name: string, detail: string) => lines.push({ state, name, detail });
@@ -60,21 +82,31 @@ export const machineDoctor = async (
     add(usable ? "ok" : machine.agent_machine ? "FAIL" : "note", "login read", usable ? "usable" : `not logged in; ${RERUN} (or \`agent-gh login read\`)`);
   }
 
-  for (const name of ["gh", "git"]) {
-    const first = findReal(name, deps.env.PATH, "");
-    const shimmed = first !== undefined && first.startsWith(`${deps.shims}/`);
-    add(
-      shimmed ? "ok" : "FAIL",
-      `${name} shim`,
-      shimmed ? `${first} is first on PATH` : `${first ?? `no ${name}`} comes first, not the shim; open a new shell, or ${RERUN}`,
-    );
-  }
+  const gh = findReal("gh", deps.env.PATH, "");
+  const shimmed = gh !== undefined && gh.startsWith(`${deps.shims}/`);
+  add(shimmed ? "ok" : "FAIL", "gh shim", shimmed ? `${gh} is first on PATH` : `${gh ?? "no gh"} comes first, not the shim; open a new shell, or ${RERUN}`);
+  const git = join(deps.shims, "git");
+  if (existsSync(git) && isShim(git)) add("FAIL", "git shim", `${git} is left from an older agent-gh; ${RERUN}`);
 
   if (machine.agent_machine) {
-    const helpers = credentialHelpers(deps);
-    const want = helperValues(deps.agentGh);
-    const helped = helpers.length === want.length && helpers.every((value, index) => value === want[index]);
-    add(helped ? "ok" : "FAIL", "git credentials", helped ? "github.com uses the read App" : `github.com does not use the read App; ${RERUN} with --agent-machine`);
+    const wrong = agentMachineGit(deps.agentGh)
+      .filter((setting) => !holds(deps, setting))
+      .map((setting) => setting.key);
+    add(
+      wrong.length === 0 ? "ok" : "FAIL",
+      "git credentials",
+      wrong.length === 0
+        ? "an agent session uses its family App where installed, and anyone else the read App"
+        : `not as install-shims sets them: ${wrong.join(", ")}; ${RERUN} with --agent-machine`,
+    );
+    const ssh = deps.ssh();
+    add(
+      ssh === "authenticates" ? "FAIL" : ssh === "refused" ? "ok" : "note",
+      "ssh",
+      ssh === "authenticates"
+        ? "a key here logs in to GitHub, and SSH can push without agent-gh; remove it from this machine or from your GitHub account"
+        : ssh === "refused" ? "no key here logs in to GitHub" : "GitHub did not answer over SSH",
+    );
     const personal = personalGhLogin(deps);
     add(personal ? "FAIL" : "ok", "gh login", personal ? "gh holds your personal login; run `gh auth logout --hostname github.com`" : "no personal login");
   }
