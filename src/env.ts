@@ -53,6 +53,9 @@ export const childEnv = (parent: Env, token: string, repo: Repo): Record<string,
     GIT_CONFIG_COUNT: String(first + GIT_CONFIG.length),
     GIT_SSH_COMMAND: SSH_OFF,
     GIT_TERMINAL_PROMPT: "0",
+    // mise's shim for gh prints its tools banner to stdout, which breaks the
+    // credential protocol when git runs `gh auth git-credential` (soltui#397).
+    MISE_QUIET: "1",
     [CHILD_MARKER]: "1",
   });
 };
