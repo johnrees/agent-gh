@@ -219,6 +219,10 @@ test("the child environment appends to inherited git config, replaces John's tok
   expect(env.GIT_AUTHOR_NAME).toBeUndefined();
 });
 
+test("the child environment keeps mise quiet, so its banner never reaches git's credential helper", () => {
+  expect(childEnv({ MISE_QUIET: "0" }, "ghu_x", { owner: "johnrees", name: "penmon" }).MISE_QUIET).toBe("1");
+});
+
 test("repositories parse from every form gh and git use", () => {
   const penmon = { owner: "johnrees", name: "penmon" };
   for (const value of [
