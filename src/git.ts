@@ -33,3 +33,12 @@ export const withoutAbsent = (text: string): string =>
     .split("\n")
     .filter((line) => line !== `Agent-Model: ${ABSENT}` && line !== `Agent-Effort: ${ABSENT}`)
     .join("\n");
+
+/**
+ * The author `git var GIT_AUTHOR_IDENT` reports, without its timestamp, and
+ * whether it is a person's: git has one, and it is not an App's `[bot]`.
+ */
+export const gitAuthor = (ident: { readonly code: number; readonly stdout: string }): { readonly author: string; readonly person: boolean } => {
+  const author = ident.stdout.trim().replace(/ \d+ [+-]\d{4}$/, "");
+  return { author, person: ident.code === 0 && author !== "" && !author.includes("[bot]") };
+};
