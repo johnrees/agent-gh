@@ -386,3 +386,21 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
     `FAIL git credentials: not as install-shims sets them: url.https://${PUSH_USER}@github.com/.pushInsteadOf, url.https://github.com/.insteadOf; rerun the install line with --agent-machine`,
   );
 });
+
+test("install-shims tells the harnesses that have run here, and doctor checks it", async () => {
+  const { home, deps, printed } = machine();
+  mkdirSync(join(home, ".claude"));
+  mkdirSync(join(home, ".codex"));
+  const doctor = async () =>
+    (await machineDoctor({ ...deps, version: "dev", latest: async () => undefined, ssh: () => "refused" })).map(formatLine);
+  expect(await doctor()).toContain("FAIL claude hook: missing from ~/.claude/settings.json; rerun the install line");
+
+  installShims(deps, true, ["claude"]);
+  const settings = JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8"));
+  expect(settings.hooks.SessionStart).toEqual([{ hooks: [{ type: "command", command: `${deps.agentGh} session-env` }] }]);
+  expect(readFileSync(join(home, ".codex", "AGENTS.md"), "utf8")).toContain("agent-gh read-token");
+  expect(printed.join("\n")).toContain("Claude Code: a SessionStart hook");
+  const lines = await doctor();
+  expect(lines).toContain("ok   claude hook: a SessionStart hook puts the shim first on PATH in Claude Code");
+  expect(lines).toContain("ok   agent instructions: each harness's global instructions say how to reach GitHub");
+});

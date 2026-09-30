@@ -1,6 +1,7 @@
 import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
+import { installClaudeHook, installInstructions } from "./agents.ts";
 import { READ_APP, readConfig, type Registry } from "./config.ts";
 import { PUSH_USER } from "./credential.ts";
 import { CHILD_MARKER } from "./env.ts";
@@ -350,6 +351,10 @@ export const installShims = (deps: ShimDeps, agentMachine: boolean, families: re
   }
   const files = updateStartupFiles(deps.home, deps.shims, deps.bin);
   deps.print(`gh shim: ${gh}, first on PATH in ${files.join(", ")}; open a new shell to use it`);
+  const claude = installClaudeHook(deps.home, deps.agentGh);
+  if (claude !== undefined) deps.print(`Claude Code: a SessionStart hook in ${claude} puts the shim first on PATH before every command`);
+  const instructions = installInstructions(deps.home);
+  if (instructions.length > 0) deps.print(`agent instructions: how to reach GitHub through agent-gh, in ${instructions.join(", ")}`);
   mkdirSync(deps.configDir, { recursive: true, mode: 0o700 });
   const machine: Machine = agentMachine
     ? { agent_machine: true, ...(families === undefined ? {} : { families }) }
