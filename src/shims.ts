@@ -6,6 +6,7 @@ import { READ_APP, readConfig, type Registry } from "./config.ts";
 import { PUSH_USER } from "./credential.ts";
 import { CHILD_MARKER } from "./env.ts";
 import { Failure } from "./failure.ts";
+import { writeAtomic } from "./files.ts";
 import { type Env, HARNESSES, harnessNames } from "./harness.ts";
 import { loginUsable } from "./login.ts";
 import { VERSION } from "./version.ts";
@@ -183,12 +184,6 @@ export const withBlock = (text: string, block: string): string => {
  * harness starts finds the shims.
  */
 export const RC_FILES = [".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".profile"] as const;
-
-const writeAtomic = (path: string, text: string) => {
-  const temp = `${path}.agent-gh.tmp`;
-  writeFileSync(temp, text);
-  renameSync(temp, path);
-};
 
 export const updateStartupFiles = (home: string, shims: string, bin: string): string[] => {
   const present = RC_FILES.map((name) => join(home, name)).filter((path) => existsSync(path));

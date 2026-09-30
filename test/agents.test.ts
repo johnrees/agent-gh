@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -101,4 +101,19 @@ test("session-env writes a PATH block that puts the shim first when sourced, and
 
   expect(run({ CLAUDE_ENV_FILE: join(dir, "missing", "dir", "file") }).exitCode).toBe(0);
   expect(run({ CLAUDE_ENV_FILE: "" }).exitCode).toBe(0);
+});
+
+test("rewriting a private settings or instructions file keeps it private", () => {
+  const dir = home();
+  mkdirSync(join(dir, ".claude"));
+  const settings = join(dir, ".claude", "settings.json");
+  const instructions = join(dir, ".claude", "CLAUDE.md");
+  writeFileSync(settings, JSON.stringify({ env: { SECRET: "x" } }));
+  writeFileSync(instructions, "# private\n");
+  chmodSync(settings, 0o600);
+  chmodSync(instructions, 0o640);
+  installClaudeHook(dir, AGENT_GH);
+  installInstructions(dir);
+  expect(statSync(settings).mode & 0o777).toBe(0o600);
+  expect(statSync(instructions).mode & 0o777).toBe(0o640);
 });

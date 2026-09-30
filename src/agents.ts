@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Failure } from "./failure.ts";
+import { writeAtomic } from "./files.ts";
 
 /**
  * What install-shims tells the agent harnesses themselves, beside the shell
@@ -12,12 +13,6 @@ import { Failure } from "./failure.ts";
  * and every harness's global instructions say what to do when gh still says
  * it is not logged in.
  */
-
-const writeAtomic = (path: string, text: string) => {
-  const temp = `${path}.agent-gh.tmp`;
-  writeFileSync(temp, text);
-  renameSync(temp, path);
-};
 
 const quoteArg = (value: string): string => (/^[A-Za-z0-9_./-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`);
 

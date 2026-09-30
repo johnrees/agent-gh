@@ -20,6 +20,24 @@ const READ_TOKEN = "ghu_read_only_7777";
 const FAMILY_TOKEN = "ghu_family_8888";
 const root = join(import.meta.dir, "..");
 
+/** Whether the host's git runs hooks from config; the tests of that path need it, and the other path uses a fixture. */
+const HOST_CONFIG_HOOKS = (() => {
+  const probe = Bun.spawnSync(["git", "-c", "hook.p.command=true", "-c", "hook.p.event=commit-msg", "hook", "list", "commit-msg"], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return probe.exitCode === 0 && probe.stdout.toString().split("\n").includes("p");
+})();
+const COMMIT_HOOK_OK = "ok   commit hook: a global commit-msg hook credits an agent session's commits in every repository";
+
+/** Replaces a machine's git with one that, like git before config-based hooks, has no `git hook list`. */
+const olderGit = (bin: string) => {
+  const real = Bun.which("git") ?? "/usr/bin/git";
+  rmSync(join(bin, "git"));
+  script(join(bin, "git"), `case " $* " in *" hook list "*) echo "usage: git hook run <hook-name>" >&2; exit 129 ;; esac\nexec '${real}' "$@"`);
+};
+
 let stops: (() => void)[] = [];
 afterEach(() => {
   for (const stop of stops) stop();
@@ -346,13 +364,13 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
     (await machineDoctor({ ...deps, ...overrides, version, latest: async () => latest ?? undefined, ssh: () => ssh })).map(formatLine);
 
   const healthy = await doctor();
-  expect(healthy).toEqual([
+  expect(healthy.filter((line) => !line.startsWith("note commit hook"))).toEqual([
     "ok   agent-gh: v0.1.0, the latest release",
     `ok   gitleaks: ${join(bin, "gitleaks")}`,
     "ok   login claude: usable",
     "ok   login read: usable",
     `ok   gh shim: ${join(deps.shims, "gh")} is first on PATH`,
-    "ok   commit hook: a global commit-msg hook credits an agent session's commits in every repository",
+    ...(HOST_CONFIG_HOOKS ? [COMMIT_HOOK_OK] : []),
     "ok   git credentials: an agent session uses its family App where installed, and anyone else the read App",
     "ok   ssh: no key here logs in to GitHub",
     "ok   gh login: no personal login",
@@ -406,7 +424,7 @@ test("install-shims tells the harnesses that have run here, and doctor checks it
   expect(lines).toContain("ok   agent instructions: each harness's global instructions say how to reach GitHub");
 });
 
-test("install-shims sets a global commit-msg hook: an agent session's commits are credited in any repository, once, and a person's are left alone", async () => {
+test.skipIf(!HOST_CONFIG_HOOKS)("install-shims sets a global commit-msg hook: an agent session's commits are credited in any repository, once, and a person's are left alone", async () => {
   const { home, deps, printed, git, env } = machine();
   installShims(deps, false, undefined);
   expect(printed.join("\n")).toContain("commits: a global commit-msg hook credits");
@@ -439,4 +457,23 @@ test("install-shims sets a global commit-msg hook: an agent session's commits ar
   git(["config", "--global", "--unset", "hook.agent-gh.command"]);
   const lines = (await machineDoctor({ ...deps, version: "dev", latest: async () => undefined, ssh: () => "refused" })).map(formatLine);
   expect(lines).toContain("FAIL commit hook: not set; rerun the install line");
+});
+
+test("with a git before config-based hooks, install-shims sets no global hook and doctor says the repository hook is needed", async () => {
+  const { bin, deps, printed, git } = machine();
+  olderGit(bin);
+  installShims(deps, false, undefined);
+  expect(printed.join("\n")).toContain("has no config-based hooks, so only repositories with agent-gh's commit-msg hook credit agent sessions");
+  expect(git(["config", "--global", "--get", "hook.agent-gh.command"]).code).not.toBe(0);
+  const lines = (await machineDoctor({ ...deps, version: "dev", latest: async () => undefined, ssh: () => "refused" })).map(formatLine);
+  expect(lines.find((line) => line.includes("commit hook"))).toStartWith("note commit hook: git version");
+  expect(lines.some((line) => line.startsWith("FAIL"))).toBe(false);
+});
+
+test("install-shims keeps a private startup file private", () => {
+  const { home, deps } = machine();
+  chmodSync(join(home, ".zshrc"), 0o600);
+  installShims(deps, false, undefined);
+  expect(readFileSync(join(home, ".zshrc"), "utf8")).toContain("# >>> agent-gh >>>");
+  expect(Bun.spawnSync(["stat", process.platform === "darwin" ? "-f%Lp" : "-c%a", join(home, ".zshrc")]).stdout.toString().trim()).toBe("600");
 });
