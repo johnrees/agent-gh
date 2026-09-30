@@ -1,5 +1,5 @@
-import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { installClaudeHook, installInstructions } from "./agents.ts";
 import { READ_APP, readConfig, type Registry } from "./config.ts";
@@ -255,7 +255,7 @@ export type ShimDeps = {
 };
 
 /** Runs the real git or gh (never a shim), marked as agent-gh's child. */
-const real = (deps: ShimDeps, name: string, args: string[], stdin: "inherit" | "ignore" = "ignore", extra: Record<string, string> = {}) => {
+const real = (deps: ShimDeps, name: string, args: string[], stdin: "inherit" | "ignore" = "ignore", extra: Record<string, string> = {}, cwd?: string) => {
   const program = findReal(name, deps.env.PATH, deps.shims);
   if (program === undefined) return { code: 127, stdout: "" };
   const env: Record<string, string> = {};
@@ -264,7 +264,7 @@ const real = (deps: ShimDeps, name: string, args: string[], stdin: "inherit" | "
   delete env.GITHUB_TOKEN;
   env[CHILD_MARKER] = "1";
   Object.assign(env, extra);
-  const result = Bun.spawnSync([program, ...args], { env, stdin, stdout: "pipe", stderr: "pipe" });
+  const result = Bun.spawnSync([program, ...args], { env, stdin, stdout: "pipe", stderr: "pipe", ...(cwd === undefined ? {} : { cwd }) });
   return { code: result.exitCode ?? 1, stdout: result.stdout.toString() };
 };
 
@@ -312,14 +312,24 @@ export const commitHook = (agentGh: string): readonly GitSetting[] => [
   { key: "hook.agent-gh.event", values: ["commit-msg"], exact: true },
 ];
 
-/** Whether this git runs hooks from config: older gits (Apple's among them) have no `git hook list`. */
+/**
+ * Whether this git runs hooks from config: older gits (Apple's among them)
+ * have no `git hook list`. Outside a repository `git hook list` ignores
+ * configured hooks, so the probe runs in a throwaway empty one, and with
+ * only its own hook: a half-written one in the person's config would make
+ * git refuse the list.
+ */
 export const configHooks = (deps: ShimDeps): boolean => {
-  const probe = real(deps, "git", ["-c", "hook.agent-gh-probe.command=true", "-c", "hook.agent-gh-probe.event=commit-msg", "hook", "list", "commit-msg"], "ignore", {
-    // Only the probe's own hook: a half-written one in the person's config would make git refuse the list.
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    GIT_CONFIG_NOSYSTEM: "1",
-  });
-  return probe.code === 0 && probe.stdout.split("\n").includes("agent-gh-probe");
+  const dir = mkdtempSync(join(tmpdir(), "agent-gh-probe-"));
+  try {
+    const isolated = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_CEILING_DIRECTORIES: dir };
+    if (real(deps, "git", ["init", "-q", dir], "ignore", isolated).code !== 0) return false;
+    const args = ["-c", "hook.agent-gh-probe.command=true", "-c", "hook.agent-gh-probe.event=commit-msg", "hook", "list", "commit-msg"];
+    const probe = real(deps, "git", args, "ignore", isolated, dir);
+    return probe.code === 0 && probe.stdout.split("\n").includes("agent-gh-probe");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 };
 
 /** The installed git's version, for doctor's advice. */

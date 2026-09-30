@@ -9,7 +9,7 @@ import { Failure } from "../src/failure.ts";
 import { familyNames } from "../src/family.ts";
 import { loginAll, loginTargets } from "../src/login.ts";
 import { formatLine, machineDoctor, type SshAnswer } from "../src/machine.ts";
-import { ghShim, installShims, RC_FILES, type ShimDeps } from "../src/shims.ts";
+import { configHooks, ghShim, installShims, RC_FILES, type ShimDeps } from "../src/shims.ts";
 import { CONFIG, fakeGitHub, HAPPY, loggedIn, reply } from "./fake-github.ts";
 
 const NOW = 1_800_000_000;
@@ -20,13 +20,18 @@ const READ_TOKEN = "ghu_read_only_7777";
 const FAMILY_TOKEN = "ghu_family_8888";
 const root = join(import.meta.dir, "..");
 
-/** Whether the host's git runs hooks from config; the tests of that path need it, and the other path uses a fixture. */
+/** Whether the host's git runs hooks from config (probed in an empty repository, as configHooks does); the tests of that path need it, and the other path uses a fixture. */
 const HOST_CONFIG_HOOKS = (() => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-gh-host-probe-"));
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+  Bun.spawnSync(["git", "init", "-q", dir], { env });
   const probe = Bun.spawnSync(["git", "-c", "hook.p.command=true", "-c", "hook.p.event=commit-msg", "hook", "list", "commit-msg"], {
-    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+    cwd: dir,
+    env,
     stdout: "pipe",
     stderr: "pipe",
   });
+  rmSync(dir, { recursive: true, force: true });
   return probe.exitCode === 0 && probe.stdout.toString().split("\n").includes("p");
 })();
 const COMMIT_HOOK_OK = "ok   commit hook: a global commit-msg hook credits an agent session's commits in every repository";
@@ -476,4 +481,16 @@ test("install-shims keeps a private startup file private", () => {
   installShims(deps, false, undefined);
   expect(readFileSync(join(home, ".zshrc"), "utf8")).toContain("# >>> agent-gh >>>");
   expect(Bun.spawnSync(["stat", process.platform === "darwin" ? "-f%Lp" : "-c%a", join(home, ".zshrc")]).stdout.toString().trim()).toBe("600");
+});
+
+test.skipIf(!HOST_CONFIG_HOOKS)("the config-hook probe works from outside any repository, as the install line runs", () => {
+  const { home, deps } = machine();
+  const before = process.cwd();
+  process.chdir(home);
+  try {
+    expect(Bun.spawnSync(["git", "rev-parse", "--git-dir"], { stderr: "pipe" }).exitCode).not.toBe(0);
+    expect(configHooks(deps)).toBe(true);
+  } finally {
+    process.chdir(before);
+  }
 });
