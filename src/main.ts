@@ -5,6 +5,7 @@
  * that App on the session's commits. GitHub shows each action as John with
  * the App's badge. The usage below lists every command.
  */
+import { appendFileSync } from "node:fs";
 import { runChild } from "./child.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
@@ -21,7 +22,7 @@ import { type Context, runAs } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
 import { readGitConfig } from "./target.ts";
-import { defaultBinDir, defaultShimDir, installShims, type ShimDeps, whichReal } from "./shims.ts";
+import { defaultBinDir, defaultShimDir, installShims, rcBlock, type ShimDeps, whichReal } from "./shims.ts";
 import { VERSION } from "./version.ts";
 
 const USAGE = `usage:
@@ -33,6 +34,7 @@ const USAGE = `usage:
   agent-gh doctor --machine         check this machine: release, gitleaks, logins, shims, and agent-machine settings
   agent-gh --version
   agent-gh credential get           git's credential helper on agent machines: an agent session's family App where installed, else the read App
+  agent-gh session-env              from Claude Code's SessionStart hook: put the gh shim first on PATH for every command
   agent-gh read-token               print the read App's token (the gh shim's GH_TOKEN on agent machines)
   agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)
   agent-gh guard commit-msg <file>  from a git hook: in an agent session, add its Agent-* trailers and credit its family App
@@ -116,6 +118,18 @@ const main = async (argv: readonly string[]): Promise<number> => {
       return 1;
     }
     console.log(program);
+    return 0;
+  }
+  if (first === "session-env") {
+    // Claude Code's SessionStart hook: CLAUDE_ENV_FILE is sourced before every command, after the shell snapshot.
+    const file = env.CLAUDE_ENV_FILE;
+    if (file !== undefined && file !== "") {
+      try {
+        appendFileSync(file, `${rcBlock(defaultShimDir(), defaultBinDir())}\n`);
+      } catch (error) {
+        console.error(`agent-gh session-env: could not write ${file}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     return 0;
   }
   if (first === "read-token") {

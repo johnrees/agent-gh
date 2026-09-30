@@ -1,0 +1,4 @@
+#!/bin/sh
+# Credits an agent session's commits to its family App; a no-op for people and machines without agent-gh.
+command -v agent-gh > /dev/null || exit 0
+exec agent-gh guard commit-msg "$1"

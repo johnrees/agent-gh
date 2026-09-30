@@ -1,10 +1,11 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { claudeHookState, instructionFiles, pathOwner, staleInstructions } from "./agents.ts";
 import { isConfigured, READ_APP } from "./config.ts";
 import { familyNames } from "./family.ts";
 import type { Api } from "./github.ts";
 import { loginUsable } from "./login.ts";
-import { agentMachineGit, findReal, holds, isShim, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
+import { agentMachineGit, commitHook, configHooks, findReal, gitVersion, holds, isShim, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
 
 export const RERUN = "rerun the install line";
 
@@ -26,6 +27,19 @@ export const sshToGitHub = (): SshAnswer => {
   } catch {
     return "unknown";
   }
+};
+
+/**
+ * Why the shim is not first, and the fix. A version manager's activation
+ * (mise, asdf) runs again at every prompt and puts its own directories back
+ * first, so a new shell does not help; agents get the shim from their hook,
+ * and a person's shell needs the tool's gh out of the way.
+ */
+export const shimAdvice = (gh: string | undefined): string => {
+  if (gh === undefined) return `no gh on PATH; install gh, then ${RERUN}`;
+  const owner = pathOwner(gh);
+  if (owner === undefined) return `${gh} comes first, not the shim; open a new shell, or ${RERUN}`;
+  return `${gh} comes first, not the shim: ${owner} puts its directories ahead of the startup files' PATH. Agents with a hook still get the shim; for other shells, install gh outside ${owner} or load ${owner} before the agent-gh block, then open a new shell`;
 };
 
 type Line = { readonly state: "ok" | "FAIL" | "note"; readonly name: string; readonly detail: string };
@@ -84,7 +98,29 @@ export const machineDoctor = async (
 
   const gh = findReal("gh", deps.env.PATH, "");
   const shimmed = gh !== undefined && gh.startsWith(`${deps.shims}/`);
-  add(shimmed ? "ok" : "FAIL", "gh shim", shimmed ? `${gh} is first on PATH` : `${gh ?? "no gh"} comes first, not the shim; open a new shell, or ${RERUN}`);
+  add(shimmed ? "ok" : "FAIL", "gh shim", shimmed ? `${gh} is first on PATH` : shimAdvice(gh));
+  if (!configHooks(deps)) {
+    add("note", "commit hook", `${gitVersion(deps)} has no config-based hooks: only repositories with agent-gh's commit-msg hook credit agent sessions; install a newer git (on macOS, Homebrew's), then ${RERUN}`);
+  } else {
+    const credited = commitHook(deps.agentGh).every((setting) => holds(deps, setting));
+    add(
+      credited ? "ok" : "FAIL",
+      "commit hook",
+      credited ? "a global commit-msg hook credits an agent session's commits in every repository" : `not set; ${RERUN}`,
+    );
+  }
+  const hook = claudeHookState(deps.home, deps.agentGh);
+  if (hook !== "absent") {
+    add(
+      hook === "ok" ? "ok" : "FAIL",
+      "claude hook",
+      hook === "ok"
+        ? "a SessionStart hook puts the shim first on PATH in Claude Code"
+        : `${hook === "stale" ? "names another agent-gh" : "missing"} from ~/.claude/settings.json; ${RERUN}`,
+    );
+  }
+  const stale = staleInstructions(deps.home);
+  if (instructionFiles(deps.home).length > 0) add(stale.length === 0 ? "ok" : "FAIL", "agent instructions", stale.length === 0 ? "each harness's global instructions say how to reach GitHub" : `missing or out of date in ${stale.join(", ")}; ${RERUN}`);
   const git = join(deps.shims, "git");
   if (existsSync(git) && isShim(git)) add("FAIL", "git shim", `${git} is left from an older agent-gh; ${RERUN}`);
 
