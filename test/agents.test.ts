@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -116,4 +116,22 @@ test("rewriting a private settings or instructions file keeps it private", () =>
   installInstructions(dir);
   expect(statSync(settings).mode & 0o777).toBe(0o600);
   expect(statSync(instructions).mode & 0o777).toBe(0o640);
+});
+
+test("a settings or instructions file symlinked from a dotfiles repository stays a link, and its target is updated", () => {
+  const dir = home();
+  mkdirSync(join(dir, ".claude"));
+  mkdirSync(join(dir, "dotfiles"));
+  const settingsTarget = join(dir, "dotfiles", "settings.json");
+  const instructionsTarget = join(dir, "dotfiles", "CLAUDE.md");
+  writeFileSync(settingsTarget, JSON.stringify({ model: "opus" }));
+  writeFileSync(instructionsTarget, "# mine\n");
+  symlinkSync(settingsTarget, join(dir, ".claude", "settings.json"));
+  symlinkSync(instructionsTarget, join(dir, ".claude", "CLAUDE.md"));
+  installClaudeHook(dir, AGENT_GH);
+  installInstructions(dir);
+  expect(lstatSync(join(dir, ".claude", "settings.json")).isSymbolicLink()).toBe(true);
+  expect(lstatSync(join(dir, ".claude", "CLAUDE.md")).isSymbolicLink()).toBe(true);
+  expect(JSON.parse(readFileSync(settingsTarget, "utf8")).hooks.SessionStart).toHaveLength(1);
+  expect(readFileSync(instructionsTarget, "utf8")).toContain(instructionsBlock());
 });
