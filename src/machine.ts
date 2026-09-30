@@ -5,7 +5,7 @@ import { isConfigured, READ_APP } from "./config.ts";
 import { familyNames } from "./family.ts";
 import type { Api } from "./github.ts";
 import { loginUsable } from "./login.ts";
-import { agentMachineGit, findReal, holds, isShim, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
+import { agentMachineGit, commitHook, configHooks, findReal, gitVersion, holds, isShim, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
 
 export const RERUN = "rerun the install line";
 
@@ -99,6 +99,16 @@ export const machineDoctor = async (
   const gh = findReal("gh", deps.env.PATH, "");
   const shimmed = gh !== undefined && gh.startsWith(`${deps.shims}/`);
   add(shimmed ? "ok" : "FAIL", "gh shim", shimmed ? `${gh} is first on PATH` : shimAdvice(gh));
+  if (!configHooks(deps)) {
+    add("note", "commit hook", `${gitVersion(deps)} has no config-based hooks: only repositories with agent-gh's commit-msg hook credit agent sessions; install a newer git (on macOS, Homebrew's), then ${RERUN}`);
+  } else {
+    const credited = commitHook(deps.agentGh).every((setting) => holds(deps, setting));
+    add(
+      credited ? "ok" : "FAIL",
+      "commit hook",
+      credited ? "a global commit-msg hook credits an agent session's commits in every repository" : `not set; ${RERUN}`,
+    );
+  }
   const hook = claudeHookState(deps.home, deps.agentGh);
   if (hook !== "absent") {
     add(

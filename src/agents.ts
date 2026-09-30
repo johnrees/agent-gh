@@ -103,6 +103,7 @@ export const instructionsBlock = (): string =>
     "",
     "- If `gh` says it is not logged in, or a private repository is not found, gh is not going through agent-gh's shim. Run the same command as `agent-gh <gh arguments>` (for example `agent-gh pr view 12 -R owner/repo`) instead.",
     "- For a read where that fails too, `GH_TOKEN=$(agent-gh read-token) gh <arguments>` reads with the read-only App.",
+    "- Commit with plain `git commit`: a commit-msg hook adds `Agent-*` trailers and `Co-authored-by: johnrees-<family>[bot]`. If a commit you made lacks that co-author line, the hook did not run; run `agent-gh doctor` in the repository and say so, rather than adding the trailers by hand.",
     "- `agent-gh doctor --machine` shows what is set up wrong; tell John its FAIL lines rather than working around them silently.",
     END,
   ].join("\n");

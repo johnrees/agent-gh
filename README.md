@@ -3,7 +3,7 @@
 Agents publish to GitHub as John through one GitHub App per model family (claude, codex, glm, deepseek, kimi, qwen), whatever harness runs them. GitHub shows each issue, comment, review, and pull request as John with the App's badge, and each commit as John with the App as co-author. Agents run plain `gh` and `git`; nothing asks them to choose a method or an identity.
 
 - **gh**: in an agent session, the gh shim runs every `gh` command through the session family's App. It never falls back to John's own login.
-- **Commits**: a repository's `commit-msg` hook adds `Agent-Harness` (with `Agent-Model` and `Agent-Effort` when the harness reports them) and `Co-authored-by: johnrees-<family>[bot]` to an agent session's commits. A person's commits, and repositories with no github.com remote, are left as written.
+- **Commits**: a global `commit-msg` hook (git's config-based hooks, set by `install-shims`), or a repository's own, adds `Agent-Harness` (with `Agent-Model` and `Agent-Effort` when the harness reports them) and `Co-authored-by: johnrees-<family>[bot]` to an agent session's commits. A person's commits, and repositories with no github.com remote, are left as written.
 - **Pushes**: on a machine you use, git pushes with your own login. On an agent machine, GitHub remotes use HTTPS, an agent session's git uses its family's App wherever that App is installed and the read-only App (`johnrees-read`) elsewhere, and anyone else's git only reads.
 
 ## Install
@@ -37,6 +37,8 @@ The harness is found from a variable it sets for its tools, and the family from 
 | opencode | `OPENCODE_TERMINAL=1` | `AGENT_GH_MODEL`, set when it starts |
 
 ## Repository hooks
+
+Where git runs hooks from config (`git hook list` exists), `install-shims` sets `hook.agent-gh.command` and `hook.agent-gh.event=commit-msg` globally, so every repository on the machine credits agent sessions with no setup of its own; `git config hook.agent-gh.enabled false` turns it off in one repository. It runs before a repository's own hook, and the trailers are replaced or skipped when already there, so both together credit a commit once. Older gits, Apple's among them, need the repository hook below; `doctor --machine` says which applies. This repository has one in `.githooks` (`git config core.hooksPath .githooks`).
 
 ```sh
 # .githooks/commit-msg (with git config core.hooksPath .githooks)

@@ -260,7 +260,7 @@ export type ShimDeps = {
 };
 
 /** Runs the real git or gh (never a shim), marked as agent-gh's child. */
-const real = (deps: ShimDeps, name: string, args: string[], stdin: "inherit" | "ignore" = "ignore") => {
+const real = (deps: ShimDeps, name: string, args: string[], stdin: "inherit" | "ignore" = "ignore", extra: Record<string, string> = {}) => {
   const program = findReal(name, deps.env.PATH, deps.shims);
   if (program === undefined) return { code: 127, stdout: "" };
   const env: Record<string, string> = {};
@@ -268,6 +268,7 @@ const real = (deps: ShimDeps, name: string, args: string[], stdin: "inherit" | "
   delete env.GH_TOKEN;
   delete env.GITHUB_TOKEN;
   env[CHILD_MARKER] = "1";
+  Object.assign(env, extra);
   const result = Bun.spawnSync([program, ...args], { env, stdin, stdout: "pipe", stderr: "pipe" });
   return { code: result.exitCode ?? 1, stdout: result.stdout.toString() };
 };
@@ -303,6 +304,32 @@ export const agentMachineGit = (agentGh: string): readonly GitSetting[] => [
   { key: "url.https://github.com/.insteadOf", values: SSH_GITHUB, exact: false },
 ];
 
+/**
+ * The global commit-msg hook, as git's config-based hooks (hook.<name>.*):
+ * every repository on the machine credits an agent session's commits, with
+ * no hook of its own. It runs before a repository's own hook, and the guard
+ * replaces or skips trailers already there, so a repository that also has
+ * agent-gh's hook gets them once. `hook.agent-gh.enabled=false` in a
+ * repository turns it off there.
+ */
+export const commitHook = (agentGh: string): readonly GitSetting[] => [
+  { key: "hook.agent-gh.command", values: [`${/\s/.test(agentGh) ? quote(agentGh) : agentGh} guard commit-msg`], exact: true },
+  { key: "hook.agent-gh.event", values: ["commit-msg"], exact: true },
+];
+
+/** Whether this git runs hooks from config: older gits (Apple's among them) have no `git hook list`. */
+export const configHooks = (deps: ShimDeps): boolean => {
+  const probe = real(deps, "git", ["-c", "hook.agent-gh-probe.command=true", "-c", "hook.agent-gh-probe.event=commit-msg", "hook", "list", "commit-msg"], "ignore", {
+    // Only the probe's own hook: a half-written one in the person's config would make git refuse the list.
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+  });
+  return probe.code === 0 && probe.stdout.split("\n").includes("agent-gh-probe");
+};
+
+/** The installed git's version, for doctor's advice. */
+export const gitVersion = (deps: ShimDeps): string => real(deps, "git", ["--version"]).stdout.trim() || "git";
+
 /** Every value of a global git setting, in order. */
 export const globalGit = (deps: ShimDeps, key: string): string[] => {
   const result = real(deps, "git", ["config", "--global", "--get-all", key]);
@@ -320,6 +347,21 @@ export const holds = (deps: ShimDeps, setting: GitSetting): boolean => {
 /** Whether gh itself holds John's personal login for github.com (a token in the environment is not asked about). */
 export const personalGhLogin = (deps: ShimDeps): boolean =>
   real(deps, "gh", ["auth", "status", "--hostname", "github.com"]).code === 0;
+
+/** Writes global git settings that do not already hold, keeping a shared key's other values. */
+const setGit = (deps: ShimDeps, settings: readonly GitSetting[]): void => {
+  for (const setting of settings) {
+    if (holds(deps, setting)) continue;
+    // A shared key (the insteadOf rules) keeps its other values; agent-gh's own are rewritten whole.
+    if (setting.exact) real(deps, "git", ["config", "--global", "--unset-all", setting.key]);
+    const present = setting.exact ? [] : globalGit(deps, setting.key);
+    for (const value of setting.values.filter((value) => !present.includes(value))) {
+      if (real(deps, "git", ["config", "--global", "--add", setting.key, value]).code !== 0) {
+        throw new Failure("installing the shims", `git config --global could not set ${setting.key}`);
+      }
+    }
+  }
+};
 
 /**
  * `agent-gh install-shims [--agent-machine]`: writes the gh shim and puts it
@@ -360,18 +402,14 @@ export const installShims = (deps: ShimDeps, agentMachine: boolean, families: re
     ? { agent_machine: true, ...(families === undefined ? {} : { families }) }
     : { agent_machine: false };
   writeAtomic(join(deps.configDir, "machine.json"), `${JSON.stringify(machine)}\n`);
-  if (!agentMachine) return;
-  for (const setting of agentMachineGit(deps.agentGh)) {
-    if (holds(deps, setting)) continue;
-    // A shared key (the insteadOf rules) keeps its other values; agent-gh's own are rewritten whole.
-    if (setting.exact) real(deps, "git", ["config", "--global", "--unset-all", setting.key]);
-    const present = setting.exact ? [] : globalGit(deps, setting.key);
-    for (const value of setting.values.filter((value) => !present.includes(value))) {
-      if (real(deps, "git", ["config", "--global", "--add", setting.key, value]).code !== 0) {
-        throw new Failure("installing the shims", `git config --global could not set ${setting.key}`);
-      }
-    }
+  if (configHooks(deps)) {
+    setGit(deps, commitHook(deps.agentGh));
+    deps.print("commits: a global commit-msg hook credits an agent session's commits in every repository");
+  } else {
+    deps.print(`commits: ${gitVersion(deps)} has no config-based hooks, so only repositories with agent-gh's commit-msg hook credit agent sessions; a newer git credits every repository`);
   }
+  if (!agentMachine) return;
+  setGit(deps, agentMachineGit(deps.agentGh));
   deps.print("git: an agent session uses its family App where installed, and anyone else the read App");
   if (personalGhLogin(deps)) {
     const out = real(deps, "gh", ["auth", "logout", "--hostname", "github.com"], "inherit");

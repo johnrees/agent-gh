@@ -352,6 +352,7 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
     "ok   login claude: usable",
     "ok   login read: usable",
     `ok   gh shim: ${join(deps.shims, "gh")} is first on PATH`,
+    "ok   commit hook: a global commit-msg hook credits an agent session's commits in every repository",
     "ok   git credentials: an agent session uses its family App where installed, and anyone else the read App",
     "ok   ssh: no key here logs in to GitHub",
     "ok   gh login: no personal login",
@@ -403,4 +404,39 @@ test("install-shims tells the harnesses that have run here, and doctor checks it
   const lines = await doctor();
   expect(lines).toContain("ok   claude hook: a SessionStart hook puts the shim first on PATH in Claude Code");
   expect(lines).toContain("ok   agent instructions: each harness's global instructions say how to reach GitHub");
+});
+
+test("install-shims sets a global commit-msg hook: an agent session's commits are credited in any repository, once, and a person's are left alone", async () => {
+  const { home, deps, printed, git, env } = machine();
+  installShims(deps, false, undefined);
+  expect(printed.join("\n")).toContain("commits: a global commit-msg hook credits");
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  const inRepo = (args: string[], extra: Record<string, string> = {}) =>
+    Bun.spawnSync([join(deps.bin, "git"), ...args], {
+      cwd: repo,
+      env: { ...env, GIT_AUTHOR_NAME: "J", GIT_AUTHOR_EMAIL: "j@example.com", GIT_COMMITTER_NAME: "J", GIT_COMMITTER_EMAIL: "j@example.com", ...extra },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  inRepo(["init", "-q"]);
+  inRepo(["remote", "add", "origin", "https://github.com/johnrees/penmon.git"]);
+  const agent = { ...AGENT, ANTHROPIC_MODEL: "claude-opus-5-5", CLAUDE_EFFORT: "low" };
+  const message = () => inRepo(["log", "-1", "--format=%B"]).stdout.toString();
+
+  expect(inRepo(["commit", "-q", "--allow-empty", "-m", "by a person"]).exitCode).toBe(0);
+  expect(message()).toBe("by a person\n\n");
+  expect(inRepo(["commit", "-q", "--allow-empty", "-m", "by an agent"], agent).exitCode).toBe(0);
+  expect(message()).toContain(`Co-authored-by: ${CONFIG.bot_login}`);
+
+  // A repository that also has agent-gh's own hook gets the trailers once.
+  const hook = join(repo, ".git", "hooks", "commit-msg");
+  writeFileSync(hook, `#!/bin/sh\nexec '${deps.agentGh}' guard commit-msg "$1"\n`);
+  chmodSync(hook, 0o755);
+  expect(inRepo(["commit", "-q", "--allow-empty", "-m", "twice"], agent).exitCode).toBe(0);
+  expect(message().split("\n").filter((line) => line.startsWith("Co-authored-by:"))).toHaveLength(1);
+  expect(git(["config", "--global", "--get", "hook.agent-gh.event"]).stdout).toBe("commit-msg\n");
+  git(["config", "--global", "--unset", "hook.agent-gh.command"]);
+  const lines = (await machineDoctor({ ...deps, version: "dev", latest: async () => undefined, ssh: () => "refused" })).map(formatLine);
+  expect(lines).toContain("FAIL commit hook: not set; rerun the install line");
 });
