@@ -7,6 +7,7 @@ import { PUSH_USER } from "./credential.ts";
 import { CHILD_MARKER } from "./env.ts";
 import { Failure } from "./failure.ts";
 import { writeAtomic } from "./files.ts";
+import { gitAuthor } from "./git.ts";
 import { type Env, HARNESSES, harnessNames } from "./harness.ts";
 import { loginUsable } from "./login.ts";
 import { VERSION } from "./version.ts";
@@ -334,6 +335,9 @@ export const configHooks = (deps: ShimDeps): boolean => {
 
 /** The installed git's version, for doctor's advice. */
 export const gitVersion = (deps: ShimDeps): string => real(deps, "git", ["--version"]).stdout.trim() || "git";
+
+/** The author git records for this machine's user, run from HOME so no repository's config answers. */
+export const machineAuthor = (deps: ShimDeps) => gitAuthor(real(deps, "git", ["var", "GIT_AUTHOR_IDENT"], "ignore", {}, deps.home));
 
 /** Every value of a global git setting, in order. */
 export const globalGit = (deps: ShimDeps, key: string): string[] => {

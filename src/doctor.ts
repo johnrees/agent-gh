@@ -1,5 +1,5 @@
 import { runChild } from "./child.ts";
-import { coAuthorTrailer } from "./git.ts";
+import { coAuthorTrailer, gitAuthor } from "./git.ts";
 import { slug } from "./repo.ts";
 import { type Context, withToken } from "./run.ts";
 
@@ -30,7 +30,7 @@ export const doctor = async (context: Context, print: (line: string) => void): P
     const remote = await runChild(["git", "ls-remote", `https://github.com/${slug(context.repo)}.git`, "HEAD"], env, true);
     const login = user.stdout.trim();
     const owners = installs.stdout.trim().split("\n").filter(Boolean);
-    const author = ident.stdout.trim().replace(/ \d+ [+-]\d{4}$/, "");
+    const author = gitAuthor(ident);
     const checks = [
       ["acting user", user.code === 0 && login !== "" && !login.endsWith("[bot]"), login || "none"],
       [
@@ -38,7 +38,7 @@ export const doctor = async (context: Context, print: (line: string) => void): P
         installs.code === 0 && owners.includes(context.repo.owner),
         owners.length > 0 ? `${config.slug}, installed on ${owners.join(", ")}` : "no installation of this App for the token",
       ],
-      ["git author", ident.code === 0 && author !== "" && !author.includes("[bot]"), author || "none"],
+      ["git author", author.person, author.author || "none"],
       ["repository access", remote.code === 0, remote.code === 0 ? "git ls-remote succeeded" : "git ls-remote failed"],
     ] as const;
     for (const [name, ok, seen] of checks) print(`${ok ? "ok  " : "FAIL"} ${name}: ${seen}`);

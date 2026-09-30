@@ -34,6 +34,8 @@ const HOST_CONFIG_HOOKS = (() => {
   rmSync(dir, { recursive: true, force: true });
   return probe.exitCode === 0 && probe.stdout.toString().split("\n").includes("p");
 })();
+const AUTHOR_NAME = "Test Person";
+const AUTHOR_EMAIL = "1+test-person@users.noreply.github.com";
 const COMMIT_HOOK_OK = "ok   commit hook: a global commit-msg hook credits an agent session's commits in every repository";
 
 /** Replaces a machine's git with one that, like git before config-based hooks, has no `git hook list`. */
@@ -59,7 +61,8 @@ const script = (path: string, body: string) => {
  * real git, and a fake gh and gitleaks in one bin directory. The fake gh holds
  * a personal login while `gh-login` exists, and answers git's credential
  * requests with GH_TOKEN as `gh auth git-credential` does. The claude and read
- * Apps exist and are logged in unless `read` is false.
+ * Apps exist and are logged in unless `read` is false. Git has a person's
+ * author in the global config.
  */
 const machine = ({ read = true, rc = [".zshrc", ".bashrc"] } = {}) => {
   const home = mkdtempSync(join(tmpdir(), "agent-gh-home-"));
@@ -69,6 +72,7 @@ const machine = ({ read = true, rc = [".zshrc", ".bashrc"] } = {}) => {
   mkdirSync(bin, { recursive: true });
   mkdirSync(configDir, { recursive: true, mode: 0o700 });
   for (const name of rc) writeFileSync(join(home, name), "export EDITOR=vi\n");
+  writeFileSync(join(home, ".gitconfig"), `[user]\n\tname = ${AUTHOR_NAME}\n\temail = ${AUTHOR_EMAIL}\n`);
   const log = join(home, "gh.log");
   const agentGh = join(bin, "agent-gh");
   script(agentGh, `exec '${process.execPath}' '${join(root, "src", "main.ts")}' "$@"`);
@@ -362,7 +366,7 @@ test("install-shims on a person's own machine leaves git credentials and gh's lo
 });
 
 test("doctor --machine passes a set-up agent machine and names the fix for each failure", async () => {
-  const { home, bin, deps } = machine();
+  const { home, bin, deps, git } = machine();
   installShims(deps, true, ["claude"]);
   let ssh: SshAnswer = "refused";
   const doctor = async (overrides: Partial<ShimDeps> = {}, version = "v0.1.0", latest: string | null = "v0.1.0") =>
@@ -376,6 +380,7 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
     "ok   login read: usable",
     `ok   gh shim: ${join(deps.shims, "gh")} is first on PATH`,
     ...(HOST_CONFIG_HOOKS ? [COMMIT_HOOK_OK] : []),
+    `ok   git author: ${AUTHOR_NAME} <${AUTHOR_EMAIL}>`,
     "ok   git credentials: an agent session uses its family App where installed, and anyone else the read App",
     "ok   ssh: no key here logs in to GitHub",
     "ok   gh login: no personal login",
@@ -409,6 +414,15 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
   expect(await doctor()).toContain(
     `FAIL git credentials: not as install-shims sets them: url.https://${PUSH_USER}@github.com/.pushInsteadOf, url.https://github.com/.insteadOf; rerun the install line with --agent-machine`,
   );
+
+  const fix = "run `git config --global user.name <your GitHub login>` and `git config --global user.email <id>+<login>@users.noreply.github.com`";
+  git(["config", "--global", "user.name", "someapp[bot]"]);
+  expect(await doctor()).toContain(`FAIL git author: someapp[bot] <${AUTHOR_EMAIL}> is an App's, not yours; ${fix}`);
+  // No identity at all; useConfigOnly stops git guessing one from the hostname, as it can where the hostname has a domain.
+  git(["config", "--global", "--unset", "user.name"]);
+  git(["config", "--global", "--unset", "user.email"]);
+  git(["config", "--global", "user.useConfigOnly", "true"]);
+  expect(await doctor()).toContain(`FAIL git author: none, so commits fail; ${fix}`);
 });
 
 test("install-shims tells the harnesses that have run here, and doctor checks it", async () => {
