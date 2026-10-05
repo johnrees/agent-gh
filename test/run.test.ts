@@ -1,12 +1,10 @@
 import { afterEach, describe as group, expect, test } from "bun:test";
-import { verify } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, Failure } from "../src/failure.ts";
-import { readConfig, readKey, type Registry } from "../src/config.ts";
+import { readConfig, type Registry } from "../src/config.ts";
 import { doctor } from "../src/doctor.ts";
-import { appJwt } from "../src/github.ts";
 import { type Context, runAs } from "../src/run.ts";
 import {
   ACCESS,
@@ -113,39 +111,6 @@ group("a command runs as John through the family App", () => {
     expect(await runAs(context, recorder(3))).toBe(3);
   });
 
-});
-
-group("the App key is only for App-level requests", () => {
-  test("an App JWT is issued by the client ID and signed by the App key", () => {
-    const { creds } = setup();
-    const key = readKey(creds.dir, "claude");
-    const [header, payload, signature] = appJwt(CONFIG, key, NOW).split(".");
-    expect(JSON.parse(Buffer.from(payload ?? "", "base64url").toString())).toEqual({ iat: NOW - 60, exp: NOW + 540, iss: CONFIG.client_id });
-    expect(
-      verify("RSA-SHA256", Buffer.from(`${header}.${payload}`), creds.publicKey, Buffer.from(signature ?? "", "base64url")),
-    ).toBe(true);
-  });
-
-  test("a key other users can read is refused, with no key material in the message", () => {
-    const { creds } = setup();
-    chmodSync(join(creds.dir, "claude.pem"), 0o644);
-    let error: unknown;
-    try {
-      readKey(creds.dir, "claude");
-    } catch (caught) {
-      error = caught;
-    }
-    expect(error).toBeInstanceOf(Failure);
-    expect((error as Failure).stage).toBe("reading key");
-    expect((error as Failure).detail).toContain("chmod 600");
-    clean(describe(error as Failure), [creds.pem.slice(40, 80)]);
-  });
-
-  test("a key that cannot sign", () => {
-    const { creds } = setup();
-    writeFileSync(join(creds.dir, "claude.pem"), "-----BEGIN RSA PRIVATE KEY-----\nnot a key\n-----END RSA PRIVATE KEY-----\n", { mode: 0o600 });
-    expect(() => appJwt(CONFIG, readKey(creds.dir, "claude"), NOW)).toThrow("could not sign a JWT");
-  });
 });
 
 group("the login refreshes before it expires, once, under a lock", () => {

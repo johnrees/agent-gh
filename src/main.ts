@@ -38,7 +38,6 @@ const USAGE = `usage:
   agent-gh read-token               print the read App's token (the gh shim's GH_TOKEN on agent machines)
   agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)
   agent-gh guard commit-msg <file>  from a git hook: in an agent session, add its Agent-* trailers and credit its family App
-  agent-gh guard pre-push           from a git hook: passes (kept so existing hooks keep working)
   agent-gh which <gh|git>           print the real program, past any agent-gh shim; copy this, never \`command -v gh\`, into a test's PATH`;
 
 /** Opens a URL in a local browser if there is one; the printed URL is always the fallback. */

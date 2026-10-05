@@ -8,7 +8,7 @@ import { guard, hasMessage, UPDATE } from "../src/guard.ts";
 import { bunVersionProblem } from "../scripts/bun-version.ts";
 
 const root = join(import.meta.dir, "..");
-/** Byte-identical copies of johnrees/penmon's .githooks/commit-msg and pre-push. */
+/** A byte-identical copy of johnrees/penmon's .githooks/commit-msg. */
 const HOOKS = join(import.meta.dir, "penmon-hooks");
 /** A Claude Code agent session that reports its model and effort; a person's shell has none of these. */
 const AGENT = { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1", ANTHROPIC_MODEL: "claude-opus-5-5", CLAUDE_EFFORT: "xhigh" };
@@ -168,13 +168,6 @@ test("a person's commit, and any commit in a repository with no github.com remot
   const local = world({ onGitHub: false });
   expect(local.run(["git", "commit", "-q", "-m", "local"], local.agent)).toEqual({ code: 0, stderr: "" });
   expect(local.last("%B")).toBe("local");
-});
-
-test("pushes pass the hook, an agent's and a person's alike", () => {
-  const { person, agent, run } = world();
-  expect(run(["git", "commit", "-q", "-m", "mine"], person).code).toBe(0);
-  expect(run(["git", "push", "-q", "origin", "HEAD:main"], agent).code).toBe(0);
-  expect(run(["git", "push", "-q", "origin", "HEAD:person"], person).code).toBe(0);
 });
 
 test("a session agent-gh cannot identify stops the commit with the fix, rather than crediting nobody", () => {

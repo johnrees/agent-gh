@@ -66,7 +66,7 @@ export const REFRESH = "ghr_refresh_test_2222";
  * keypair's private key. A machine that only ran `agent-gh login` has no key.
  */
 export const credentials = (family = "claude", config: AppConfig = CONFIG, { key = true, json = true } = {}) => {
-  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const pem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
   const dir = join(mkdtempSync(join(tmpdir(), "agent-gh-")), "config");
   mkdirSync(dir, { mode: 0o700 });
@@ -75,7 +75,7 @@ export const credentials = (family = "claude", config: AppConfig = CONFIG, { key
     chmodSync(join(dir, `${family}.pem`), 0o600);
   }
   if (json) writeFileSync(join(dir, `${family}.json`), JSON.stringify(config), { mode: 0o600 });
-  return { dir, pem, publicKey };
+  return { dir };
 };
 
 /** Stores a login for `family`, valid for eight hours from `now` unless overridden. */

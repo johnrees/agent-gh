@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Enabled by any cargo xtask command (core.hooksPath = .githooks). agent-gh
-# (johnrees/agent-gh#5) refuses a commit an agent session would make as
-# John; git runs this hook whichever tool commits.
+# Enabled by any cargo xtask command (core.hooksPath = .githooks). In an
+# agent session, agent-gh adds the co-author and Agent-* trailers that
+# credit the agent's family App; git runs this hook whichever tool commits.
 command -v agent-gh > /dev/null || exit 0
 exec agent-gh guard commit-msg "$1"

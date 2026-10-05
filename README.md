@@ -46,19 +46,11 @@ command -v agent-gh > /dev/null || exit 0
 exec agent-gh guard commit-msg "$1"
 ```
 
-A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify` skips it anywhere. An empty message still aborts the commit. `agent-gh guard pre-push` passes and is kept only for older hooks.
+A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify` skips it anywhere. An empty message still aborts the commit.
 
 ## Apps
 
 `agent-gh setup <family>` (or `read`), in your own terminal, creates the App from a manifest and prints what is left: install it on repositories, enable device flow, log in, and commit its `apps.json` line, which is how other machines find it. `agent-gh settings <family>` prints its pages; GitHub has no API for an App's permissions or repositories. Each machine keeps John's user tokens in `~/.config/agent-gh/` (mode 600); they refresh for six months, and the App keys are never needed day to day.
-
-## Claude Code without the shim
-
-On a machine without the gh shim, a PreToolUse hook denies a gh write that skips agent-gh:
-
-```json
-{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "bun /path/to/agent-gh/hooks/deny-bare-gh.ts" }] }
-```
 
 ## Development
 

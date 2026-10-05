@@ -75,10 +75,8 @@ export const stripsComments = (config: GitConfig, env: Env, text: string, prefix
  * session: it adds the Agent-* trailers the harness reports and the family
  * App as co-author with `git interpret-trailers` (as `git commit --trailer`
  * does, so comments and the `-v` scissors are respected). Otherwise it leaves
- * the message alone. It never refuses a commit for lacking them. `pre-push`
- * passes: it is kept only so repositories' existing hooks keep working.
- * Anything this version does not understand fails with exit 2, never a
- * silent pass.
+ * the message alone. It never refuses a commit for lacking them. Anything
+ * this version does not understand fails with exit 2, never a silent pass.
  */
 export const guard = (
   args: readonly string[],
@@ -113,6 +111,5 @@ export const guard = (
       message: `agent-gh guard: git interpret-trailers exited ${result.exitCode}, so this commit would not credit ${app.slug}[bot]: ${result.stderr.toString().trim()}\n${NEXT_STEP}`,
     };
   }
-  if (hook === "pre-push") return PASS;
   return unknown(hook === undefined ? "no hook named" : `unknown hook \`${hook}\``);
 };

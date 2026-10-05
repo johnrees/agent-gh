@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import registryJson from "../apps.json" with { type: "json" };
@@ -107,35 +107,6 @@ export const readConfig = (dir: string, family: string, registry: Registry = REG
   }
   if (!isConfig(value)) throw new Failure("reading config", `${path} is not an agent-gh App config`);
   return value;
-};
-
-/**
- * The App's private key, which only `agent-gh setup` writes and only App-level
- * requests (the planned `audit`) read: everyday commands use John's user token.
- * The caller zeroes the buffer once it has signed.
- */
-export const readKey = (dir: string, family: string): Buffer => {
-  const path = paths(dir, family).key;
-  let mode: number;
-  try {
-    mode = statSync(path).mode;
-  } catch (error) {
-    if (code(error) === "ENOENT") {
-      throw new Failure(
-        "reading key",
-        `no private key for ${family} in ${dir}; run \`agent-gh setup ${family}\` in your own terminal`,
-      );
-    }
-    throw new Failure("reading key", `${path} could not be read (${code(error)})`);
-  }
-  if ((mode & 0o077) !== 0) {
-    throw new Failure("reading key", `${path} is readable by other users; run chmod 600 ${path}`);
-  }
-  try {
-    return readFileSync(path);
-  } catch (error) {
-    throw new Failure("reading key", `${path} could not be read (${code(error)})`);
-  }
 };
 
 export const hasCredentials = (dir: string, family: string): boolean => {
