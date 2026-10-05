@@ -8,7 +8,8 @@ import type { Repo } from "./repo.ts";
 
 export type Context = {
   readonly identity: Identity;
-  readonly repo: Repo;
+  /** The repository the command names, if any (`resolveRepo`). */
+  readonly repo: Repo | undefined;
   readonly env: Env;
   readonly api: Api;
   readonly configDir: string;
@@ -20,10 +21,11 @@ export type Context = {
 
 /**
  * John's user access token for the family's App, after checking with that
- * token that the App is installed on the context's repository. The App's
- * private key is never read here. GitHub records what the child does as
- * John with the App's badge. A user token reaches every repository the App is
- * installed on; it cannot be narrowed to one per call.
+ * token that the App is installed on the context's repository, when the
+ * command names one. The check only explains a refusal: a user token reaches
+ * every repository the App is installed on, cannot be narrowed to one per
+ * call, and GitHub refuses the rest itself. The App's private key is never
+ * read here. GitHub records what the child does as John with the App's badge.
  */
 export const withToken = async <T>(
   context: Context,
@@ -37,7 +39,7 @@ export const withToken = async <T>(
     nowSeconds: context.nowSeconds,
     sleep: context.sleep,
   });
-  await requireInstallation(context.api, config, family, token, context.repo);
+  if (context.repo !== undefined) await requireInstallation(context.api, config, family, token, context.repo);
   return use(childEnv(context.env, token, context.repo), config);
 };
 

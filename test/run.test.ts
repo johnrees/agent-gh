@@ -36,7 +36,7 @@ const setup = (routes: Routes = HAPPY, login: Parameters<typeof loggedIn>[2] | n
   const creds = credentials("claude", CONFIG, { key });
   if (login !== null) loggedIn(creds.dir, NOW, login);
   const out = join(mkdtempSync(join(tmpdir(), "agent-gh-out-")), "env.json");
-  const context: Context = {
+  const context = {
     identity: { harness: "claude", family: "claude" },
     repo: { owner: "johnrees", name: "penmon" },
     env: { PATH: process.env.PATH, OUT: out, GH_DEBUG: "api", GH_TOKEN: "ghp_johns_own" },
@@ -44,8 +44,8 @@ const setup = (routes: Routes = HAPPY, login: Parameters<typeof loggedIn>[2] | n
     configDir: creds.dir,
     registry: {},
     nowSeconds: () => NOW,
-    sleep: (ms) => Bun.sleep(Math.min(ms, 10)),
-  };
+    sleep: (ms: number) => Bun.sleep(Math.min(ms, 10)),
+  } satisfies Context;
   return { fake, creds, out, context };
 };
 
@@ -97,6 +97,15 @@ group("a command runs as John through the family App", () => {
     expect(env.GIT_AUTHOR_NAME).toBeUndefined();
     expect(env.GIT_COMMITTER_EMAIL).toBeUndefined();
     expect(JSON.stringify(env)).not.toContain(REFRESH);
+  });
+
+  test("a command that names no repository runs with no installation check and no GH_REPO", async () => {
+    const { fake, out, context } = setup();
+    expect(await runAs({ ...context, repo: undefined }, recorder())).toBe(0);
+    expect(fake.log).toEqual([]);
+    const env = JSON.parse(readFileSync(out, "utf8"));
+    expect(env.GH_TOKEN).toBe(ACCESS);
+    expect(env.GH_REPO).toBeUndefined();
   });
 
   test("the child's exit code is returned", async () => {
@@ -374,7 +383,7 @@ group("another machine needs only the committed registry and `agent-gh login`", 
     };
     script("gh", 'case "$2" in user) echo johnrees ;; user/installations) echo johnrees ;; esac');
     script("git", 'case "$1" in var) echo "John Rees <john@example.com> 1800000000 +0000" ;; ls-remote) echo "0000 HEAD" ;; --version) echo "git version 2" ;; esac');
-    const machine: Context = { ...context, configDir: dir, registry: { claude: ENTRY }, env: { ...context.env, PATH: `${bin}:${process.env.PATH}` } };
+    const machine = { ...context, configDir: dir, registry: { claude: ENTRY }, env: { ...context.env, PATH: `${bin}:${process.env.PATH}` } } satisfies Context;
     expect(await runAs(machine, ["gh", "--version"])).toBe(0);
     const lines: string[] = [];
     expect(await doctor(machine, (line) => lines.push(line))).toBe(0);

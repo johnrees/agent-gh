@@ -1,6 +1,6 @@
 import { runChild } from "./child.ts";
 import { coAuthorTrailer } from "./git.ts";
-import { slug } from "./repo.ts";
+import { type Repo, slug } from "./repo.ts";
 import { type Context, withToken } from "./run.ts";
 
 /**
@@ -10,7 +10,7 @@ import { type Context, withToken } from "./run.ts";
  * user token), John's git author, and git access to the repository. Exit 0
  * only if all hold.
  */
-export const doctor = async (context: Context, print: (line: string) => void): Promise<number> => {
+export const doctor = async (context: Context & { readonly repo: Repo }, print: (line: string) => void): Promise<number> => {
   const { identity } = context;
   print(`harness: ${identity.harness}`);
   print(`model: ${identity.model ?? "not reported"}`);

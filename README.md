@@ -2,7 +2,7 @@
 
 Agents publish to GitHub as John through one GitHub App per model family (claude, codex, glm, deepseek, kimi, qwen), whatever harness runs them. GitHub shows each issue, comment, review, and pull request as John with the App's badge, and each commit as John with the App as co-author. Agents run plain `gh` and `git`; nothing asks them to choose a method or an identity.
 
-- **gh**: in an agent session, the gh shim runs every `gh` command through the session family's App. It never falls back to John's own login.
+- **gh**: in an agent session, the gh shim runs every `gh` command through the session family's App. It never falls back to John's own login. A command that names a repository (`--repo`, `GH_REPO`, or a clone's github.com `origin`) first checks that the App is installed there, so a refusal says why; one that names none (`gh api user`, `gh search`, `gh repo clone` outside a clone) runs as it is, and GitHub refuses whatever the App cannot reach.
 - **Commits**: a global `commit-msg` hook (git's config-based hooks, set by `install-shims`), or a repository's own, adds `Agent-Harness` (with `Agent-Model` and `Agent-Effort` when the harness reports them) and `Co-authored-by: johnrees-<family>[bot]` to an agent session's commits. A person's commits, and repositories with no github.com remote, are left as written.
 - **Pushes**: on a machine you use, git pushes with your own login. On an agent machine, GitHub remotes use HTTPS, an agent session's git uses its family's App wherever that App is installed and the read-only App (`johnrees-read`) elsewhere, and anyone else's git only reads.
 
