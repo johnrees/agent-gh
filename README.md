@@ -46,7 +46,7 @@ command -v agent-gh > /dev/null || exit 0
 exec agent-gh guard commit-msg "$1"
 ```
 
-A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify` skips it anywhere. An empty message still aborts the commit.
+A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify` skips it anywhere. An empty message still aborts the commit. `agent-gh guard pre-push` passes and is kept only for older hooks.
 
 ## Apps
 

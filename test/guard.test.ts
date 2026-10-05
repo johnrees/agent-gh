@@ -179,6 +179,15 @@ test("a session agent-gh cannot identify stops the commit with the fix, rather t
   expect(count()).toBe(before);
 });
 
+test("an older hook's guard pre-push passes, so its pushes are never blocked, an agent's or a person's", () => {
+  for (const env of [{}, AGENT]) {
+    const verdict = guard(["pre-push"], env, "/nonexistent", REGISTRY, () => {
+      throw new Error("pre-push never reads the repository");
+    });
+    expect(verdict).toEqual({ code: 0 });
+  }
+});
+
 test("a hook this version does not understand fails with exit 2 and the update command, never a pass", () => {
   for (const args of [["post-merge"], [], ["commit-msg"], ["commit-msg", "a", "b"]]) {
     for (const env of [{}, AGENT]) {
