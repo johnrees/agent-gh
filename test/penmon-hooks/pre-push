@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# Enabled by any cargo xtask command (core.hooksPath = .githooks). The
-# author opens a draft; CI runs once a reviewer marks it ready.
-echo "pre-push: agent-gh pr create --draft; a reviewer marks it ready for CI." >&2
-
-# agent-gh (johnrees/agent-gh#5) refuses a push an agent session would make
-# as John; git runs this hook whichever tool pushes.
-command -v agent-gh > /dev/null || exit 0
-exec agent-gh guard pre-push

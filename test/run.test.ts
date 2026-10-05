@@ -1,12 +1,10 @@
 import { afterEach, describe as group, expect, test } from "bun:test";
-import { verify } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, Failure } from "../src/failure.ts";
-import { readConfig, readKey, type Registry } from "../src/config.ts";
+import { readConfig, type Registry } from "../src/config.ts";
 import { doctor } from "../src/doctor.ts";
-import { appJwt } from "../src/github.ts";
 import { type Context, runAs } from "../src/run.ts";
 import {
   ACCESS,
@@ -36,7 +34,7 @@ const setup = (routes: Routes = HAPPY, login: Parameters<typeof loggedIn>[2] | n
   const creds = credentials("claude", CONFIG, { key });
   if (login !== null) loggedIn(creds.dir, NOW, login);
   const out = join(mkdtempSync(join(tmpdir(), "agent-gh-out-")), "env.json");
-  const context: Context = {
+  const context = {
     identity: { harness: "claude", family: "claude" },
     repo: { owner: "johnrees", name: "penmon" },
     env: { PATH: process.env.PATH, OUT: out, GH_DEBUG: "api", GH_TOKEN: "ghp_johns_own" },
@@ -44,8 +42,8 @@ const setup = (routes: Routes = HAPPY, login: Parameters<typeof loggedIn>[2] | n
     configDir: creds.dir,
     registry: {},
     nowSeconds: () => NOW,
-    sleep: (ms) => Bun.sleep(Math.min(ms, 10)),
-  };
+    sleep: (ms: number) => Bun.sleep(Math.min(ms, 10)),
+  } satisfies Context;
   return { fake, creds, out, context };
 };
 
@@ -99,44 +97,20 @@ group("a command runs as John through the family App", () => {
     expect(JSON.stringify(env)).not.toContain(REFRESH);
   });
 
+  test("a command that names no repository runs with no installation check and no GH_REPO", async () => {
+    const { fake, out, context } = setup();
+    expect(await runAs({ ...context, repo: undefined }, recorder())).toBe(0);
+    expect(fake.log).toEqual([]);
+    const env = JSON.parse(readFileSync(out, "utf8"));
+    expect(env.GH_TOKEN).toBe(ACCESS);
+    expect(env.GH_REPO).toBeUndefined();
+  });
+
   test("the child's exit code is returned", async () => {
     const { context } = setup();
     expect(await runAs(context, recorder(3))).toBe(3);
   });
 
-});
-
-group("the App key is only for App-level requests", () => {
-  test("an App JWT is issued by the client ID and signed by the App key", () => {
-    const { creds } = setup();
-    const key = readKey(creds.dir, "claude");
-    const [header, payload, signature] = appJwt(CONFIG, key, NOW).split(".");
-    expect(JSON.parse(Buffer.from(payload ?? "", "base64url").toString())).toEqual({ iat: NOW - 60, exp: NOW + 540, iss: CONFIG.client_id });
-    expect(
-      verify("RSA-SHA256", Buffer.from(`${header}.${payload}`), creds.publicKey, Buffer.from(signature ?? "", "base64url")),
-    ).toBe(true);
-  });
-
-  test("a key other users can read is refused, with no key material in the message", () => {
-    const { creds } = setup();
-    chmodSync(join(creds.dir, "claude.pem"), 0o644);
-    let error: unknown;
-    try {
-      readKey(creds.dir, "claude");
-    } catch (caught) {
-      error = caught;
-    }
-    expect(error).toBeInstanceOf(Failure);
-    expect((error as Failure).stage).toBe("reading key");
-    expect((error as Failure).detail).toContain("chmod 600");
-    clean(describe(error as Failure), [creds.pem.slice(40, 80)]);
-  });
-
-  test("a key that cannot sign", () => {
-    const { creds } = setup();
-    writeFileSync(join(creds.dir, "claude.pem"), "-----BEGIN RSA PRIVATE KEY-----\nnot a key\n-----END RSA PRIVATE KEY-----\n", { mode: 0o600 });
-    expect(() => appJwt(CONFIG, readKey(creds.dir, "claude"), NOW)).toThrow("could not sign a JWT");
-  });
 });
 
 group("the login refreshes before it expires, once, under a lock", () => {
@@ -374,7 +348,7 @@ group("another machine needs only the committed registry and `agent-gh login`", 
     };
     script("gh", 'case "$2" in user) echo johnrees ;; user/installations) echo johnrees ;; esac');
     script("git", 'case "$1" in var) echo "John Rees <john@example.com> 1800000000 +0000" ;; ls-remote) echo "0000 HEAD" ;; --version) echo "git version 2" ;; esac');
-    const machine: Context = { ...context, configDir: dir, registry: { claude: ENTRY }, env: { ...context.env, PATH: `${bin}:${process.env.PATH}` } };
+    const machine = { ...context, configDir: dir, registry: { claude: ENTRY }, env: { ...context.env, PATH: `${bin}:${process.env.PATH}` } } satisfies Context;
     expect(await runAs(machine, ["gh", "--version"])).toBe(0);
     const lines: string[] = [];
     expect(await doctor(machine, (line) => lines.push(line))).toBe(0);

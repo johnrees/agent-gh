@@ -232,9 +232,10 @@ const main = async (argv: readonly string[]): Promise<number> => {
   }
   const identity = detectIdentity(env);
   const args = first === "gh" ? rest : argv;
+  const repo = await resolveRepo(first === "doctor" ? "git" : "gh", args, env, () => originUrl(process.cwd()));
   const context: Context = {
     identity,
-    repo: await resolveRepo(first === "doctor" ? "git" : "gh", args, env, () => originUrl(process.cwd())),
+    repo,
     env,
     api: GITHUB,
     configDir: defaultConfigDir(),
@@ -242,7 +243,12 @@ const main = async (argv: readonly string[]): Promise<number> => {
     nowSeconds,
     sleep: (ms) => Bun.sleep(ms),
   };
-  if (first === "doctor") return doctor(context, (line) => console.log(line));
+  if (first === "doctor") {
+    if (repo === undefined) {
+      throw new Failure("resolving the repository", "no GH_REPO and no github.com origin remote; run doctor inside a clone of the repository");
+    }
+    return doctor({ ...context, repo }, (line) => console.log(line));
+  }
   if (args.length === 0) {
     console.error(USAGE);
     return 1;

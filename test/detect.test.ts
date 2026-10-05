@@ -247,14 +247,16 @@ test("gh's repo flag is found in every spelling", () => {
   expect(repoFlag(["pr", "view", "--repo=a/b"])).toBe("a/b");
   expect(repoFlag(["pr", "create", "--", "-R", "a/b"])).toBeUndefined();
 });
-test("the repository comes from the flag, then GH_REPO, then origin", async () => {
+test("the repository comes from the flag, then GH_REPO, then a github.com origin, else none", async () => {
   const origin = async () => "git@github.com:johnrees/soltui.git";
   expect(await resolveRepo("gh", ["pr", "view", "-R", "a/flag"], { GH_REPO: "a/env" }, origin)).toEqual({ owner: "a", name: "flag" });
   expect(await resolveRepo("gh", ["pr", "view"], { GH_REPO: "a/env" }, origin)).toEqual({ owner: "a", name: "env" });
   expect(await resolveRepo("gh", ["pr", "view"], {}, origin)).toEqual({ owner: "johnrees", name: "soltui" });
   expect(await resolveRepo("git", ["push", "-R", "a/flag"], {}, origin)).toEqual({ owner: "johnrees", name: "soltui" });
-  const failed = await resolveRepo("gh", ["pr", "view"], {}, async () => undefined).catch((error: Failure) => error.detail);
-  expect(failed).toContain("no --repo flag, no GH_REPO, and no origin remote");
+  expect(await resolveRepo("gh", ["api", "user"], {}, async () => undefined)).toBeUndefined();
+  for (const url of ["https://gitlab.com/a/b.git", "../local/repo", "a/b"]) {
+    expect(await resolveRepo("gh", ["pr", "view"], {}, async () => url)).toBeUndefined();
+  }
   const other = await resolveRepo("gh", ["pr", "view"], { GH_REPO: "gitlab.com/a/b" }, origin).catch((error: Failure) => error.detail);
   expect(other).toBe("GH_REPO does not name a github.com repository as OWNER/REPO");
 });

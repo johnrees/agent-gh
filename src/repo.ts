@@ -58,26 +58,22 @@ export const repoFlag = (args: readonly string[]): string | undefined => {
 };
 
 /**
- * The one repository a command's token is minted for: gh's `-R`/`--repo`, else
- * `GH_REPO`, else the `origin` remote.
+ * The repository a command names: gh's `-R`/`--repo`, else `GH_REPO`, else a
+ * github.com `origin` remote. Undefined when none does, as for `gh api user`,
+ * `gh search`, or `gh repo clone` outside a clone. A flag or `GH_REPO` that
+ * names no github.com repository is refused, never passed over.
  */
 export const resolveRepo = async (
   command: "gh" | "git",
   args: readonly string[],
   env: Env,
   origin: () => Promise<string | undefined>,
-): Promise<Repo> => {
-  const [source, value] =
-    command === "gh" && repoFlag(args) !== undefined
-      ? ["the --repo flag", repoFlag(args)]
-      : env.GH_REPO
-        ? ["GH_REPO", env.GH_REPO]
-        : ["the origin remote", await origin()];
+): Promise<Repo | undefined> => {
+  const flag = command === "gh" ? repoFlag(args) : undefined;
+  const [source, value] = flag !== undefined ? ["the --repo flag", flag] : env.GH_REPO ? ["GH_REPO", env.GH_REPO] : [];
   if (value === undefined) {
-    throw new Failure(
-      "resolving the repository",
-      "no --repo flag, no GH_REPO, and no origin remote; run inside a clone of the repository or pass --repo OWNER/REPO",
-    );
+    const url = await origin();
+    return url === undefined ? undefined : parseRemoteUrl(url);
   }
   const parsed = parseRepo(value);
   if (parsed === undefined) {

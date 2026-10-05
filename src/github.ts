@@ -1,4 +1,3 @@
-import { sign } from "node:crypto";
 import type { AppConfig } from "./config.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { type Repo, slug } from "./repo.ts";
@@ -82,25 +81,6 @@ export const oauthPost = async (
 /** An OAuth error code, safe to show: GitHub's are short snake_case words. */
 export const errorCode = (value: unknown): string =>
   typeof value === "string" && /^[a-z_]{1,40}$/.test(value) ? value : "an unrecognised error";
-
-/**
- * A GitHub App JWT: RS256, issued by the App's client ID, valid for nine
- * minutes. For App-level requests only (the planned `audit`); everyday
- * commands authenticate with John's user token.
- */
-export const appJwt = (config: AppConfig, key: Buffer, nowSeconds: number): string => {
-  try {
-    const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
-    const message = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({
-      iat: nowSeconds - 60,
-      exp: nowSeconds + 540,
-      iss: config.client_id,
-    })}`;
-    return `${message}.${sign("RSA-SHA256", Buffer.from(message), key).toString("base64url")}`;
-  } catch {
-    throw new Failure("signing", `the ${config.slug} private key could not sign a JWT`);
-  }
-};
 
 const PER_PAGE = 100;
 const MAX_PAGES = 50;

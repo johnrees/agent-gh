@@ -31,9 +31,10 @@ const count = (value: string | undefined): number => {
 /**
  * The environment of a gh that agent-gh runs: the parent's, with the family
  * App's user token in place of any inherited GitHub token, for gh and for the
- * git gh starts. The git author stays John's own.
+ * git gh starts, and `GH_REPO` when the command names a repository. The git
+ * author stays John's own.
  */
-export const childEnv = (parent: Env, token: string, repo: Repo): Record<string, string> => {
+export const childEnv = (parent: Env, token: string, repo: Repo | undefined): Record<string, string> => {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(parent)) if (value !== undefined) env[name] = value;
   delete env.GH_DEBUG;
@@ -48,7 +49,7 @@ export const childEnv = (parent: Env, token: string, repo: Repo): Record<string,
     GH_TOKEN: token,
     GITHUB_TOKEN: token,
     GH_HOST: "github.com",
-    GH_REPO: slug(repo),
+    ...(repo === undefined ? {} : { GH_REPO: slug(repo) }),
     GH_PROMPT_DISABLED: "1",
     GIT_CONFIG_COUNT: String(first + GIT_CONFIG.length),
     GIT_SSH_COMMAND: SSH_OFF,

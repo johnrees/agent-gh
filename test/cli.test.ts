@@ -39,6 +39,18 @@ test("a family in the registry needs only a login, and is never told to run setu
   }
 });
 
+test("outside a clone, gh runs with no repository, and doctor asks for one", async () => {
+  const agent = { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1" };
+  for (const args of [["api", "user"], ["repo", "clone", "johnrees/penmon"], ["search", "issues", "x"]]) {
+    const result = await cli(args, agent);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toStartWith("agent-gh: reading the login failed: no login for claude");
+  }
+  expect((await cli(["doctor"], agent)).stderr).toStartWith(
+    "agent-gh: resolving the repository failed: no GH_REPO and no github.com origin remote; run doctor inside a clone of the repository",
+  );
+});
+
 test("an IDE terminal's CLAUDECODE is a person, and opencode must declare its model", async () => {
   expect((await cli(["pr", "view"], { CLAUDECODE: "1" })).stderr).toContain("no agent harness detected");
   const opencode = await cli(["pr", "view"], { OPENCODE_TERMINAL: "1", GH_REPO: "johnrees/penmon" });

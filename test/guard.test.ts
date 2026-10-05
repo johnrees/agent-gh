@@ -8,7 +8,7 @@ import { guard, hasMessage, UPDATE } from "../src/guard.ts";
 import { bunVersionProblem } from "../scripts/bun-version.ts";
 
 const root = join(import.meta.dir, "..");
-/** Byte-identical copies of johnrees/penmon's .githooks/commit-msg and pre-push. */
+/** A byte-identical copy of johnrees/penmon's .githooks/commit-msg. */
 const HOOKS = join(import.meta.dir, "penmon-hooks");
 /** A Claude Code agent session that reports its model and effort; a person's shell has none of these. */
 const AGENT = { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1", ANTHROPIC_MODEL: "claude-opus-5-5", CLAUDE_EFFORT: "xhigh" };
@@ -170,13 +170,6 @@ test("a person's commit, and any commit in a repository with no github.com remot
   expect(local.last("%B")).toBe("local");
 });
 
-test("pushes pass the hook, an agent's and a person's alike", () => {
-  const { person, agent, run } = world();
-  expect(run(["git", "commit", "-q", "-m", "mine"], person).code).toBe(0);
-  expect(run(["git", "push", "-q", "origin", "HEAD:main"], agent).code).toBe(0);
-  expect(run(["git", "push", "-q", "origin", "HEAD:person"], person).code).toBe(0);
-});
-
 test("a session agent-gh cannot identify stops the commit with the fix, rather than crediting nobody", () => {
   const { person, run, count } = world();
   const before = count();
@@ -184,6 +177,15 @@ test("a session agent-gh cannot identify stops the commit with the fix, rather t
   expect(commit.code).not.toBe(0);
   expect(commit.stderr).toContain("opencode does not tell shell commands which model runs");
   expect(count()).toBe(before);
+});
+
+test("an older hook's guard pre-push passes, so its pushes are never blocked, an agent's or a person's", () => {
+  for (const env of [{}, AGENT]) {
+    const verdict = guard(["pre-push"], env, "/nonexistent", REGISTRY, () => {
+      throw new Error("pre-push never reads the repository");
+    });
+    expect(verdict).toEqual({ code: 0 });
+  }
 });
 
 test("a hook this version does not understand fails with exit 2 and the update command, never a pass", () => {
