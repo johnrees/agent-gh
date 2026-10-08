@@ -182,7 +182,10 @@ export const readyTarget = (args: readonly string[]): ReadyTarget | undefined =>
     if (arg === "-R" || arg === "--repo") index++;
     else if (!arg.startsWith("--repo=") && !arg.startsWith("-R")) words.push(arg);
   }
-  if (words[0] !== "pr" || words[1] !== "ready" || words.includes("--undo")) return undefined;
+  if (words[0] !== "pr" || words[1] !== "ready") return undefined;
+  // gh's last --undo wins, so `--undo --undo=false` marks the pull request ready.
+  const undo = words.reduce((on, word) => (word === "--undo" || word === "--undo=true" ? true : word === "--undo=false" ? false : on), false);
+  if (undo) return undefined;
   const target = words.slice(2).find((word) => !word.startsWith("-"));
   if (target === undefined) return { branch: undefined };
   if (/^#?\d+$/.test(target)) return { number: Number(target.replace("#", "")) };

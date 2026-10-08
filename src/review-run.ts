@@ -210,11 +210,30 @@ export const dispatchGh = async (args: readonly string[], repo: Repo | undefined
   });
 };
 
+/** Runs a reviewer in its checkout, with the instructions on stdin and without the caller's harness. */
+export const spawnReviewer = async (
+  command: readonly string[],
+  stdin: string,
+  cwd: string,
+  env: Env,
+): Promise<{ code: number; stdout: string; stderr: string }> => {
+  const child = Bun.spawn([...command], {
+    cwd,
+    env: reviewerEnv(env),
+    stdin: stdin === "" ? "ignore" : new Blob([stdin]),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  return { code, stdout, stderr };
+};
+
 // The reviewer works in a throwaway checkout of the reviewed commit and may run the
 // repository's configured checks there. Codex's sandbox confines writes to that checkout
 // (with network, for the checks); Claude runs restricted to its own settings, with git's
 // read commands and the checks the only shell commands it is allowed.
-const CODEX_ACCESS = ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"];
+const codexAccess = (checks: readonly string[]): string[] =>
+  checks.length === 0 ? ["-s", "read-only"] : ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"];
 const claudeAccess = (checks: readonly string[]): string[] => [
   "--restricted", "--tools", "Read,Grep,Glob,Bash",
   "--allowedTools", ["git diff", "git log", "git show", ...checks].map((command) => `Bash(${command}:*)`).join(","),
@@ -224,13 +243,13 @@ const claudeAccess = (checks: readonly string[]): string[] => [
 /** The reviewer command for a full review, answering in REVIEW_SCHEMA. */
 export const fullCommand = (reviewer: Reviewer, effort: Effort, files: { readonly schema: string; readonly out: string }, checks: readonly string[]): string[] =>
   reviewer.family === "codex"
-    ? ["codex", "exec", "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, ...CODEX_ACCESS, "--ephemeral", "--output-schema", files.schema, "-o", files.out, "-"]
+    ? ["codex", "exec", "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, ...codexAccess(checks), "--ephemeral", "--output-schema", files.schema, "-o", files.out, "-"]
     : ["claude", "-p", "--model", reviewer.model, "--effort", effort, "--output-format", "json", "--json-schema", JSON.stringify(REVIEW_SCHEMA), ...claudeAccess(checks)];
 
 /** The reviewer command for a sweep: plain text, no ticket. */
 export const sweepCommand = (reviewer: Reviewer, effort: Effort, base: string, out: string, checks: readonly string[]): string[] =>
   reviewer.family === "codex"
-    ? ["codex", "exec", "review", "--base", base, "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, ...CODEX_ACCESS, "--ephemeral", "-o", out]
+    ? ["codex", "exec", "review", "--base", base, "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, ...codexAccess(checks), "--ephemeral", "-o", out]
     : ["claude", "-p", "--model", reviewer.model, "--effort", effort, ...claudeAccess(checks)];
 
 /** Runs `use` in a detached checkout of `sha`, removed afterwards whatever the reviewer left in it. */
@@ -276,6 +295,16 @@ const fetchBase = async (io: ReviewIo, base: string): Promise<string> => {
   return mergeBase;
 };
 
+/** The pull request's merge base, from its own repository: origin may be a fork with a different base. */
+const mergeBaseOf = async (io: ReviewIo, base: string, head: string): Promise<string> => {
+  const stage = "reviewing";
+  const compare = record((await call(io, stage, "GET", `${repoPath(io)}/compare/${encodeURIComponent(base)}...${head}`)).value);
+  const sha = text(record(compare.merge_base_commit).sha);
+  // An ancestor of HEAD, so it is already here; a missing one means HEAD is not the pull request.
+  if (sha === "" || (await io.git(["cat-file", "-e", `${sha}^{commit}`])) === undefined) throw new Failure(stage, `HEAD shares no history with ${slug(io.repo)}'s ${base}`);
+  return sha;
+};
+
 const headSha = async (io: ReviewIo): Promise<string> => {
   const head = await io.git(["rev-parse", "HEAD"]);
   if (head === undefined) throw new Failure("reviewing", "not in a git repository");
@@ -314,7 +343,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const tick = await ticket(io, issue);
   const effort = options.effort ?? effortFor(config, tick.labels);
   const reviewer = reviewerFor(config, io.family);
-  const mergeBase = await fetchBase(io, target.base);
+  const mergeBase = await mergeBaseOf(io, target.base, head);
   const dir = io.tempDir();
   const files = { schema: join(dir, "schema.json"), out: join(dir, "review.json") };
   await Bun.write(files.schema, JSON.stringify(REVIEW_SCHEMA));

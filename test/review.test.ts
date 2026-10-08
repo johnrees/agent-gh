@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Failure } from "../src/failure.ts";
@@ -12,9 +12,9 @@ import {
   reviewed,
   waivedBy,
 } from "../src/review.ts";
-import { dispatchGh, gateReady, type GhDispatch, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "../src/review-run.ts";
+import { dispatchGh, fullCommand, gateReady, type GhDispatch, type ReviewIo, reviewerEnv, reviewFull, reviewSweep, spawnReviewer } from "../src/review-run.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
-import { parseRepo, slug } from "../src/repo.ts";
+import { parseRepo, repoFlag, slug } from "../src/repo.ts";
 
 /** The issue's example config: Codex and Claude reviewers, effort from the ticket's labels. */
 const EXAMPLE = {
@@ -100,6 +100,11 @@ test("gh pr ready names its pull request as gh does, and --undo is not gated", (
   expect(readyTarget(["pr", "ready", "-R", "o/r", "https://github.com/o/r/pull/34"])).toEqual({ number: 34, repo: "o/r" });
   expect(readyTarget(["pr", "ready", "feature/x"])).toEqual({ branch: "feature/x" });
   expect(readyTarget(["pr", "ready", "12", "--undo"])).toBeUndefined();
+  expect(readyTarget(["pr", "ready", "12", "--undo=true"])).toBeUndefined();
+  // gh's last --undo wins.
+  expect(readyTarget(["pr", "ready", "12", "--undo", "--undo=false"])).toEqual({ number: 12 });
+  expect(repoFlag(["-R", "o/first", "pr", "ready", "12", "--repo=o/last"])).toBe("o/last");
+  expect(repoFlag(["pr", "ready", "-R", "o/r", "--", "-R", "o/not"])).toBe("o/r");
   expect(readyTarget(["pr", "view", "12"])).toBeUndefined();
   expect(reviewed({ statuses: [{ context: "agent-review", state: "success" }] })).toBe(true);
   expect(reviewed({ statuses: [{ context: "agent-review", state: "pending" }, { context: "ci", state: "success" }] })).toBe(false);
@@ -146,6 +151,8 @@ const world = ({ head = HEAD, labels = [], status = [], events = [], optedIn = t
     [`GET ${REPO}`]: () => reply(200, { default_branch: "main" }),
     [`GET ${REPO}/contents/.github/agent-review.json`]: () =>
       optedIn ? reply(200, { content: Buffer.from(JSON.stringify(EXAMPLE)).toString("base64") }) : reply(404, {}),
+    // The pull request's own merge base; origin's (below) would be a fork's.
+    [`GET ${REPO}/compare/main...${HEAD}`]: () => reply(200, { merge_base_commit: { sha: OLD } }),
     [`GET ${REPO}/commits/${head}/status`]: () => reply(200, { state: "success", statuses: status }),
     [`GET ${REPO}/issues/12/events`]: () => reply(200, events),
     "POST /graphql": () => reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { nodes: [{ number: 7, repository: { nameWithOwner: closes } }] } } } } }),
@@ -174,7 +181,8 @@ const world = ({ head = HEAD, labels = [], status = [], events = [], optedIn = t
         worktrees.push(args.join(" "));
         return "";
       }
-      if (args[0] === "merge-base") return OLD;
+      if (args[0] === "merge-base") return "f".repeat(40);
+      if (args[0] === "cat-file") return args.at(-1) === `${OLD}^{commit}` ? "" : undefined;
       return undefined;
     },
     runReviewer: async (command, stdin, cwd) => {
@@ -251,6 +259,7 @@ test("a full review runs the other family in a checkout of the head against the 
   expect(command).toContain("sandbox_workspace_write.network_access=true");
   // The reviewer runs in a throwaway checkout of the reviewed commit, removed afterwards.
   expect(worktrees).toEqual([`worktree add --detach ${cwd} ${HEAD}`, `worktree remove --force ${cwd}`]);
+  // The merge base is the pull request's, from GitHub, not origin's.
   expect(stdin).toContain(`git diff ${OLD}...${HEAD}`);
   expect(stdin).toContain("# Issue #7: The ticket\nLabels: model:fable-astra\n\nDo it well.\n\n## Last comment\n\nLast word.");
   expect(stdin).toContain("Apply each section of docs/agents/review-checklist.md");
@@ -380,4 +389,22 @@ test("a sweep prints the reviewer's text against the pull request's base and rec
   expect(stdin).toBe("");
   expect(w.output()).toBe("No defects found.\n");
   expect(w.fake.log.filter((entry) => entry.method === "POST" && entry.path !== "/graphql")).toEqual([]);
+});
+
+test("a reviewer with no checks to run is read-only", () => {
+  const codex = { family: "codex", model: "gpt-6-astra" } as const;
+  const files = { schema: "s.json", out: "o.json" };
+  const sandbox = (checks: string[]) => fullCommand(codex, "high", files, checks).slice(6, 8);
+  expect(sandbox([])).toEqual(["-s", "read-only"]);
+  expect(sandbox(["bun test"])).toEqual(["-s", "workspace-write"]);
+});
+
+test("the reviewer process gets its instructions on stdin, in the checkout, without the caller's harness", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-gh-fake-reviewer-"));
+  const checkout = mkdtempSync(join(tmpdir(), "agent-gh-checkout-"));
+  const fake = join(dir, "reviewer");
+  await Bun.write(fake, '#!/bin/sh\necho "cwd=$(pwd) args=$* claude=${CLAUDECODE:-unset} quiet=$MISE_QUIET"\ncat\necho oops >&2\nexit 3\n');
+  chmodSync(fake, 0o755);
+  const result = await spawnReviewer([fake, "--flag"], "the prompt", checkout, { PATH: process.env.PATH ?? "", CLAUDECODE: "1" });
+  expect(result).toEqual({ code: 3, stdout: `cwd=${realpathSync(checkout)} args=--flag claude=unset quiet=1\nthe prompt`, stderr: "oops\n" });
 });

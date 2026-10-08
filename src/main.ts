@@ -21,7 +21,7 @@ import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
 import { originUrl, type Repo, resolveRepo } from "./repo.ts";
 import { EFFORTS, type Effort } from "./review.ts";
-import { dispatchGh, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "./review-run.ts";
+import { dispatchGh, type ReviewIo, reviewFull, reviewSweep, spawnReviewer } from "./review-run.ts";
 import { type Context, runAs, withToken } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
@@ -103,14 +103,7 @@ const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): Re
   runReviewer: async (command, stdin, cwd) => {
     const dir = mkdtempSync(join(tmpdir(), "agent-gh-reviewer-"));
     const log = join(dir, "stderr.log");
-    const child = Bun.spawn([...command], {
-      cwd,
-      env: reviewerEnv(process.env),
-      stdin: stdin === "" ? "ignore" : new Blob([stdin]),
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    const { code, stdout, stderr } = await spawnReviewer(command, stdin, cwd, process.env);
     writeFileSync(log, stderr);
     if (code !== 0) console.error(`agent-gh: the reviewer's log is ${log}`);
     return { code, stdout };

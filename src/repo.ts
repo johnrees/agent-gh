@@ -46,15 +46,17 @@ export const parseRepo = (value: string): Repo | undefined => {
 
 /** The value of gh's `-R`/`--repo` flag in any of its spellings, if given. */
 export const repoFlag = (args: readonly string[]): string | undefined => {
+  // gh takes the last of repeated flags, so the gate must check the repository gh acts on.
+  let value: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index] as string;
-    if (arg === "--") return undefined;
-    if (arg === "-R" || arg === "--repo") return args[index + 1];
-    if (arg.startsWith("--repo=")) return arg.slice("--repo=".length);
-    if (arg.startsWith("-R=")) return arg.slice("-R=".length);
-    if (arg.startsWith("-R") && arg.length > 2) return arg.slice(2);
+    if (arg === "--") break;
+    if (arg === "-R" || arg === "--repo") value = args[++index];
+    else if (arg.startsWith("--repo=")) value = arg.slice("--repo=".length);
+    else if (arg.startsWith("-R=")) value = arg.slice("-R=".length);
+    else if (arg.startsWith("-R") && arg.length > 2) value = arg.slice(2);
   }
-  return undefined;
+  return value;
 };
 
 /**
