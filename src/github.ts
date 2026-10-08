@@ -49,6 +49,47 @@ export const getJson = async (api: Api, stage: Stage, path: string, token: strin
 };
 
 /**
+ * A REST request with John's user token for the family App, in any method,
+ * with an optional JSON body. Returns the status and the parsed body (or
+ * undefined when there is none or it is not JSON), so callers decide what a
+ * 404 means; a request that never reaches GitHub fails.
+ */
+export const request = async (
+  api: Api,
+  stage: Stage,
+  method: "GET" | "POST",
+  path: string,
+  token: string,
+  body?: unknown,
+): Promise<{ readonly status: number; readonly value: unknown }> => {
+  let response: Response;
+  try {
+    response = await fetch(`${api.base}${path}`, {
+      method,
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "User-Agent": "agent-gh",
+        "X-GitHub-Api-Version": "2022-11-28",
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      redirect: "error",
+      signal: AbortSignal.timeout(api.timeoutMs),
+    });
+  } catch {
+    throw new Failure(stage, `could not reach ${host(api.base)}`, true);
+  }
+  let value: unknown;
+  try {
+    value = await response.json();
+  } catch {
+    value = undefined;
+  }
+  return { status: response.status, value };
+};
+
+/**
  * A form POST to github.com's OAuth endpoints (device code, token exchange,
  * refresh). They answer JSON when asked, with errors as an `error` field, so
  * the caller reads the body whatever the status.

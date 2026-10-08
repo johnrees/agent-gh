@@ -40,7 +40,10 @@ export type Stage =
   | "starting the child"
   | "setting up"
   | "installing the shims"
-  | "reading a credential";
+  | "reading a credential"
+  | "reading the review config"
+  | "checking the review"
+  | "reviewing";
 
 export const describe = (failure: Failure): string =>
   `agent-gh: ${failure.stage} failed: ${failure.detail}.\n${failure.network ? NETWORK_NEXT_STEP : NEXT_STEP}`;

@@ -5,7 +5,9 @@
  * that App on the session's commits. GitHub shows each action as John with
  * the App's badge. The usage below lists every command.
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runChild } from "./child.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
@@ -17,8 +19,10 @@ import { familyNames } from "./family.ts";
 import { detectIdentity, inAgentSession } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
-import { originUrl, resolveRepo } from "./repo.ts";
-import { type Context, runAs } from "./run.ts";
+import { originUrl, type Repo, resolveRepo } from "./repo.ts";
+import { EFFORTS, type Effort, readyTarget } from "./review.ts";
+import { gateReady, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "./review-run.ts";
+import { type Context, runAs, withToken } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
 import { readGitConfig } from "./target.ts";
@@ -39,6 +43,10 @@ const USAGE = `usage:
   agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)
   agent-gh guard commit-msg <file>  from a git hook: in an agent session, add its Agent-* trailers and credit its family App
   agent-gh guard pre-push           from a git hook: passes (kept so existing hooks keep working)
+  agent-gh review sweep [--base REF] [--effort E]
+                                    a quick bug sweep of the branch by another model family; prints, records nothing
+  agent-gh review full [--pr N] [--issue N] [--effort E]
+                                    review the pull request's pushed head against its issue; posts the findings and the agent-review status
   agent-gh which <gh|git>           print the real program, past any agent-gh shim; copy this, never \`command -v gh\`, into a test's PATH`;
 
 /** Opens a URL in a local browser if there is one; the printed URL is always the fallback. */
@@ -80,6 +88,61 @@ const deviceDeps = () => ({
   open: openUrl,
   print: (line: string) => console.error(line),
 });
+
+/** The review commands' and the gate's I/O, in an agent session with the family App's token in `env`. */
+const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): ReviewIo => ({
+  api: context.api,
+  token: env.GH_TOKEN ?? "",
+  repo,
+  family: context.identity.family,
+  git: async (args) => {
+    const child = Bun.spawn(["git", ...args], { env, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+    return code === 0 ? out.trim() : undefined;
+  },
+  runReviewer: async (command, stdin) => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-gh-reviewer-"));
+    const log = join(dir, "stderr.log");
+    const child = Bun.spawn([...command], {
+      env: reviewerEnv(process.env),
+      stdin: stdin === "" ? "ignore" : new Blob([stdin]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    writeFileSync(log, stderr);
+    if (code !== 0) console.error(`agent-gh: the reviewer's log is ${log}`);
+    return { code, stdout };
+  },
+  readFile: (path) => Bun.file(path).text(),
+  tempDir: () => mkdtempSync(join(tmpdir(), "agent-gh-review-")),
+  print: (line) => console.error(line),
+  out: (text) => process.stdout.write(text),
+});
+
+/** `agent-gh review sweep|full` options; undefined when they do not parse. */
+const reviewOptions = (rest: readonly string[]) => {
+  const [mode, ...flags] = rest;
+  if (mode !== "sweep" && mode !== "full") return undefined;
+  const allowed = mode === "sweep" ? ["--base", "--effort"] : ["--pr", "--issue", "--effort"];
+  const values: Record<string, string> = {};
+  for (let index = 0; index < flags.length; index += 2) {
+    const [flag, value] = [flags[index] as string, flags[index + 1]];
+    if (!allowed.includes(flag) || value === undefined || values[flag] !== undefined) return undefined;
+    values[flag] = value;
+  }
+  const number = (value: string | undefined) => (value === undefined ? undefined : /^\d+$/.test(value) ? Number(value) : Number.NaN);
+  const [pr, issue] = [number(values["--pr"]), number(values["--issue"])];
+  const effort = values["--effort"] as Effort | undefined;
+  if (Number.isNaN(pr) || Number.isNaN(issue) || (effort !== undefined && !EFFORTS.includes(effort))) return undefined;
+  return {
+    mode,
+    ...(values["--base"] === undefined ? {} : { base: values["--base"] }),
+    ...(pr === undefined ? {} : { pr }),
+    ...(issue === undefined ? {} : { issue }),
+    ...(effort === undefined ? {} : { effort }),
+  };
+};
 
 const main = async (argv: readonly string[]): Promise<number> => {
   const [first, ...rest] = argv;
@@ -230,9 +293,14 @@ const main = async (argv: readonly string[]): Promise<number> => {
     await login(family, deviceDeps());
     return 0;
   }
+  const review = first === "review" ? reviewOptions(rest) : undefined;
+  if (first === "review" && review === undefined) {
+    console.error(USAGE);
+    return 1;
+  }
   const identity = detectIdentity(env);
   const args = first === "gh" ? rest : argv;
-  const repo = await resolveRepo(first === "doctor" ? "git" : "gh", args, env, () => originUrl(process.cwd()));
+  const repo = await resolveRepo(first === "doctor" || first === "review" ? "git" : "gh", args, env, () => originUrl(process.cwd()));
   const context: Context = {
     identity,
     repo,
@@ -249,9 +317,28 @@ const main = async (argv: readonly string[]): Promise<number> => {
     }
     return doctor({ ...context, repo }, (line) => console.log(line));
   }
+  if (review !== undefined) {
+    if (repo === undefined) {
+      throw new Failure("reviewing", "no GH_REPO and no github.com origin remote; run the review inside a clone of the repository");
+    }
+    return withToken(context, async (childEnv) => {
+      const io = reviewIo(context, repo, childEnv);
+      if (review.mode === "full") await reviewFull(io, review);
+      else await reviewSweep(io, review);
+      return 0;
+    });
+  }
   if (args.length === 0) {
     console.error(USAGE);
     return 1;
+  }
+  const ready = readyTarget(args);
+  if (ready !== undefined && repo !== undefined) {
+    // One token for the gate and the gh it lets through.
+    return withToken(context, async (childEnv) => {
+      await gateReady(reviewIo(context, repo, childEnv), ready);
+      return (await runChild(["gh", ...args], childEnv)).code;
+    });
   }
   return runAs(context, ["gh", ...args]);
 };
