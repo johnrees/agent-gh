@@ -12,6 +12,7 @@ import {
   parseReviewConfig,
   type PullRequest,
   type ReadyTarget,
+  readyTarget,
   REVIEW_SCHEMA,
   type Review,
   reviewComment,
@@ -186,9 +187,27 @@ export const gateReady = async (io: ReviewIo, target: ReadyTarget): Promise<void
 };
 
 /** `gh pr ready` behind the gate: `run` starts gh only once the gate passes. */
-export const readyThroughGate = async (io: ReviewIo, target: ReadyTarget, run: () => Promise<number>): Promise<number> => {
-  await gateReady(io, target);
-  return run();
+/** What `dispatchGh` needs from the CLI: tokens, the gate's I/O, and gh itself. */
+export interface GhDispatch {
+  /** Runs `use` with one token for the repository, shared by the gate and the gh it lets through. */
+  withToken: (repo: Repo, use: (env: Record<string, string>) => Promise<number>) => Promise<number>;
+  io: (repo: Repo, env: Record<string, string>) => ReviewIo;
+  /** Runs gh with the token the gate used. */
+  runWith: (args: readonly string[], env: Record<string, string>) => Promise<number>;
+  /** Runs gh as any other command, with its own token. */
+  run: (args: readonly string[]) => Promise<number>;
+}
+
+/** Runs a gh command, holding `gh pr ready` until its pull request's head is reviewed. */
+export const dispatchGh = async (args: readonly string[], repo: Repo | undefined, deps: GhDispatch): Promise<number> => {
+  const ready = readyTarget(args);
+  // gh acts on a pull request URL's repository, whatever the clone or flags say.
+  const readyRepo = ready !== undefined && "repo" in ready && ready.repo !== undefined ? parseRepo(ready.repo) : repo;
+  if (ready === undefined || readyRepo === undefined) return deps.run(args);
+  return deps.withToken(readyRepo, async (env) => {
+    await gateReady(deps.io(readyRepo, env), ready);
+    return deps.runWith(args, env);
+  });
 };
 
 // The reviewer works in a throwaway checkout of the reviewed commit and may run the

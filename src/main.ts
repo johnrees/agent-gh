@@ -19,9 +19,9 @@ import { familyNames } from "./family.ts";
 import { detectIdentity, inAgentSession } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
-import { originUrl, parseRepo, type Repo, resolveRepo } from "./repo.ts";
-import { EFFORTS, type Effort, readyTarget } from "./review.ts";
-import { readyThroughGate, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "./review-run.ts";
+import { originUrl, type Repo, resolveRepo } from "./repo.ts";
+import { EFFORTS, type Effort } from "./review.ts";
+import { dispatchGh, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "./review-run.ts";
 import { type Context, runAs, withToken } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
@@ -333,17 +333,12 @@ const main = async (argv: readonly string[]): Promise<number> => {
     console.error(USAGE);
     return 1;
   }
-  const ready = readyTarget(args);
-  // gh acts on a pull request URL's repository, whatever the clone or flags say.
-  const readyRepo = ready !== undefined && "repo" in ready && ready.repo !== undefined ? parseRepo(ready.repo) : repo;
-  if (ready !== undefined && readyRepo !== undefined) {
-    // One token for the gate and the gh it lets through.
-    const gated = { ...context, repo: readyRepo };
-    return withToken(gated, async (childEnv) => {
-      return readyThroughGate(reviewIo(gated, readyRepo, childEnv), ready, async () => (await runChild(["gh", ...args], childEnv)).code);
-    });
-  }
-  return runAs(context, ["gh", ...args]);
+  return dispatchGh(args, repo, {
+    withToken: (target, use) => withToken({ ...context, repo: target }, use),
+    io: (target, childEnv) => reviewIo({ ...context, repo: target }, target, childEnv),
+    runWith: async (ghArgs, childEnv) => (await runChild(["gh", ...ghArgs], childEnv)).code,
+    run: (ghArgs) => runAs(context, ["gh", ...ghArgs]),
+  });
 };
 
 try {

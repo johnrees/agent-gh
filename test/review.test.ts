@@ -12,8 +12,9 @@ import {
   reviewed,
   waivedBy,
 } from "../src/review.ts";
-import { gateReady, readyThroughGate, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "../src/review-run.ts";
+import { dispatchGh, gateReady, type GhDispatch, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "../src/review-run.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
+import { parseRepo, slug } from "../src/repo.ts";
 
 /** The issue's example config: Codex and Claude reviewers, effort from the ticket's labels. */
 const EXAMPLE = {
@@ -301,16 +302,37 @@ test("a selector the gate cannot resolve fails closed in an opted-in repository,
   await gateReady(world({ branchPulls: [], optedIn: false }).io, { branch: "contributor:feature" });
 });
 
-test("gh runs only after the gate passes", async () => {
-  let ran = 0;
-  const run = async () => {
-    ran++;
-    return 0;
-  };
-  await gateRefusal(readyThroughGate(world().io, { number: 12 }, run));
-  expect(ran).toBe(0);
-  expect(await readyThroughGate(world({ status: [{ context: "agent-review", state: "success" }] }).io, { number: 12 }, run)).toBe(0);
-  expect(ran).toBe(1);
+test("gh pr ready runs only after the gate passes, with the gate's token; other commands are not gated", async () => {
+  const calls: string[] = [];
+  const deps = (io: ReviewIo): GhDispatch => ({
+    withToken: async (repo, use) => {
+      calls.push(`token ${slug(repo)}`);
+      return use({ GH_TOKEN: "t" });
+    },
+    io: () => io,
+    runWith: async (args, env) => {
+      calls.push(`gated gh ${args.join(" ")} ${env.GH_TOKEN}`);
+      return 0;
+    },
+    run: async (args) => {
+      calls.push(`gh ${args.join(" ")}`);
+      return 0;
+    },
+  });
+  const here = parseRepo("johnrees/penmon");
+  await gateRefusal(dispatchGh(["pr", "ready", "12"], here, deps(world().io)));
+  expect(calls).toEqual(["token johnrees/penmon"]);
+
+  calls.length = 0;
+  const done = world({ status: [{ context: "agent-review", state: "success" }] }).io;
+  expect(await dispatchGh(["-R", "johnrees/penmon", "pr", "ready", "12"], here, deps(done))).toBe(0);
+  expect(await dispatchGh(["pr", "ready", "12", "--undo"], here, deps(done))).toBe(0);
+  expect(await dispatchGh(["pr", "view", "12"], here, deps(done))).toBe(0);
+  expect(calls).toEqual(["token johnrees/penmon", "gated gh -R johnrees/penmon pr ready 12 t", "gh pr ready 12 --undo", "gh pr view 12"]);
+
+  calls.length = 0;
+  await dispatchGh(["pr", "ready", "https://github.com/johnrees/penmon/pull/12"], parseRepo("someone/else"), deps(done));
+  expect(calls[0]).toBe("token johnrees/penmon");
 });
 
 test("a waiver history longer than the gate reads is not trusted", async () => {
