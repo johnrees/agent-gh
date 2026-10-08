@@ -52,6 +52,35 @@ A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify`
 
 `agent-gh setup <family>` (or `read`), in your own terminal, creates the App from a manifest and prints what is left: install it on repositories, enable device flow, log in, and commit its `apps.json` line, which is how other machines find it. `agent-gh settings <family>` prints its pages; GitHub has no API for an App's permissions or repositories. Each machine keeps John's user tokens in `~/.config/agent-gh/` (mode 600); they refresh for six months, and the App keys are never needed day to day.
 
+## Reviews
+
+A repository opts in to cross-family review by committing `.github/agent-review.json` to its base branch. There, in an agent session, the gh shim refuses `gh pr ready` until the pull request's current head has a successful `agent-review` status, so work is reviewed before CI runs on it. A repository without the file, and a person's own `gh`, are never gated.
+
+- `agent-gh review full` reviews the pushed head of the branch's pull request against the issue it closes (or `--issue N`), from the merge base GitHub reports for the pull request's own repository. It runs the first configured reviewer from another family than the session's (or the config's `pin`), with the issue, its last comment, the pull request's description, and the repository's checklist. The reviewer works in a throwaway checkout of the reviewed commit and may run the config's `checks` there to confirm a finding: Codex in its workspace-write sandbox with network access (read-only when there are no checks), Claude restricted to git's read commands and those checks. The caller's tree is never touched. It posts the findings as a comment for the agent to answer and sets the status on that head. A new commit needs a new review.
+- `agent-gh review sweep` is a quick bug sweep of the branch with no ticket; it prints and records nothing.
+- Effort comes from the ticket's labels through the config's rules (`--effort` overrides). Reviewers are the `codex` and `claude` CLIs on PATH.
+- John waives the review of one pull request by adding the waiver label himself. A label an agent adds, through its App, waives nothing; `review full` then records "waived by" on the status.
+
+```json
+{
+  "reviewers": { "codex": { "model": "gpt-6-astra" }, "claude": { "model": "claude-opus-5-5" } },
+  "effort": {
+    "default": "high",
+    "rules": [
+      { "labels": ["model:fable-*"], "effort": "xhigh" },
+      { "labels": ["model:opus-*", "effort:xhigh"], "effort": "xhigh" }
+    ]
+  },
+  "checklist": "docs/agents/review-checklist.md",
+  "checks": ["bun test", "bun run typecheck"],
+  "waiver_label": "review-waived"
+}
+```
+
+The family Apps need the Commit statuses permission (write; the read App, read). An App created before it needs it added on its permissions page (`agent-gh settings <family>` prints the link), and each installation must accept the change; until then `review full` posts its comment but cannot set the status.
+
+The first rule whose label patterns (`*` matches anything) all match one of the ticket's labels sets the effort. The config is read from the pull request's base branch, so a branch cannot switch off its own review. The status is set by the agent that asked for the review: it shows that a review was recorded, not that nobody could forge one. A branch ruleset that requires `agent-review` makes it a merge condition too.
+
 ## Development
 
 `bun test` (offline: a fake GitHub API, real throwaway repositories and hooks, the shim under real shells, and `install.sh` against a fake release), `bun run typecheck`, `bun run build`. `bun run install-local` installs a checkout's build. A `v*` tag publishes a release with `SHA256SUMS`.
