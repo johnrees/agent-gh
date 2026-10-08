@@ -3,8 +3,9 @@ import { hasCredentials, READ_APP, REGISTRY, registryLine, writeCredentials, typ
 import { Failure } from "./failure.ts";
 import type { Api } from "./github.ts";
 
-const WRITE = { contents: "write", issues: "write", pull_requests: "write", actions: "read", checks: "read" } as const;
-const READ = { contents: "read", issues: "read", pull_requests: "read", actions: "read", checks: "read" } as const;
+// statuses: `agent-gh review` records the agent-review status, and the gate on `gh pr ready` reads it.
+const WRITE = { contents: "write", issues: "write", pull_requests: "write", actions: "read", checks: "read", statuses: "write" } as const;
+const READ = { contents: "read", issues: "read", pull_requests: "read", actions: "read", checks: "read", statuses: "read" } as const;
 
 /**
  * An App private to John's account, with no webhook deliveries. A model

@@ -26,6 +26,7 @@ test("the manifest asks for exactly the permissions agents need, and no webhook 
     pull_requests: "write",
     actions: "read",
     checks: "read",
+    statuses: "write",
   });
   expect(value.redirect_url).toBe("http://127.0.0.1:5000/callback");
   expect("callback_urls" in value).toBe(false);

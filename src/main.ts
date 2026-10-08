@@ -19,7 +19,7 @@ import { familyNames } from "./family.ts";
 import { detectIdentity, inAgentSession } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
-import { originUrl, type Repo, resolveRepo } from "./repo.ts";
+import { originUrl, parseRepo, type Repo, resolveRepo } from "./repo.ts";
 import { EFFORTS, type Effort, readyTarget } from "./review.ts";
 import { gateReady, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "./review-run.ts";
 import { type Context, runAs, withToken } from "./run.ts";
@@ -333,10 +333,13 @@ const main = async (argv: readonly string[]): Promise<number> => {
     return 1;
   }
   const ready = readyTarget(args);
-  if (ready !== undefined && repo !== undefined) {
+  // gh acts on a pull request URL's repository, whatever the clone or flags say.
+  const readyRepo = ready !== undefined && "repo" in ready && ready.repo !== undefined ? parseRepo(ready.repo) : repo;
+  if (ready !== undefined && readyRepo !== undefined) {
     // One token for the gate and the gh it lets through.
-    return withToken(context, async (childEnv) => {
-      await gateReady(reviewIo(context, repo, childEnv), ready);
+    const gated = { ...context, repo: readyRepo };
+    return withToken(gated, async (childEnv) => {
+      await gateReady(reviewIo(gated, readyRepo, childEnv), ready);
       return (await runChild(["gh", ...args], childEnv)).code;
     });
   }

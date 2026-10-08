@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { Failure, type Stage } from "./failure.ts";
 import { type Api, request } from "./github.ts";
 import { HARNESSES, type Env } from "./harness.ts";
-import { type Repo, slug } from "./repo.ts";
+import { parseRepo, type Repo, slug } from "./repo.ts";
 import {
   CONFIG_PATH,
   type Effort,
@@ -91,25 +91,30 @@ const pullForBranch = async (io: ReviewIo, stage: Stage, branch: string) =>
 const pullForCommit = async (io: ReviewIo, stage: Stage, sha: string) =>
   openPullNumber((await call(io, stage, "GET", `${repoPath(io)}/commits/${sha}/pulls`, undefined, [404, 422])).value);
 
-/** The first issue the pull request closes (GraphQL only: REST does not expose it). */
-const closingIssue = async (io: ReviewIo, number: number): Promise<number | undefined> => {
-  const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){closingIssuesReferences(first:1){nodes{number}}}}}`;
+type IssueRef = { readonly repo: Repo; readonly number: number };
+
+/** The first issue the pull request closes, in whichever repository (GraphQL only: REST does not expose it). */
+const closingIssue = async (io: ReviewIo, number: number): Promise<IssueRef | undefined> => {
+  const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){closingIssuesReferences(first:1){nodes{number repository{nameWithOwner}}}}}}`;
   const { value } = await call(io, "reviewing", "POST", "/graphql", { query, variables: { owner: io.repo.owner, name: io.repo.name, number } });
   const nodes = record(record(record(record(record(value).data).repository).pullRequest).closingIssuesReferences).nodes;
-  const first = Array.isArray(nodes) ? record(nodes[0]).number : undefined;
-  return Number.isSafeInteger(first) ? (first as number) : undefined;
+  const first = Array.isArray(nodes) ? record(nodes[0]) : {};
+  const repo = parseRepo(text(record(first.repository).nameWithOwner));
+  return Number.isSafeInteger(first.number) && repo !== undefined ? { repo, number: first.number as number } : undefined;
 };
 
-const ticket = async (io: ReviewIo, number: number): Promise<Ticket> => {
-  const issue = record((await call(io, "reviewing", "GET", `${repoPath(io)}/issues/${number}`)).value);
+const ticket = async (io: ReviewIo, { repo, number }: IssueRef): Promise<Ticket> => {
+  const path = `/repos/${slug(repo)}/issues/${number}`;
+  const issue = record((await call(io, "reviewing", "GET", path)).value);
   const count = Number.isSafeInteger(issue.comments) ? (issue.comments as number) : 0;
   let lastComment: string | undefined;
   if (count > 0) {
     const page = Math.ceil(count / 100);
-    const comments = (await call(io, "reviewing", "GET", `${repoPath(io)}/issues/${number}/comments?per_page=100&page=${page}`)).value;
+    const comments = (await call(io, "reviewing", "GET", `${path}/comments?per_page=100&page=${page}`)).value;
     if (Array.isArray(comments) && comments.length > 0) lastComment = text(record(comments[comments.length - 1]).body);
   }
-  return { number, title: text(issue.title), labels: labelNames(issue.labels), body: text(issue.body), lastComment };
+  const ref = slug(repo).toLowerCase() === slug(io.repo).toLowerCase() ? `#${number}` : `${slug(repo)}#${number}`;
+  return { ref, number, title: text(issue.title), labels: labelNames(issue.labels), body: text(issue.body), lastComment };
 };
 
 /** The person who waived the review of this pull request, if one did and the label is still on it. */
@@ -215,7 +220,8 @@ export const reviewerEnv = (env: Env): Record<string, string> => {
 };
 
 const fetchBase = async (io: ReviewIo, base: string): Promise<string> => {
-  if ((await io.git(["fetch", "-q", "origin", base])) === undefined) throw new Failure("reviewing", `could not fetch ${base} from origin`);
+  // An explicit refspec: a single-branch clone's configured one would not update origin/<base>.
+  if ((await io.git(["fetch", "-q", "origin", `+refs/heads/${base}:refs/remotes/origin/${base}`])) === undefined) throw new Failure("reviewing", `could not fetch ${base} from origin`);
   const mergeBase = await io.git(["merge-base", "HEAD", `origin/${base}`]);
   if (mergeBase === undefined) throw new Failure("reviewing", `HEAD shares no history with origin/${base}`);
   return mergeBase;
@@ -240,6 +246,9 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const head = await headSha(io);
   const number = options.pr ?? (await pullForCommit(io, stage, head));
   if (number === undefined) throw new Failure(stage, "no open pull request contains HEAD; push it and open a draft, or pass --pr N");
+  if ((await io.git(["status", "--porcelain"])) !== "") {
+    throw new Failure(stage, "the working tree has uncommitted or untracked changes, which the reviewer would read as the pushed head; commit or remove them, then review");
+  }
   const target = await pull(io, stage, number);
   if (target.head !== head) {
     throw new Failure(stage, `HEAD is not pull request #${number}'s head (${target.head.slice(0, 8)}); push your commits or check out its head, then review`);
@@ -253,7 +262,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
     io.out(`${JSON.stringify({ waived_by: person }, null, 2)}\n`);
     return;
   }
-  const issue = options.issue ?? (await closingIssue(io, number));
+  const issue = options.issue === undefined ? await closingIssue(io, number) : { repo: io.repo, number: options.issue };
   if (issue === undefined) throw new Failure(stage, `pull request #${number} closes no issue; pass --issue N for the ticket it implements`);
   const tick = await ticket(io, issue);
   const effort = options.effort ?? effortFor(config, tick.labels);
@@ -262,12 +271,15 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const dir = io.tempDir();
   const files = { schema: join(dir, "schema.json"), out: join(dir, "review.json") };
   await Bun.write(files.schema, JSON.stringify(REVIEW_SCHEMA));
-  io.print(`agent-gh: ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against #${issue}`);
-  const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, checklist: config.checklist });
+  io.print(`agent-gh: ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against ${tick.ref}`);
+  const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist });
   const result = await io.runReviewer(fullCommand(reviewer, effort, files), prompt);
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
   const review = await answer(io, reviewer, result.stdout, files.out);
-  await call(io, stage, "POST", `${repoPath(io)}/issues/${number}/comments`, { body: reviewComment(review, { reviewer, effort, head, issue }) });
+  if ((await io.git(["rev-parse", "HEAD"])) !== head || (await io.git(["status", "--porcelain"])) !== "") {
+    throw new Failure(stage, "the working tree changed while the reviewer read it; review again once it is still");
+  }
+  await call(io, stage, "POST", `${repoPath(io)}/issues/${number}/comments`, { body: reviewComment(review, { reviewer, effort, head, issue: tick.ref }) });
   const verdict = review.verdict === "approve" ? "approved" : "changes requested";
   await setStatus(io, head, `${verdict}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
   io.out(`${JSON.stringify(review, null, 2)}\n`);

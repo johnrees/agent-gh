@@ -88,8 +88,11 @@ test("only a person's waiver label counts, and removing it withdraws the waiver"
 
 test("gh pr ready names its pull request as gh does, and --undo is not gated", () => {
   expect(readyTarget(["pr", "ready"])).toEqual({ branch: undefined });
+  expect(readyTarget(["-R", "o/r", "pr", "ready", "12"])).toEqual({ number: 12 });
+  expect(readyTarget(["--repo=o/r", "pr", "ready"])).toEqual({ branch: undefined });
+  expect(readyTarget(["pr", "ready", "https://github.com/other/place/pull/9"])).toEqual({ number: 9, repo: "other/place" });
   expect(readyTarget(["pr", "ready", "12"])).toEqual({ number: 12 });
-  expect(readyTarget(["pr", "ready", "-R", "o/r", "https://github.com/o/r/pull/34"])).toEqual({ number: 34 });
+  expect(readyTarget(["pr", "ready", "-R", "o/r", "https://github.com/o/r/pull/34"])).toEqual({ number: 34, repo: "o/r" });
   expect(readyTarget(["pr", "ready", "feature/x"])).toEqual({ branch: "feature/x" });
   expect(readyTarget(["pr", "ready", "12", "--undo"])).toBeUndefined();
   expect(readyTarget(["pr", "view", "12"])).toBeUndefined();
@@ -117,10 +120,13 @@ type World = {
   events?: unknown[];
   optedIn?: boolean;
   answer?: unknown;
+  dirty?: boolean;
+  /** The repository of the issue #7 the pull request closes. */
+  closes?: string;
 };
 
 /** A pull request #12 on johnrees/penmon, closing issue #7, in a fake GitHub and a fake reviewer. */
-const world = ({ head = HEAD, labels = [], status = [], events = [], optedIn = true, answer }: World = {}) => {
+const world = ({ head = HEAD, labels = [], status = [], events = [], optedIn = true, answer, dirty = false, closes = "johnrees/penmon" }: World = {}) => {
   const fake = fakeGitHub({
     [`GET ${REPO}/pulls/12`]: () =>
       reply(200, { state: "open", title: "Do it", body: "Closes #7.", head: { sha: head }, base: { ref: "main" }, labels: labels.map((name) => ({ name })) }),
@@ -130,9 +136,10 @@ const world = ({ head = HEAD, labels = [], status = [], events = [], optedIn = t
       optedIn ? reply(200, { content: Buffer.from(JSON.stringify(EXAMPLE)).toString("base64") }) : reply(404, {}),
     [`GET ${REPO}/commits/${head}/status`]: () => reply(200, { state: "success", statuses: status }),
     [`GET ${REPO}/issues/12/events`]: () => reply(200, events),
-    "POST /graphql": () => reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { nodes: [{ number: 7 }] } } } } }),
+    "POST /graphql": () => reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { nodes: [{ number: 7, repository: { nameWithOwner: closes } }] } } } } }),
     [`GET ${REPO}/issues/7`]: () => reply(200, { title: "The ticket", body: "Do it well.", labels: [{ name: "model:fable-astra" }], comments: 1 }),
     [`GET ${REPO}/issues/7/comments`]: () => reply(200, [{ body: "Last word." }]),
+    ["GET /repos/johnrees/tracker/issues/7"]: () => reply(200, { title: "Elsewhere", body: "Tracked elsewhere.", labels: [{ name: "model:opus-sol" }], comments: 0 }),
     [`POST ${REPO}/issues/12/comments`]: () => reply(201, {}),
     [`POST ${REPO}/statuses/${HEAD}`]: () => reply(201, {}),
   });
@@ -148,7 +155,8 @@ const world = ({ head = HEAD, labels = [], status = [], events = [], optedIn = t
     git: async (args) => {
       if (args[0] === "rev-parse" && args.at(-1) === "HEAD" && args.length === 2) return HEAD;
       if (args[0] === "rev-parse" && args.includes("@{upstream}")) return "origin/feature";
-      if (args[0] === "fetch") return "";
+      if (args[0] === "fetch") return args.at(-1) === "+refs/heads/main:refs/remotes/origin/main" ? "" : undefined;
+      if (args[0] === "status") return dirty ? "?? scratch.txt" : "";
       if (args[0] === "merge-base") return OLD;
       return undefined;
     },
@@ -223,7 +231,7 @@ test("a full review runs the other family read-only against the ticket, then pos
   const [{ command, stdin }] = commands as [{ command: readonly string[]; stdin: string }];
   expect(command.slice(0, 7)).toEqual(["codex", "exec", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"', "-s"]);
   expect(command).toContain("read-only");
-  expect(stdin).toContain(`git diff ${OLD}...HEAD`);
+  expect(stdin).toContain(`git diff ${OLD}...${HEAD}`);
   expect(stdin).toContain("# Issue #7: The ticket\nLabels: model:fable-astra\n\nDo it well.\n\n## Last comment\n\nLast word.");
   expect(stdin).toContain("Apply each section of docs/agents/review-checklist.md");
   expect(JSON.parse(output())).toEqual(answer);
@@ -251,4 +259,23 @@ test("a malformed answer fails the review and sets no status", async () => {
   const { fake, io } = world({ answer: { verdict: "approve" } });
   expect(await gateRefusal(reviewFull(io, {}))).toBe("the reviewer's answer has no spec summary");
   expect(posted(fake, `${REPO}/statuses/${HEAD}`)).toEqual([]);
+});
+
+test("a full review refuses a working tree with changes the reviewer would read as the pushed head", async () => {
+  const dirty = world({ dirty: true, answer: {} });
+  expect(await gateRefusal(reviewFull(dirty.io, {}))).toContain("the working tree has uncommitted or untracked changes");
+  expect(dirty.commands).toEqual([]);
+});
+
+test("an issue closed in another repository is the ticket, with its own labels", async () => {
+  const answer = { verdict: "approve", spec: "Done.", findings: [] };
+  const { fake, commands } = await (async () => {
+    const w = world({ closes: "johnrees/tracker", answer });
+    await reviewFull(w.io, {});
+    return w;
+  })();
+  const [{ command, stdin }] = commands as [{ command: readonly string[]; stdin: string }];
+  expect(command).toContain('model_reasoning_effort="high"');
+  expect(stdin).toContain("# Issue johnrees/tracker#7: Elsewhere\nLabels: model:opus-sol");
+  expect(posted(fake, `${REPO}/issues/12/comments`)[0]?.body).toContain("against johnrees/tracker#7 by");
 });

@@ -76,6 +76,8 @@ A repository opts in to cross-family review by committing `.github/agent-review.
 }
 ```
 
+The family Apps need the Commit statuses permission (write; the read App, read). An App created before it needs it added on its permissions page (`agent-gh settings <family>` prints the link), and each installation must accept the change; until then `review full` posts its comment but cannot set the status.
+
 The first rule whose label patterns (`*` matches anything) all match one of the ticket's labels sets the effort. The config is read from the pull request's base branch, so a branch cannot switch off its own review. The status is set by the agent that asked for the review: it shows that a review was recorded, not that nobody could forge one. A branch ruleset that requires `agent-review` makes it a merge condition too.
 
 ## Development
