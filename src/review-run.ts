@@ -35,8 +35,8 @@ export type ReviewIo = {
   readonly family: string;
   /** Runs git in the working tree; its trimmed stdout, or undefined when it fails. */
   readonly git: (args: readonly string[]) => Promise<string | undefined>;
-  /** Runs a reviewer CLI with `stdin` (none when empty) and returns its exit code and stdout. */
-  readonly runReviewer: (command: readonly string[], stdin: string) => Promise<{ readonly code: number; readonly stdout: string }>;
+  /** Runs a reviewer CLI in `cwd` with `stdin` (none when empty) and returns its exit code and stdout. */
+  readonly runReviewer: (command: readonly string[], stdin: string, cwd: string) => Promise<{ readonly code: number; readonly stdout: string }>;
   readonly readFile: (path: string) => Promise<string>;
   readonly tempDir: () => string;
   /** Progress and notes, to stderr. */
@@ -83,13 +83,17 @@ const openPullNumber = (value: unknown): number | undefined => {
   return found === undefined ? undefined : (found.number as number);
 };
 
-/** The open pull request whose head branch is `branch` in this repository. */
-const pullForBranch = async (io: ReviewIo, stage: Stage, branch: string) =>
-  openPullNumber((await call(io, stage, "GET", `${repoPath(io)}/pulls?state=open&head=${encodeURIComponent(`${io.repo.owner}:${branch}`)}`)).value);
+/** The open pull request whose head branch is `branch`, or `owner:branch` for a fork's, as gh names one. */
+const pullForBranch = async (io: ReviewIo, stage: Stage, branch: string) => {
+  const head = branch.includes(":") ? branch : `${io.repo.owner}:${branch}`;
+  return openPullNumber((await call(io, stage, "GET", `${repoPath(io)}/pulls?state=open&head=${encodeURIComponent(head)}`)).value);
+};
 
-/** The open pull request containing `sha`; finds it when the local branch is named differently. */
-const pullForCommit = async (io: ReviewIo, stage: Stage, sha: string) =>
-  openPullNumber((await call(io, stage, "GET", `${repoPath(io)}/commits/${sha}/pulls`, undefined, [404, 422])).value);
+/** The open pull request whose head is `sha`; finds it when the local branch is named differently. */
+const pullForCommit = async (io: ReviewIo, stage: Stage, sha: string) => {
+  const { value } = await call(io, stage, "GET", `${repoPath(io)}/commits/${sha}/pulls`, undefined, [404, 422]);
+  return openPullNumber(Array.isArray(value) ? value.filter((item) => record(record(item).head).sha === sha) : undefined);
+};
 
 type IssueRef = { readonly repo: Repo; readonly number: number };
 
@@ -121,9 +125,11 @@ const ticket = async (io: ReviewIo, { repo, number }: IssueRef): Promise<Ticket>
 const waiver = async (io: ReviewIo, stage: Stage, target: Pull, config: ReviewConfig): Promise<string | undefined> => {
   if (!target.labels.includes(config.waiverLabel)) return undefined;
   const events: unknown[] = [];
-  for (let page = 1; page <= 10; page++) {
+  for (let page = 1; ; page++) {
+    // A history cut short could hide the App that re-added the label last, so it waives nothing.
+    if (page > 10) throw new Failure(stage, `pull request #${target.number} has over 1,000 events; its waiver cannot be checked`);
     const { value } = await call(io, stage, "GET", `${repoPath(io)}/issues/${target.number}/events?per_page=100&page=${page}`);
-    if (!Array.isArray(value)) break;
+    if (!Array.isArray(value)) throw new Failure(stage, `pull request #${target.number}'s events: invalid response`);
     events.push(...value);
     if (value.length < 100) break;
   }
@@ -157,7 +163,12 @@ export const gateReady = async (io: ReviewIo, target: ReadyTarget): Promise<void
       if (head !== undefined) number = await pullForCommit(io, stage, head);
     }
   }
-  if (number === undefined) return;
+  if (number === undefined) {
+    // gh may resolve a selector this lookup does not, so an opted-in repository fails closed.
+    const branch = text(record((await call(io, stage, "GET", repoPath(io))).value).default_branch);
+    if (branch === "" || (await readReviewConfig(io, stage, branch)) === undefined) return;
+    throw new Failure(stage, "cannot find the pull request `gh pr ready` names; name it by number");
+  }
   const pr = await pull(io, stage, number);
   const config = await readReviewConfig(io, stage, pr.base);
   if (config === undefined) return;
@@ -174,26 +185,45 @@ export const gateReady = async (io: ReviewIo, target: ReadyTarget): Promise<void
   );
 };
 
-/** The reviewer command for a full review: read-only, answering in REVIEW_SCHEMA. */
-export const fullCommand = (reviewer: Reviewer, effort: Effort, files: { readonly schema: string; readonly out: string }): string[] =>
+/** `gh pr ready` behind the gate: `run` starts gh only once the gate passes. */
+export const readyThroughGate = async (io: ReviewIo, target: ReadyTarget, run: () => Promise<number>): Promise<number> => {
+  await gateReady(io, target);
+  return run();
+};
+
+// The reviewer works in a throwaway checkout of the reviewed commit and may run the
+// repository's configured checks there. Codex's sandbox confines writes to that checkout
+// (with network, for the checks); Claude runs restricted to its own settings, with git's
+// read commands and the checks the only shell commands it is allowed.
+const CODEX_ACCESS = ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"];
+const claudeAccess = (checks: readonly string[]): string[] => [
+  "--restricted", "--tools", "Read,Grep,Glob,Bash",
+  "--allowedTools", ["git diff", "git log", "git show", ...checks].map((command) => `Bash(${command}:*)`).join(","),
+  "--permission-mode", "dontAsk", "--no-session-persistence",
+];
+
+/** The reviewer command for a full review, answering in REVIEW_SCHEMA. */
+export const fullCommand = (reviewer: Reviewer, effort: Effort, files: { readonly schema: string; readonly out: string }, checks: readonly string[]): string[] =>
   reviewer.family === "codex"
-    ? ["codex", "exec", "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, "-s", "read-only", "--ephemeral", "--output-schema", files.schema, "-o", files.out, "-"]
-    : [
-        "claude", "-p", "--model", reviewer.model, "--effort", effort, "--output-format", "json",
-        "--json-schema", JSON.stringify(REVIEW_SCHEMA), "--tools", "Read,Grep,Glob,Bash",
-        "--allowedTools", "Bash(git diff:*),Bash(git log:*),Bash(git show:*)",
-        "--permission-mode", "dontAsk", "--no-session-persistence",
-      ];
+    ? ["codex", "exec", "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, ...CODEX_ACCESS, "--ephemeral", "--output-schema", files.schema, "-o", files.out, "-"]
+    : ["claude", "-p", "--model", reviewer.model, "--effort", effort, "--output-format", "json", "--json-schema", JSON.stringify(REVIEW_SCHEMA), ...claudeAccess(checks)];
 
 /** The reviewer command for a sweep: plain text, no ticket. */
-export const sweepCommand = (reviewer: Reviewer, effort: Effort, base: string, out: string): string[] =>
+export const sweepCommand = (reviewer: Reviewer, effort: Effort, base: string, out: string, checks: readonly string[]): string[] =>
   reviewer.family === "codex"
-    ? ["codex", "exec", "review", "--base", base, "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, "--ephemeral", "-o", out]
-    : [
-        "claude", "-p", "--model", reviewer.model, "--effort", effort, "--tools", "Read,Grep,Glob,Bash",
-        "--allowedTools", "Bash(git diff:*),Bash(git log:*),Bash(git show:*)",
-        "--permission-mode", "dontAsk", "--no-session-persistence",
-      ];
+    ? ["codex", "exec", "review", "--base", base, "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, ...CODEX_ACCESS, "--ephemeral", "-o", out]
+    : ["claude", "-p", "--model", reviewer.model, "--effort", effort, ...claudeAccess(checks)];
+
+/** Runs `use` in a detached checkout of `sha`, removed afterwards whatever the reviewer left in it. */
+const inCheckout = async <T>(io: ReviewIo, sha: string, use: (dir: string) => Promise<T>): Promise<T> => {
+  const dir = join(io.tempDir(), "checkout");
+  if ((await io.git(["worktree", "add", "--detach", dir, sha])) === undefined) throw new Failure("reviewing", `could not check out ${sha.slice(0, 8)} for the reviewer`);
+  try {
+    return await use(dir);
+  } finally {
+    await io.git(["worktree", "remove", "--force", dir]);
+  }
+};
 
 /** Reads a reviewer's structured answer from its output file (codex) or stdout (claude). */
 const answer = async (io: ReviewIo, reviewer: Reviewer, stdout: string, out: string): Promise<Review> => {
@@ -244,11 +274,9 @@ export type FullOptions = { readonly pr?: number; readonly issue?: number; reado
 export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<void> => {
   const stage = "reviewing";
   const head = await headSha(io);
-  const number = options.pr ?? (await pullForCommit(io, stage, head));
-  if (number === undefined) throw new Failure(stage, "no open pull request contains HEAD; push it and open a draft, or pass --pr N");
-  if ((await io.git(["status", "--porcelain"])) !== "") {
-    throw new Failure(stage, "the working tree has uncommitted or untracked changes, which the reviewer would read as the pushed head; commit or remove them, then review");
-  }
+  const branch = options.pr === undefined ? await currentBranch(io) : undefined;
+  const number = options.pr ?? (branch === undefined ? undefined : await pullForBranch(io, stage, branch)) ?? (await pullForCommit(io, stage, head));
+  if (number === undefined) throw new Failure(stage, "no open pull request for this branch or with HEAD as its head; push it and open a draft, or pass --pr N");
   const target = await pull(io, stage, number);
   if (target.head !== head) {
     throw new Failure(stage, `HEAD is not pull request #${number}'s head (${target.head.slice(0, 8)}); push your commits or check out its head, then review`);
@@ -272,13 +300,10 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const files = { schema: join(dir, "schema.json"), out: join(dir, "review.json") };
   await Bun.write(files.schema, JSON.stringify(REVIEW_SCHEMA));
   io.print(`agent-gh: ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against ${tick.ref}`);
-  const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist });
-  const result = await io.runReviewer(fullCommand(reviewer, effort, files), prompt);
+  const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks: config.checks });
+  const result = await inCheckout(io, head, (cwd) => io.runReviewer(fullCommand(reviewer, effort, files, config.checks), prompt, cwd));
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
   const review = await answer(io, reviewer, result.stdout, files.out);
-  if ((await io.git(["rev-parse", "HEAD"])) !== head || (await io.git(["status", "--porcelain"])) !== "") {
-    throw new Failure(stage, "the working tree changed while the reviewer read it; review again once it is still");
-  }
   await call(io, stage, "POST", `${repoPath(io)}/issues/${number}/comments`, { body: reviewComment(review, { reviewer, effort, head, issue: tick.ref }) });
   const verdict = review.verdict === "approve" ? "approved" : "changes requested";
   await setStatus(io, head, `${verdict}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
@@ -313,7 +338,9 @@ export const reviewSweep = async (io: ReviewIo, options: SweepOptions): Promise<
   const out = join(io.tempDir(), "sweep.md");
   io.print(`agent-gh: ${reviewer.model} (${reviewer.family}) at ${effort} is sweeping the changes since ${base}`);
   // `codex exec review` takes no prompt beside --base; claude reads the instructions on stdin.
-  const result = await io.runReviewer(sweepCommand(reviewer, effort, base, out), reviewer.family === "codex" ? "" : sweepPrompt(base));
+  const result = await inCheckout(io, head, (cwd) =>
+    io.runReviewer(sweepCommand(reviewer, effort, base, out, config.checks), reviewer.family === "codex" ? "" : sweepPrompt(base, config.checks), cwd),
+  );
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
   io.out(`${reviewer.family === "codex" ? await io.readFile(out) : result.stdout}`.trimEnd() + "\n");
 };

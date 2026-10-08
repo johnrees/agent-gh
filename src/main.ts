@@ -21,7 +21,7 @@ import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
 import { originUrl, parseRepo, type Repo, resolveRepo } from "./repo.ts";
 import { EFFORTS, type Effort, readyTarget } from "./review.ts";
-import { gateReady, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "./review-run.ts";
+import { readyThroughGate, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "./review-run.ts";
 import { type Context, runAs, withToken } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
@@ -100,10 +100,11 @@ const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): Re
     const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
     return code === 0 ? out.trim() : undefined;
   },
-  runReviewer: async (command, stdin) => {
+  runReviewer: async (command, stdin, cwd) => {
     const dir = mkdtempSync(join(tmpdir(), "agent-gh-reviewer-"));
     const log = join(dir, "stderr.log");
     const child = Bun.spawn([...command], {
+      cwd,
       env: reviewerEnv(process.env),
       stdin: stdin === "" ? "ignore" : new Blob([stdin]),
       stdout: "pipe",
@@ -339,8 +340,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     // One token for the gate and the gh it lets through.
     const gated = { ...context, repo: readyRepo };
     return withToken(gated, async (childEnv) => {
-      await gateReady(reviewIo(gated, readyRepo, childEnv), ready);
-      return (await runChild(["gh", ...args], childEnv)).code;
+      return readyThroughGate(reviewIo(gated, readyRepo, childEnv), ready, async () => (await runChild(["gh", ...args], childEnv)).code);
     });
   }
   return runAs(context, ["gh", ...args]);

@@ -12,7 +12,7 @@ import {
   reviewed,
   waivedBy,
 } from "../src/review.ts";
-import { gateReady, type ReviewIo, reviewerEnv, reviewFull } from "../src/review-run.ts";
+import { gateReady, readyThroughGate, type ReviewIo, reviewerEnv, reviewFull, reviewSweep } from "../src/review-run.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
 
 /** The issue's example config: Codex and Claude reviewers, effort from the ticket's labels. */
@@ -28,6 +28,7 @@ const EXAMPLE = {
   },
   checklist: "docs/agents/review-checklist.md",
   waiver_label: "review-waived",
+  checks: ["bun test", "bun run typecheck"],
 };
 const config = parseReviewConfig(JSON.stringify(EXAMPLE));
 
@@ -68,7 +69,8 @@ test("a config with a typo is refused with the field to fix, and defaults fill w
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, waiver: "x" })))).toContain("unknown key waiver");
   expect(refusal(() => parseReviewConfig(JSON.stringify({ reviewers: {} })))).toContain("names no reviewer");
   const minimal = parseReviewConfig(JSON.stringify({ reviewers: { codex: { model: "gpt-6-astra" } } }));
-  expect(minimal).toMatchObject({ effort: { default: "high", rules: [] }, checklist: undefined, waiverLabel: "review-waived" });
+  expect(minimal).toMatchObject({ effort: { default: "high", rules: [] }, checklist: undefined, waiverLabel: "review-waived", checks: [] });
+  expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, checks: "bun test" })))).toContain("checks must be a list");
 });
 
 const labeled = (login: string, app: unknown, event = "labeled", name = "review-waived") => ({
@@ -92,6 +94,8 @@ test("gh pr ready names its pull request as gh does, and --undo is not gated", (
   expect(readyTarget(["--repo=o/r", "pr", "ready"])).toEqual({ branch: undefined });
   expect(readyTarget(["pr", "ready", "https://github.com/other/place/pull/9"])).toEqual({ number: 9, repo: "other/place" });
   expect(readyTarget(["pr", "ready", "12"])).toEqual({ number: 12 });
+  expect(readyTarget(["pr", "ready", "#12"])).toEqual({ number: 12 });
+  expect(readyTarget(["pr", "ready", "contributor:feature"])).toEqual({ branch: "contributor:feature" });
   expect(readyTarget(["pr", "ready", "-R", "o/r", "https://github.com/o/r/pull/34"])).toEqual({ number: 34, repo: "o/r" });
   expect(readyTarget(["pr", "ready", "feature/x"])).toEqual({ branch: "feature/x" });
   expect(readyTarget(["pr", "ready", "12", "--undo"])).toBeUndefined();
@@ -120,18 +124,25 @@ type World = {
   events?: unknown[];
   optedIn?: boolean;
   answer?: unknown;
-  dirty?: boolean;
+  /** Whether the branch has an upstream (whose pull request is #12). */
+  upstream?: boolean;
+  /** The open pull requests GitHub lists for HEAD's commit. */
+  commitPulls?: unknown[];
+  /** The open pull requests for a branch lookup. */
+  branchPulls?: unknown[];
+  family?: string;
   /** The repository of the issue #7 the pull request closes. */
   closes?: string;
 };
 
 /** A pull request #12 on johnrees/penmon, closing issue #7, in a fake GitHub and a fake reviewer. */
-const world = ({ head = HEAD, labels = [], status = [], events = [], optedIn = true, answer, dirty = false, closes = "johnrees/penmon" }: World = {}) => {
+const world = ({ head = HEAD, labels = [], status = [], events = [], optedIn = true, answer, closes = "johnrees/penmon", upstream = true, commitPulls = [{ number: 12, state: "open", head: { sha: HEAD } }], branchPulls = [{ number: 12, state: "open" }], family = "claude" }: World = {}) => {
   const fake = fakeGitHub({
     [`GET ${REPO}/pulls/12`]: () =>
       reply(200, { state: "open", title: "Do it", body: "Closes #7.", head: { sha: head }, base: { ref: "main" }, labels: labels.map((name) => ({ name })) }),
-    [`GET ${REPO}/pulls`]: () => reply(200, [{ number: 12, state: "open" }]),
-    [`GET ${REPO}/commits/${HEAD}/pulls`]: () => reply(200, [{ number: 12, state: "open" }]),
+    [`GET ${REPO}/pulls`]: () => reply(200, branchPulls),
+    [`GET ${REPO}/commits/${HEAD}/pulls`]: () => reply(200, commitPulls),
+    [`GET ${REPO}`]: () => reply(200, { default_branch: "main" }),
     [`GET ${REPO}/contents/.github/agent-review.json`]: () =>
       optedIn ? reply(200, { content: Buffer.from(JSON.stringify(EXAMPLE)).toString("base64") }) : reply(404, {}),
     [`GET ${REPO}/commits/${head}/status`]: () => reply(200, { state: "success", statuses: status }),
@@ -144,26 +155,32 @@ const world = ({ head = HEAD, labels = [], status = [], events = [], optedIn = t
     [`POST ${REPO}/statuses/${HEAD}`]: () => reply(201, {}),
   });
   stops.push(fake.stop);
-  const commands: { command: readonly string[]; stdin: string }[] = [];
+  const commands: { command: readonly string[]; stdin: string; cwd: string }[] = [];
+  const worktrees: string[] = [];
   const printed: string[] = [];
   let output = "";
   const io: ReviewIo = {
     api: fake.api,
     token: "ghu_test",
     repo: { owner: "johnrees", name: "penmon" },
-    family: "claude",
+    family,
     git: async (args) => {
       if (args[0] === "rev-parse" && args.at(-1) === "HEAD" && args.length === 2) return HEAD;
-      if (args[0] === "rev-parse" && args.includes("@{upstream}")) return "origin/feature";
+      if (args[0] === "rev-parse" && args.includes("@{upstream}")) return upstream ? "origin/feature" : undefined;
+      if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return upstream ? "feature" : "HEAD";
       if (args[0] === "fetch") return args.at(-1) === "+refs/heads/main:refs/remotes/origin/main" ? "" : undefined;
-      if (args[0] === "status") return dirty ? "?? scratch.txt" : "";
+      if (args[0] === "worktree") {
+        worktrees.push(args.join(" "));
+        return "";
+      }
       if (args[0] === "merge-base") return OLD;
       return undefined;
     },
-    runReviewer: async (command, stdin) => {
-      commands.push({ command, stdin });
+    runReviewer: async (command, stdin, cwd) => {
+      commands.push({ command, stdin, cwd });
+      if (command[0] === "claude") return { code: 0, stdout: JSON.stringify({ type: "result", result: "", structured_output: answer }) };
       const out = command[command.indexOf("-o") + 1];
-      if (out !== undefined) await Bun.write(out, JSON.stringify(answer));
+      if (out !== undefined) await Bun.write(out, typeof answer === "string" ? answer : JSON.stringify(answer));
       return { code: 0, stdout: "" };
     },
     readFile: (path) => Bun.file(path).text(),
@@ -173,13 +190,13 @@ const world = ({ head = HEAD, labels = [], status = [], events = [], optedIn = t
       output += text;
     },
   };
-  return { fake, io, commands, printed, output: () => output };
+  return { fake, io, commands, worktrees, printed, output: () => output };
 };
 
 const posted = (fake: ReturnType<typeof world>["fake"], path: string) =>
   fake.log.filter((entry) => entry.method === "POST" && entry.path === path).map((entry) => JSON.parse(entry.body) as Record<string, unknown>);
 
-const gateRefusal = async (run: Promise<void>): Promise<string> => {
+const gateRefusal = async (run: Promise<unknown>): Promise<string> => {
   try {
     await run;
   } catch (error) {
@@ -219,21 +236,24 @@ test("a person's waiver label passes the gate; an App's does not", async () => {
   expect(await gateRefusal(gateReady(app.io, { number: 12 }))).toContain("has no agent-review status");
 });
 
-test("a full review runs the other family read-only against the ticket, then posts its findings and status", async () => {
+test("a full review runs the other family in a checkout of the head against the ticket, then posts its findings and status", async () => {
   const answer = {
     verdict: "changes_requested",
     spec: "Mostly done.",
     findings: [{ priority: "P2", kind: "tests", file: "src/a.ts", line: 3, summary: "Untested branch.", scenario: "Deleting it passes every test." }],
   };
-  const { fake, io, commands, output } = world({ answer });
+  const { fake, io, commands, worktrees, output } = world({ answer });
   await reviewFull(io, {});
   expect(commands).toHaveLength(1);
-  const [{ command, stdin }] = commands as [{ command: readonly string[]; stdin: string }];
-  expect(command.slice(0, 7)).toEqual(["codex", "exec", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"', "-s"]);
-  expect(command).toContain("read-only");
+  const [{ command, stdin, cwd }] = commands as [{ command: readonly string[]; stdin: string; cwd: string }];
+  expect(command.slice(0, 9)).toEqual(["codex", "exec", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"', "-s", "workspace-write", "-c"]);
+  expect(command).toContain("sandbox_workspace_write.network_access=true");
+  // The reviewer runs in a throwaway checkout of the reviewed commit, removed afterwards.
+  expect(worktrees).toEqual([`worktree add --detach ${cwd} ${HEAD}`, `worktree remove --force ${cwd}`]);
   expect(stdin).toContain(`git diff ${OLD}...${HEAD}`);
   expect(stdin).toContain("# Issue #7: The ticket\nLabels: model:fable-astra\n\nDo it well.\n\n## Last comment\n\nLast word.");
   expect(stdin).toContain("Apply each section of docs/agents/review-checklist.md");
+  expect(stdin).toContain("you may run these checks, and no other commands that build or write: `bun test`, `bun run typecheck`.");
   expect(JSON.parse(output())).toEqual(answer);
   const [comment] = posted(fake, `${REPO}/issues/12/comments`);
   expect(comment?.body).toContain("**agent-review** of aaaaaaaa against #7 by gpt-6-astra (codex) at xhigh: changes requested");
@@ -261,12 +281,6 @@ test("a malformed answer fails the review and sets no status", async () => {
   expect(posted(fake, `${REPO}/statuses/${HEAD}`)).toEqual([]);
 });
 
-test("a full review refuses a working tree with changes the reviewer would read as the pushed head", async () => {
-  const dirty = world({ dirty: true, answer: {} });
-  expect(await gateRefusal(reviewFull(dirty.io, {}))).toContain("the working tree has uncommitted or untracked changes");
-  expect(dirty.commands).toEqual([]);
-});
-
 test("an issue closed in another repository is the ticket, with its own labels", async () => {
   const answer = { verdict: "approve", spec: "Done.", findings: [] };
   const { fake, commands } = await (async () => {
@@ -274,8 +288,74 @@ test("an issue closed in another repository is the ticket, with its own labels",
     await reviewFull(w.io, {});
     return w;
   })();
-  const [{ command, stdin }] = commands as [{ command: readonly string[]; stdin: string }];
+  const [{ command, stdin }] = commands as [{ command: readonly string[]; stdin: string; cwd: string }];
   expect(command).toContain('model_reasoning_effort="high"');
   expect(stdin).toContain("# Issue johnrees/tracker#7: Elsewhere\nLabels: model:opus-sol");
   expect(posted(fake, `${REPO}/issues/12/comments`)[0]?.body).toContain("against johnrees/tracker#7 by");
+});
+
+test("a selector the gate cannot resolve fails closed in an opted-in repository, and passes elsewhere", async () => {
+  const opted = world({ branchPulls: [] });
+  expect(await gateRefusal(gateReady(opted.io, { branch: "contributor:feature" }))).toBe("cannot find the pull request `gh pr ready` names; name it by number");
+  expect(opted.fake.log.some((entry) => entry.path === `${REPO}/pulls` )).toBe(true);
+  await gateReady(world({ branchPulls: [], optedIn: false }).io, { branch: "contributor:feature" });
+});
+
+test("gh runs only after the gate passes", async () => {
+  let ran = 0;
+  const run = async () => {
+    ran++;
+    return 0;
+  };
+  await gateRefusal(readyThroughGate(world().io, { number: 12 }, run));
+  expect(ran).toBe(0);
+  expect(await readyThroughGate(world({ status: [{ context: "agent-review", state: "success" }] }).io, { number: 12 }, run)).toBe(0);
+  expect(ran).toBe(1);
+});
+
+test("a waiver history longer than the gate reads is not trusted", async () => {
+  const many = Array.from({ length: 100 }, () => labeled("johnrees", null));
+  const long = world({ labels: ["review-waived"], events: many });
+  expect(await gateRefusal(gateReady(long.io, { number: 12 }))).toBe("pull request #12 has over 1,000 events; its waiver cannot be checked");
+});
+
+test("without an upstream, the full review takes the pull request whose head is HEAD, not any that contains it", async () => {
+  const w = world({
+    upstream: false,
+    commitPulls: [{ number: 11, state: "open", head: { sha: OLD } }, { number: 12, state: "open", head: { sha: HEAD } }],
+    answer: { verdict: "approve", spec: "Done.", findings: [] },
+  });
+  await reviewFull(w.io, {});
+  expect(w.fake.log.some((entry) => entry.path === `${REPO}/pulls/11`)).toBe(false);
+  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)).toHaveLength(1);
+});
+
+test("a Codex session's work is reviewed by Claude, restricted to git's reads and the configured checks", async () => {
+  const answer = { verdict: "approve", spec: "Done.", findings: [] };
+  const w = world({ family: "codex", answer });
+  await reviewFull(w.io, {});
+  const [{ command }] = w.commands as [{ command: readonly string[]; stdin: string; cwd: string }];
+  expect(command.slice(0, 6)).toEqual(["claude", "-p", "--model", "claude-opus-5-5", "--effort", "xhigh"]);
+  expect(command).toContain("--restricted");
+  expect(command).toContain("dontAsk");
+  expect(command).not.toContain("bypassPermissions");
+  expect(command[command.indexOf("--allowedTools") + 1]).toBe("Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(bun test:*),Bash(bun run typecheck:*)");
+  expect(JSON.parse(w.output())).toEqual(answer);
+});
+
+test("a pinned reviewer reviews its own family's work", () => {
+  const pinned = parseReviewConfig(JSON.stringify({ reviewers: { codex: { model: "gpt-6-astra" } }, pin: "codex" }));
+  expect(reviewerFor(pinned, "codex")).toEqual({ family: "codex", model: "gpt-6-astra" });
+  expect(() => parseReviewConfig(JSON.stringify({ reviewers: { codex: { model: "gpt-6-astra" } }, pin: "claude" }))).toThrow("pin must name a family under reviewers");
+});
+
+test("a sweep prints the reviewer's text against the pull request's base and records nothing", async () => {
+  const w = world({ answer: "No defects found." });
+  await reviewSweep(w.io, {});
+  const [{ command, stdin }] = w.commands as [{ command: readonly string[]; stdin: string; cwd: string }];
+  expect(command.slice(0, 5)).toEqual(["codex", "exec", "review", "--base", "origin/main"]);
+  expect(command).toContain('model_reasoning_effort="xhigh"');
+  expect(stdin).toBe("");
+  expect(w.output()).toBe("No defects found.\n");
+  expect(w.fake.log.filter((entry) => entry.method === "POST" && entry.path !== "/graphql")).toEqual([]);
 });
