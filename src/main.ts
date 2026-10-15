@@ -19,7 +19,10 @@ import { familyNames } from "./family.ts";
 import { detectIdentity, inAgentSession } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
+import { parseThreadRef, sessionId } from "./notify.ts";
 import { originUrl, parseRemoteUrl, parseRepo, type Repo, resolveRepo, slug } from "./repo.ts";
+import { parseAddress } from "./reply.ts";
+import { type NotifyOptions, notifyCommand, replyCommand, type ReplyOptions } from "./reply-run.ts";
 import { EFFORTS, type Effort } from "./review.ts";
 import { dispatchGh, guardPush, type ReviewIo, reviewFull, reviewSweep, spawnCheck, spawnReviewer } from "./review-run.ts";
 import { type Context, runAs, withToken } from "./run.ts";
@@ -51,6 +54,12 @@ const USAGE = `usage:
                                     run the config's checks on the pull request's pushed head, review it against its issue,
                                     and post the findings as a review and the agent-review status (or, with
                                     status_writer "actions", wait for the agent-review workflow to set it)
+  agent-gh reply <finding> --applied <sha> | --declined "<why>" [--pr N]
+                                    answer a review finding or a notify (its id as \`review full\` prints it, or its URL);
+                                    a finding's review thread is answered and resolved
+  agent-gh notify <issue or pr> --severity P0|P1|P2 --body "<text>" | --body-file <file|-> [--from <issue or pr>]
+                                    post a finding on another thread, linked back to this branch's pull request (or --from);
+                                    it waits for an agent's \`agent-gh reply\`
   agent-gh status [--pr N]          in the agent-review workflow (GitHub Actions, GITHUB_TOKEN): set agent-review
                                     and agent-threads on the event's pull request
   agent-gh which <gh|git>           print the real program, past any agent-gh shim; copy this, never \`command -v gh\`, into a test's PATH`;
@@ -175,6 +184,50 @@ const reviewOptions = (rest: readonly string[]) => {
     ...(issue === undefined ? {} : { issue }),
     ...(effort === undefined ? {} : { effort }),
   };
+};
+
+/** `--flag value` pairs after `count` positional arguments; undefined when they do not parse. */
+const flagPairs = (args: readonly string[], count: number, allowed: readonly string[]) => {
+  const positional = args.slice(0, count);
+  if (positional.length < count || positional.some((arg) => arg.startsWith("--"))) return undefined;
+  const values: Record<string, string> = {};
+  for (let index = count; index < args.length; index += 2) {
+    const [flag, value] = [args[index] as string, args[index + 1]];
+    if (!allowed.includes(flag) || value === undefined || values[flag] !== undefined) return undefined;
+    values[flag] = value;
+  }
+  return { positional, values };
+};
+
+const prFlag = (value: string | undefined) => (value === undefined ? undefined : /^\d+$/.test(value) ? Number(value) : Number.NaN);
+
+/** `agent-gh reply`'s options; undefined when they do not parse. */
+const replyOptions = (rest: readonly string[]): ReplyOptions | undefined => {
+  const parsed = flagPairs(rest, 1, ["--applied", "--declined", "--pr"]);
+  if (parsed === undefined) return undefined;
+  const { positional, values } = parsed;
+  const [applied, declined, pr] = [values["--applied"], values["--declined"], prFlag(values["--pr"])];
+  if ((applied === undefined) === (declined === undefined) || Number.isNaN(pr)) return undefined;
+  return { address: positional[0] as string, outcome: applied === undefined ? { declined: declined as string } : { applied }, ...(pr === undefined ? {} : { pr }) };
+};
+
+/** `agent-gh notify`'s options, with the text read from `--body-file` (`-` for stdin); undefined when they do not parse. */
+const notifyOptions = async (rest: readonly string[]): Promise<NotifyOptions | undefined> => {
+  const parsed = flagPairs(rest, 1, ["--severity", "--body", "--body-file", "--from"]);
+  if (parsed === undefined) return undefined;
+  const { positional, values } = parsed;
+  const [body, file] = [values["--body"], values["--body-file"]];
+  if ((body === undefined) === (file === undefined)) return undefined;
+  let text = body ?? "";
+  if (file !== undefined) {
+    try {
+      text = file === "-" ? await new Response(Bun.stdin.stream()).text() : readFileSync(file, "utf8");
+    } catch {
+      throw new Failure("notifying", `cannot read ${file}`);
+    }
+  }
+  const from = values["--from"];
+  return { target: positional[0] as string, severity: values["--severity"], text, ...(from === undefined ? {} : { from }) };
 };
 
 const main = async (argv: readonly string[]): Promise<number> => {
@@ -359,13 +412,21 @@ const main = async (argv: readonly string[]): Promise<number> => {
     return 0;
   }
   const review = first === "review" ? reviewOptions(rest) : undefined;
-  if (first === "review" && review === undefined) {
+  const replying = first === "reply" ? replyOptions(rest) : undefined;
+  const notifying = first === "notify" ? await notifyOptions(rest) : undefined;
+  if ((first === "review" && review === undefined) || (first === "reply" && replying === undefined) || (first === "notify" && notifying === undefined)) {
     console.error(USAGE);
     return 1;
   }
   const identity = detectIdentity(env);
   const args = first === "gh" ? rest : argv;
-  const repo = await resolveRepo(first === "doctor" || first === "review" ? "git" : "gh", args, env, () => originUrl(process.cwd()));
+  const local = first === "doctor" || first === "review" || first === "reply" || first === "notify";
+  // Outside a clone, a reply or notify that names its thread by URL acts in that thread's repository.
+  const named = replying === undefined ? undefined : (parseAddress(replying.address) as { readonly repo?: Repo } | undefined)?.repo;
+  const repo =
+    (await resolveRepo(local ? "git" : "gh", args, env, () => originUrl(process.cwd()))) ??
+    named ??
+    (notifying === undefined ? undefined : parseThreadRef(notifying.target, undefined)?.repo);
   const context: Context = {
     identity,
     repo,
@@ -390,6 +451,17 @@ const main = async (argv: readonly string[]): Promise<number> => {
       const io = reviewIo(context, repo, childEnv);
       if (review.mode === "full") await reviewFull(io, review);
       else await reviewSweep(io, review);
+      return 0;
+    });
+  }
+  if (replying !== undefined || notifying !== undefined) {
+    if (repo === undefined) {
+      throw new Failure(replying === undefined ? "notifying" : "replying", "no GH_REPO and no github.com origin remote; run it inside a clone of the repository, or name the thread by its URL");
+    }
+    return withToken(context, async (childEnv) => {
+      const io = reviewIo(context, repo, childEnv);
+      if (replying !== undefined) await replyCommand(io, sessionId(env), replying);
+      else if (notifying !== undefined) await notifyCommand(io, sessionId(env), notifying);
       return 0;
     });
   }

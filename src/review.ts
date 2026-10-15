@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Failure } from "./failure.ts";
 
 /**
@@ -608,6 +609,8 @@ export type Finding = {
   readonly line: number;
   readonly summary: string;
   readonly scenario: string;
+  /** Set by agent-gh once the review is in (`withIds`), never by the reviewer: what `agent-gh reply` answers. */
+  readonly id?: string;
 };
 export type Review = { readonly verdict: "approve" | "changes_requested"; readonly spec: string; readonly findings: readonly Finding[] };
 
@@ -874,10 +877,47 @@ export const parseMarker = (body: string): ReviewMarker | undefined => {
   return ok ? (value as unknown as ReviewMarker) : undefined;
 };
 
-/** A finding as an inline review comment on its line. */
-export const inlineComment = (finding: Finding): string => `**${finding.priority} ${finding.kind}**: ${finding.summary}\n\n${finding.scenario}`;
+/**
+ * A posted finding's marker: its id, which `agent-gh reply` takes, and its
+ * priority, so a thread's weight can be read without parsing its text.
+ */
+export type FindingMarker = { readonly v: 1; readonly id: string; readonly priority: Finding["priority"] };
 
-const listed = (finding: Finding): string => `- **${finding.priority} ${finding.kind}** \`${finding.file}:${finding.line}\`: ${finding.summary}\n  ${finding.scenario}`;
+const FINDING = /<!-- agent-finding (\{[^\n]*?\}) -->/;
+const FINDING_ID = /^[0-9a-f]{12}$/;
+
+export const findingMarker = (marker: FindingMarker): string => `<!-- agent-finding ${JSON.stringify(marker)} -->`;
+
+/** The finding marker in a comment or a line of a review's body; undefined when there is none or it is malformed. */
+export const parseFinding = (body: string): FindingMarker | undefined => {
+  const match = FINDING.exec(body);
+  if (match === null) return undefined;
+  try {
+    const value = JSON.parse(match[1] as string) as Record<string, unknown>;
+    const ok = value.v === 1 && typeof value.id === "string" && FINDING_ID.test(value.id) && ["P0", "P1", "P2", "P3"].includes(value.priority as string);
+    return ok ? { v: 1, id: value.id as string, priority: value.priority as Finding["priority"] } : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Each finding with its id: 12 hex digits of the SHA-256 of the reviewed head,
+ * its place in the review, and its file, line, and summary, so ids differ
+ * across findings and reviews. Any id the reviewer gave is replaced.
+ */
+export const withIds = (head: string, findings: readonly Finding[]): Finding[] =>
+  findings.map((finding, index) => ({
+    ...finding,
+    id: createHash("sha256").update(`${head}\n${index}\n${finding.file}\n${finding.line}\n${finding.summary}`).digest("hex").slice(0, 12),
+  }));
+
+const tagged = (finding: Finding): string => (finding.id === undefined ? "" : ` ${findingMarker({ v: 1, id: finding.id, priority: finding.priority })}`);
+
+/** A finding as an inline review comment on its line. */
+export const inlineComment = (finding: Finding): string => `**${finding.priority} ${finding.kind}**: ${finding.summary}${tagged(finding)}\n\n${finding.scenario}`;
+
+const listed = (finding: Finding): string => `- **${finding.priority} ${finding.kind}** \`${finding.file}:${finding.line}\`: ${finding.summary}${tagged(finding)}\n  ${finding.scenario}`;
 
 /**
  * The pull request review's body: the marker, the verdict and checks, the
@@ -908,7 +948,7 @@ export const reviewBody = (
     ...(!meta.postOutput || meta.checks.state === "not run" || meta.checks.tail === ""
       ? []
       : ["", `<details><summary>Checks output (last lines)</summary>`, "", ...fenced(meta.checks.tail), "", "</details>"]),
-    ...(review.findings.length === 0 ? [] : ["", "Reply with what was done about each finding: applied (with the commit), or not, and why."]),
+    ...(review.findings.length === 0 ? [] : ["", "Answer each finding with `agent-gh reply <finding id> --applied <sha>` or `--declined \"<why>\"`."]),
   ].join("\n");
 };
 

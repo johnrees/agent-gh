@@ -19,13 +19,14 @@ export type Severity = (typeof SEVERITIES)[number];
 
 /**
  * A notify: an agent's finding posted on another thread. P0 to P2 need a
- * reply; P3 never does. `id` names it, so a reply can point at it. Posting
- * notifies and replies is `agent-gh notify` / `reply` (#20, part C); this is
- * the format both read.
+ * reply; P3 never does. `id` names it, so a reply can point at it, and
+ * `session` names the harness session that posted it (`<harness>:<id>`),
+ * when the harness tells. `agent-gh notify` and `reply` post them (notify.ts,
+ * reply.ts); this is the format both read.
  */
-export type NotifyMarker = { readonly v: 1; readonly id: string; readonly severity: Severity };
-/** A reply to the notify `to`; a reply never needs an answer itself. */
-export type ReplyMarker = { readonly v: 1; readonly to: string };
+export type NotifyMarker = { readonly v: 1; readonly id: string; readonly severity: Severity; readonly session?: string };
+/** A reply to the notify or review finding `to`; a reply never needs an answer itself. */
+export type ReplyMarker = { readonly v: 1; readonly to: string; readonly session?: string };
 
 const NOTIFY = /<!-- agent-notify (\{[^\n]*?\}) -->/;
 const REPLY = /<!-- agent-reply (\{[^\n]*?\}) -->/;

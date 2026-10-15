@@ -106,6 +106,27 @@ test("review takes sweep or full and their own flags, and refuses anything else 
   }
 });
 
+test("reply takes one answer and notify one text, and anything else is refused before any request", async () => {
+  const agent = { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1", GH_REPO: "johnrees/penmon" };
+  for (const args of [
+    ["reply"],
+    ["reply", "abcdef123456"],
+    ["reply", "abcdef123456", "--applied", "abc1234", "--declined", "no"],
+    ["reply", "--applied", "abc1234"],
+    ["reply", "abcdef123456", "--applied"],
+    ["reply", "abcdef123456", "--declined", "no", "--pr", "x"],
+    ["notify", "7", "--severity", "P1"],
+    ["notify", "7", "--severity", "P1", "--body", "a", "--body-file", "f"],
+    ["notify", "--body", "a"],
+  ]) {
+    const result = await cli(args, agent);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toStartWith("usage:");
+  }
+  // Outside an agent session, as for every command that publishes.
+  expect((await cli(["reply", "abcdef123456", "--declined", "no"], {})).stderr).toContain("no agent harness detected");
+});
+
 test("status runs only in GitHub Actions, never in an agent session, and needs the workflow's token", async () => {
   const refused = "agent-gh: deriving the statuses failed: `agent-gh status` runs in GitHub Actions, in the agent-review workflow, with its GITHUB_TOKEN; an agent runs `agent-gh review full`.";
   expect((await cli(["status"], {})).stderr).toBe(`${refused}${NEXT}`);

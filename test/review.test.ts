@@ -14,6 +14,8 @@ import {
   mergeCommand,
   outcomeSummary,
   outputTail,
+  type Finding,
+  parseFinding,
   parseMarker,
   parseReviewConfig,
   prRepoFlag,
@@ -23,6 +25,7 @@ import {
   reviewMarker,
   reviewState,
   waivedBy,
+  withIds,
 } from "../src/review.ts";
 import {
   authoredBy,
@@ -519,16 +522,22 @@ test("a full review runs the checks itself in a clone of the head, then the auth
   expect(stdin).toContain("The pull request is blocked when you request changes, so request changes only for a finding that should block the merge.");
   // No earlier review, so no re-review.
   expect(stdin).not.toContain("re-review");
-  expect(JSON.parse(output())).toEqual(answer);
+  // Each finding is printed with the id its posted marker carries, which `agent-gh reply` answers.
+  const [inlineId, bodyId] = ["c814a6519931", "3c145eec1971"];
+  expect(JSON.parse(output())).toEqual({ ...answer, findings: [{ ...answer.findings[0], id: inlineId }, { ...answer.findings[1], id: bodyId }] });
+  expect(withIds(HEAD, answer.findings as Finding[]).map((finding) => finding.id)).toEqual([inlineId, bodyId]);
   expect(posted(fake, `${REPO}/issues/12/comments`)).toEqual([]);
   const [review] = posted(fake, `${REPO}/pulls/12/reviews`);
   expect(review).toMatchObject({ commit_id: HEAD, event: "COMMENT" });
   // The finding on a line of the diff goes on that line; the other is in the body.
-  expect(review?.comments).toEqual([{ path: "src/a.ts", line: 3, side: "RIGHT", body: "**P2 tests**: Untested branch.\n\nDeleting it passes every test." }]);
+  expect(review?.comments).toEqual([
+    { path: "src/a.ts", line: 3, side: "RIGHT", body: `**P2 tests**: Untested branch. <!-- agent-finding {"v":1,"id":"${inlineId}","priority":"P2"} -->\n\nDeleting it passes every test.` },
+  ]);
+  expect(parseFinding((review?.comments as { body: string }[])[0]?.body ?? "")).toEqual({ v: 1, id: inlineId, priority: "P2" });
   const body = review?.body as string;
   expect(parseMarker(body)).toEqual({ v: 1, head: HEAD, merge_base: OLD, patch_id: PATCH_ID, verdict: "changes_requested", checks: "passed", reviewer: "codex", priorities: ["P2", "P1"] });
   expect(body).toContain("**agent-review** of aaaaaaaa against #7 by gpt-6-astra (codex) at xhigh: changes requested; checks passed");
-  expect(body).toContain("1 finding(s) are on their lines.\n\nOn lines outside the diff:\n- **P1 defect** `src/b.ts:9`: Off by one.");
+  expect(body).toContain(`1 finding(s) are on their lines.\n\nOn lines outside the diff:\n- **P1 defect** \`src/b.ts:9\`: Off by one. <!-- agent-finding {"v":1,"id":"${bodyId}","priority":"P1"} -->\n  An empty list`);
   expect(body).not.toContain("src/a.ts:3");
   expect(posted(fake, `${REPO}/statuses/${HEAD}`)).toEqual([
     { state: "failure", context: "agent-review", description: "changes requested; checks passed: 2 finding(s) by gpt-6-astra at xhigh" },
