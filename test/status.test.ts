@@ -398,3 +398,14 @@ test("the reusable workflow is a workflow_call that sets the statuses with GITHU
   expect(job.steps.at(-1).run).toBe("./agent-gh-linux-x64 status");
   expect(job.steps.at(-1).env.GITHUB_TOKEN).toBe("${{ github.token }}");
 });
+
+test("the README's caller template grants the reusable workflow every scope it declares, on the events it handles", () => {
+  const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
+  const template = /```yaml\n(# \.github\/workflows\/agent-review\.yml[\s\S]*?)```/.exec(readme)?.[1];
+  const caller = Bun.YAML.parse(template ?? "") as Record<string, any>;
+  const reusable = Bun.YAML.parse(readFileSync(join(import.meta.dir, "..", ".github", "workflows", "agent-review.yml"), "utf8")) as Record<string, any>;
+  expect(caller.jobs["agent-review"].permissions).toEqual(reusable.jobs.status.permissions);
+  expect(caller.jobs["agent-review"].uses).toStartWith("johnrees/agent-gh/.github/workflows/agent-review.yml@");
+  expect(Object.keys(caller.on)).toEqual(["pull_request_target", "pull_request_review", "issue_comment"]);
+  expect(caller.on.pull_request_target.types).toEqual(["opened", "synchronize", "reopened", "ready_for_review", "labeled", "unlabeled"]);
+});

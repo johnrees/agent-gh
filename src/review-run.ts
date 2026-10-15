@@ -257,17 +257,21 @@ const branchPath = (branch: string) => branch.split("/").map(encodeURIComponent)
  * The guard on `gh pr merge` in an agent session: agents act as John, who may
  * bypass the base branch's rules, so every check the branch requires (its
  * rulesets' and classic protection's) must have passed on the pull request's
- * head. `--admin` is always refused, and so is a pull request the guard
- * cannot find. A branch that requires no checks is not held. Returns the
- * head it checked, which the merge must then require, so a commit pushed
- * meanwhile is not merged in its place.
+ * head. Auto-merge (`auto`) is let through whatever the checks say: GitHub
+ * merges it only once they pass, even for a bypass actor (checked live on
+ * a ruleset with John as an always-bypass actor). `--admin` is always
+ * refused, and so is a pull request the guard cannot find. A branch that
+ * requires no checks is not held. Returns the head it checked, which the
+ * merge must then require, so a commit pushed meanwhile is not merged in its
+ * place.
  */
-export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolean): Promise<string> => {
+export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolean, auto = false): Promise<string> => {
   const stage = MERGE_STAGE;
   if (admin) throw new Failure(stage, "an agent never merges with `--admin`, which skips the base branch's requirements; merge without it once the required checks pass, or ask John");
   const number = await pullNumber(io, stage, target);
   if (number === undefined) throw new Failure(stage, "cannot find the pull request `gh pr merge` names; name it by number");
   const pr = await pull(io, stage, number);
+  if (auto) return pr.head;
   const base = branchPath(pr.base);
   const rules = await pages(io, stage, `${repoPath(io)}/rules/branches/${base}`);
   const branch = (await call(io, stage, "GET", `${repoPath(io)}/branches/${base}`)).value;
@@ -284,7 +288,7 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
   if (unmet.length === 0) return pr.head;
   throw new Failure(
     stage,
-    `pull request #${number}'s head ${pr.head.slice(0, 8)} has not passed every check ${pr.base} requires (${unmet.join(", ")}); wait for them to pass, fix what fails, or ask John to merge it`,
+    `pull request #${number}'s head ${pr.head.slice(0, 8)} has not passed every check ${pr.base} requires (${unmet.join(", ")}); wait for them to pass, fix what fails, or merge with \`--auto\`, which GitHub completes once they pass`,
   );
 };
 
@@ -432,7 +436,7 @@ export const dispatchGh = async (args: readonly string[], repo: Repo | undefined
       await gateReady(io, target);
       return deps.runWith(args, env);
     }
-    const head = await gateMerge(io, merge.target, merge.admin);
+    const head = await gateMerge(io, merge.target, merge.admin, merge.auto);
     if (merge.headCommit !== undefined && merge.headCommit !== head) {
       throw new Failure(MERGE_STAGE, `--match-head-commit ${merge.headCommit.slice(0, 8)} is not the head whose checks passed (${head.slice(0, 8)})`);
     }
@@ -498,7 +502,7 @@ const dispatchApi = async (args: readonly string[], api: ApiCall, repo: Repo | u
     for (const merge of merges) {
       // The node lookup is GraphQL, which names no repository; the io's own is unused.
       const pr = await pullForNode(deps.io(repo ?? { owner: "-", name: "-" }, env), merge.id);
-      const head = await gateMerge(deps.io(pr.repo, env), { number: pr.number }, false);
+      const head = await gateMerge(deps.io(pr.repo, env), { number: pr.number }, false, merge.auto);
       if (merge.expectedHeadOid !== head) {
         throw new Failure(MERGE_STAGE, `a GraphQL merge of #${pr.number} must give expectedHeadOid: "${head}", the head whose checks passed, so a later push is not merged in its place`);
       }

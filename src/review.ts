@@ -312,15 +312,19 @@ export const prRepoFlag = (args: readonly string[]): string | undefined => ghArg
 /**
  * `gh pr merge`: the pull request it names, whether it asks for `--admin`
  * (which merges past the base branch's requirements; any spelling gh would
- * not read as false counts), and its `--match-head-commit`. Undefined for
- * `--disable-auto`, which only turns auto-merge off, and for any other command.
+ * not read as false counts), whether it asks for `--auto` (a spelling gh
+ * would not read as true counts as not), and its `--match-head-commit`.
+ * Undefined for `--disable-auto`, which only turns auto-merge off, and for
+ * any other command.
  */
-export const mergeCommand = (args: readonly string[]): { readonly target: ReadyTarget; readonly admin: boolean; readonly headCommit: string | undefined } | undefined => {
+export const mergeCommand = (
+  args: readonly string[],
+): { readonly target: ReadyTarget; readonly admin: boolean; readonly auto: boolean; readonly headCommit: string | undefined } | undefined => {
   const { words, flags, last } = ghArgs(args, MERGE_FLAGS);
   if (words[0] !== "pr" || words[1] !== "merge") return undefined;
   const admin = lastBoolean(flags, "admin", true);
   if (!admin && lastBoolean(flags, "disable-auto", false)) return undefined;
-  return { target: selector(words[2]), admin, headCommit: last("match-head-commit") };
+  return { target: selector(words[2]), admin, auto: lastBoolean(flags, "auto", false), headCommit: last("match-head-commit") };
 };
 
 /**
@@ -492,8 +496,8 @@ const inputField = (query: string, mask: string, field: string, variables: Reado
 /** A variable's own value, never one inherited from a prototype. */
 const own = (object: Readonly<Record<string, unknown>>, key: string): unknown => (Object.hasOwn(object, key) ? object[key] : undefined);
 
-/** A pull request a GraphQL merge mutation names, and the head it requires (`expectedHeadOid`), if any. */
-export type GraphqlMerge = { readonly id: string; readonly expectedHeadOid: string | undefined };
+/** A pull request a GraphQL merge mutation names, the head it requires (`expectedHeadOid`), if any, and whether it only enables auto-merge. */
+export type GraphqlMerge = { readonly id: string; readonly expectedHeadOid: string | undefined; readonly auto: boolean };
 
 const MERGE_NAMES = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b/g;
 
@@ -566,7 +570,7 @@ export const graphqlMerges = (query: string, variables: Readonly<Record<string, 
     const id = inputField(text, args, "pullRequestId", variables);
     const expectedHeadOid = inputField(text, args, "expectedHeadOid", variables);
     if (typeof id !== "string" || expectedHeadOid === null) return unreadable;
-    merges.push({ id, expectedHeadOid });
+    merges.push({ id, expectedHeadOid, auto: match[1] === "enablePullRequestAutoMerge" });
   }
   return merges;
 };

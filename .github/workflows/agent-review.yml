@@ -18,6 +18,11 @@ jobs:
   status:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Declaring permissions drops the defaults, so every read the run makes is
+    # named here: contents (the config, compare, fetching commits),
+    # pull-requests (the PR, its commits and reviews), issues (comments, label
+    # events, reactions, closing issues), statuses (read and set). A caller
+    # must grant the same.
     permissions:
       contents: read
       issues: read

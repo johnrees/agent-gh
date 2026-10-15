@@ -701,12 +701,16 @@ test("gh pr ready runs only after the gate passes, with the gate's token; other 
 });
 
 test("gh pr merge names its pull request as gh does, skipping flag values, and --admin is always seen", () => {
-  expect(mergeCommand(["pr", "merge"])).toEqual({ target: { branch: undefined }, admin: false, headCommit: undefined });
-  expect(mergeCommand(["pr", "merge", "12", "--squash", "-d"])).toEqual({ target: { number: 12 }, admin: false, headCommit: undefined });
-  expect(mergeCommand(["pr", "merge", "-b", "body text", "-t", "subject", "--match-head-commit", HEAD, "#12"])).toEqual({ target: { number: 12 }, admin: false, headCommit: HEAD });
-  expect(mergeCommand(["pr", "merge", "-sb", "12", "13"])).toEqual({ target: { number: 13 }, admin: false, headCommit: undefined });
-  expect(mergeCommand(["pr", "merge", "--body=12", "feature"])).toEqual({ target: { branch: "feature" }, admin: false, headCommit: undefined });
-  expect(mergeCommand(["-R", "o/r", "pr", "merge", "https://github.com/o/r/pull/4", "--admin"])).toEqual({ target: { number: 4, repo: "o/r" }, admin: true, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge"])).toEqual({ target: { branch: undefined }, admin: false, auto: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "12", "--squash", "-d"])).toEqual({ target: { number: 12 }, admin: false, auto: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "-b", "body text", "-t", "subject", "--match-head-commit", HEAD, "#12"])).toEqual({ target: { number: 12 }, admin: false, auto: false, headCommit: HEAD });
+  expect(mergeCommand(["pr", "merge", "-sb", "12", "13"])).toEqual({ target: { number: 13 }, admin: false, auto: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "--body=12", "feature"])).toEqual({ target: { branch: "feature" }, admin: false, auto: false, headCommit: undefined });
+  expect(mergeCommand(["-R", "o/r", "pr", "merge", "https://github.com/o/r/pull/4", "--admin"])).toEqual({ target: { number: 4, repo: "o/r" }, admin: true, auto: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "12", "--auto", "--squash"])?.auto).toBe(true);
+  // A spelling gh would not read as true is not auto-merge, so the checks are required.
+  expect(mergeCommand(["pr", "merge", "12", "--auto=maybe"])?.auto).toBe(false);
+  expect(mergeCommand(["pr", "merge", "12", "--auto", "--auto=false"])?.auto).toBe(false);
   expect(mergeCommand(["pr", "merge", "12", "--admin=false", "--admin"])?.admin).toBe(true);
   expect(mergeCommand(["pr", "merge", "12", "--admin", "--admin=false"])?.admin).toBe(false);
   for (const spelling of ["--admin=1", "--admin=t", "--admin=True", "--admin=yes"]) expect(mergeCommand(["pr", "merge", "12", spelling])?.admin).toBe(true);
@@ -741,7 +745,7 @@ test("an agent's gh pr merge runs only once every check the base branch requires
   const calls: string[] = [];
   const unmet = world({ rules: REQUIRED, status: [{ context: "agent-review", state: "failure" }], checkRuns: [{ name: "build", status: "in_progress", conclusion: null, app: { id: 15368 } }] });
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--squash"], here, mergeDeps(unmet.io, calls)))).toBe(
-    "pull request #12's head aaaaaaaa has not passed every check main requires (`build` pending, `agent-review` failed); wait for them to pass, fix what fails, or ask John to merge it",
+    "pull request #12's head aaaaaaaa has not passed every check main requires (`build` pending, `agent-review` failed); wait for them to pass, fix what fails, or merge with `--auto`, which GitHub completes once they pass",
   );
   const classic = world({ branch: { protection: { required_status_checks: { enforcement_level: "non_admins", contexts: ["lint"], checks: [] } } } });
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(classic.io, calls)))).toContain("(`lint` missing)");
@@ -759,6 +763,24 @@ test("an agent's gh pr merge runs only once every check the base branch requires
   expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD} -- x`]);
 });
 
+test("an agent may turn on auto-merge while checks are pending or failing, bound to the head it saw, and never with --admin", async () => {
+  // GitHub holds auto-merge until the required checks pass, even for a bypass actor (checked live).
+  const here = parseRepo("johnrees/widget");
+  const calls: string[] = [];
+  const failing = world({ rules: REQUIRED, status: [{ context: "agent-review", state: "failure" }], checkRuns: [{ name: "build", status: "completed", conclusion: "failure", app: { id: 15368 } }] });
+  expect(await dispatchGh(["pr", "merge", "12", "--auto", "--squash"], here, mergeDeps(failing.io, calls))).toBe(0);
+  expect(calls).toEqual([`gh pr merge 12 --auto --squash --match-head-commit ${HEAD}`]);
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto", "--admin"], here, mergeDeps(failing.io, calls)))).toContain("an agent never merges with `--admin`");
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto", "--match-head-commit", OLD], here, mergeDeps(failing.io, calls)))).toContain("--match-head-commit bbbbbbbb is not the head");
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(failing.io, calls)))).toContain("or merge with `--auto`");
+  // GraphQL: enablePullRequestAutoMerge passes on the same terms, with the head bound; a direct merge does not.
+  const auto = (oid: string) => `mutation { enablePullRequestAutoMerge(input: {pullRequestId: "PR_12"${oid}}) { clientMutationId } }`;
+  expect(await dispatchGh(["api", "graphql", "-f", `query=${auto(`, expectedHeadOid: "${HEAD}"`)}`], here, mergeDeps(failing.io, calls))).toBe(0);
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=${auto("")}`], here, mergeDeps(failing.io, calls)))).toContain(`must give expectedHeadOid: "${HEAD}"`);
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=mutation { mergePullRequest(input: {pullRequestId: "PR_12", expectedHeadOid: "${HEAD}"}) { x } }`], here, mergeDeps(failing.io, calls)))).toContain("has not passed every check");
+  expect(calls).toHaveLength(2);
+});
+
 test("a required check tied to GitHub Actions is met by a status its bot set (the agent-review workflow's), never by one an agent set", async () => {
   const here = parseRepo("johnrees/widget");
   const calls: string[] = [];
@@ -770,6 +792,9 @@ test("a required check tied to GitHub Actions is met by a status its bot set (th
   // The latest of the App's own statuses decides, whatever an agent set after it.
   const failed = { ...byActions, state: "failure" };
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: pinned, status: [byAgent, failed, byActions] }).io, calls)))).toContain("(`agent-review` failed)");
+  // The live case: the workflow's failure is named as failed, not missing; its pending as pending.
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: pinned, status: [failed] }).io, calls)))).toContain("(`agent-review` failed)");
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: pinned, status: [{ ...byActions, state: "pending" }] }).io, calls)))).toContain("(`agent-review` pending)");
   expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD}`]);
 });
 
@@ -844,10 +869,10 @@ test("a gh api call that merges is found in every spelling, and one the guard ca
 
 test("each GraphQL merge mutation's pull request and expected head are read from its own arguments", () => {
   const H = "e".repeat(40);
-  expect(graphqlMerges(`mutation { mergePullRequest(input: {pullRequestId: "PR_1", expectedHeadOid: "${H}"}) { clientMutationId } }`, {})).toEqual([{ id: "PR_1", expectedHeadOid: H }]);
-  expect(graphqlMerges("mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }", { id: "PR_2" })).toEqual([{ id: "PR_2", expectedHeadOid: undefined }]);
-  expect(graphqlMerges("mutation($input: MergePullRequestInput!) { mergePullRequest(input: $input) { clientMutationId } }", { input: { pullRequestId: "PR_3", expectedHeadOid: H } })).toEqual([{ id: "PR_3", expectedHeadOid: H }]);
-  expect(graphqlMerges('mutation { enqueuePullRequest(input: {pullRequestId: "P(R)"}) { x } }', {})).toEqual([{ id: "P(R)", expectedHeadOid: undefined }]);
+  expect(graphqlMerges(`mutation { mergePullRequest(input: {pullRequestId: "PR_1", expectedHeadOid: "${H}"}) { clientMutationId } }`, {})).toEqual([{ id: "PR_1", expectedHeadOid: H, auto: false }]);
+  expect(graphqlMerges("mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }", { id: "PR_2" })).toEqual([{ id: "PR_2", expectedHeadOid: undefined, auto: true }]);
+  expect(graphqlMerges("mutation($input: MergePullRequestInput!) { mergePullRequest(input: $input) { clientMutationId } }", { input: { pullRequestId: "PR_3", expectedHeadOid: H } })).toEqual([{ id: "PR_3", expectedHeadOid: H, auto: false }]);
+  expect(graphqlMerges('mutation { enqueuePullRequest(input: {pullRequestId: "P(R)"}) { x } }', {})).toEqual([{ id: "P(R)", expectedHeadOid: undefined, auto: false }]);
   expect(graphqlMerges("query { viewer { login } }", {})).toEqual([]);
   expect(graphqlMerges("mutation($id: ID!) { mergePullRequest(input: {pullRequestId: $id}) { clientMutationId } }", {})).toHaveProperty("refuse");
   // Another mutation's pull request id never stands in for the merge's own.
@@ -857,10 +882,10 @@ test("each GraphQL merge mutation's pull request and expected head are read from
   expect(graphqlMerges('mutation { mergeBranch(input: {repositoryId: "R", base: "main", head: "x"}) { x } }', {})).toHaveProperty("refuse");
   // Comments and strings are not read as fields: GitHub ignores them, so the guard does too.
   // GraphQL ends a comment at a bare carriage return too.
-  expect(graphqlMerges('# note\rmutation { mergePullRequest(input: {pullRequestId: "PR_R"}) { x } }', {})).toEqual([{ id: "PR_R", expectedHeadOid: undefined }]);
-  expect(graphqlMerges(`mutation { mergePullRequest(input: {\n# pullRequestId: "PR_SAFE", expectedHeadOid: "${H}"\npullRequestId: "PR_BLOCKED"}) { x } }`, {})).toEqual([{ id: "PR_BLOCKED", expectedHeadOid: undefined }]);
-  expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "pullRequestId: $safe", pullRequestId: "PR_B"}) { x } }', { safe: "PR_SAFE" })).toEqual([{ id: "PR_B", expectedHeadOid: undefined }]);
-  expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "a ) b", pullRequestId: "PR_C"}) { x } }', {})).toEqual([{ id: "PR_C", expectedHeadOid: undefined }]);
+  expect(graphqlMerges('# note\rmutation { mergePullRequest(input: {pullRequestId: "PR_R"}) { x } }', {})).toEqual([{ id: "PR_R", expectedHeadOid: undefined, auto: false }]);
+  expect(graphqlMerges(`mutation { mergePullRequest(input: {\n# pullRequestId: "PR_SAFE", expectedHeadOid: "${H}"\npullRequestId: "PR_BLOCKED"}) { x } }`, {})).toEqual([{ id: "PR_BLOCKED", expectedHeadOid: undefined, auto: false }]);
+  expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "pullRequestId: $safe", pullRequestId: "PR_B"}) { x } }', { safe: "PR_SAFE" })).toEqual([{ id: "PR_B", expectedHeadOid: undefined, auto: false }]);
+  expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "a ) b", pullRequestId: "PR_C"}) { x } }', {})).toEqual([{ id: "PR_C", expectedHeadOid: undefined, auto: false }]);
   expect(graphqlMerges('mutation { mergePullRequest(input: {pullRequestId: "PR_1", pullRequestId: "PR_2"}) { x } }', {})).toHaveProperty("refuse");
   expect(graphqlMerges('mutation { mergePullRequest(input: {pullRequestId: "PR_1", commitBody: """x"""}) { x } }', {})).toHaveProperty("refuse");
 });
