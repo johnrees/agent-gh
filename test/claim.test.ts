@@ -512,4 +512,12 @@ test("a claim refuses a clone that pushes somewhere else than it fetches from", 
   git.run(["remote", "set-url", "--push", "origin", "https://github.com/someone/fork.git"], a.dir);
   await expect(claim(a.io, { issue: 7, refs: false, noPr: false })).rejects.toThrow("whose origin fetches from and pushes to johnrees/widget");
   expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], a.dir).stdout).toBe("main");
+  // A push URL that names no GitHub repository (a mirror on disk), unless it is the fetch URL itself.
+  const mirror = join(git.home, "mirror.git");
+  git.run(["init", "-q", "--bare", mirror]);
+  const b = session(w.fake, git, git.clone("b"));
+  git.run(["remote", "set-url", "--push", "origin", mirror], b.dir);
+  await expect(claim(b.io, { issue: 7, refs: false, noPr: false })).rejects.toThrow("whose origin fetches from and pushes to johnrees/widget");
+  expect(git.run(["for-each-ref", "refs/heads"], mirror).stdout).toBe("");
+  expect(sent(w.fake, "POST", `${PATH}/pulls`)).toEqual([]);
 });

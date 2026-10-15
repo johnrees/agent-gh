@@ -224,13 +224,18 @@ export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number>
   const marker: ClaimMarker = { v: 1, issue: number, family: io.family, session: io.session, id: crypto.randomUUID().replaceAll("-", "") };
   if (options.noPr) return claimByComment(io, marker, label);
 
-  // Fetch and every push URL: a clone that fetches here but pushes to a fork would open nothing here.
-  const urls = [(await io.git(["remote", "get-url", "origin"])).stdout, ...(await io.git(["remote", "get-url", "--push", "--all", "origin"])).stdout.split("\n")];
-  const elsewhere = (url: string) => {
+  // Fetch and every push URL: a clone that fetches here but pushes to a fork, or to a mirror on disk, would open nothing here.
+  // A push URL must name this repository, or be the fetch URL itself.
+  const fetchUrl = (await io.git(["remote", "get-url", "origin"])).stdout;
+  const pushUrls = (await io.git(["remote", "get-url", "--push", "--all", "origin"])).stdout.split("\n");
+  const here = (url: string) => {
     const remote = parseRemoteUrl(url);
-    return url === "" || (remote !== undefined && slug(remote).toLowerCase() !== slug(io.repo).toLowerCase());
+    return remote !== undefined && slug(remote).toLowerCase() === slug(io.repo).toLowerCase();
   };
-  if (urls.some(elsewhere)) throw new Failure(stage, `claim with a draft pull request from a clone whose origin fetches from and pushes to ${slug(io.repo)}`);
+  const elsewhere = (url: string) => url === "" || (parseRemoteUrl(url) !== undefined && !here(url));
+  if (elsewhere(fetchUrl) || pushUrls.some((url) => url === "" || (url !== fetchUrl && !here(url)))) {
+    throw new Failure(stage, `claim with a draft pull request from a clone whose origin fetches from and pushes to ${slug(io.repo)}`);
+  }
   if ((await git(io, stage, ["status", "--porcelain", "--untracked-files=no"])) !== "") {
     throw new Failure(stage, "the working tree has uncommitted changes; commit or stash them first, since the claim switches to a new branch");
   }
