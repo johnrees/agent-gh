@@ -43,17 +43,17 @@ export type CheckState = "passed" | "failed" | "pending" | "missing";
 const PASSING = ["success", "neutral", "skipped"];
 
 /**
- * Whether a commit passed a required check, from its combined status's
- * `statuses` and the check runs named `check.context` (the latest of each
- * suite). Every matching run must pass. A check tied to an App counts only
- * that App's check runs: a commit status does not say which App set it, so
- * one never satisfies it here, and the guard refuses rather than guess.
+ * Whether a commit passed a required check, from its statuses, latest first,
+ * and the check runs named `check.context` (the latest of each suite). Every
+ * matching run must pass. A check tied to an App counts only that App's
+ * check runs and statuses: for one, `statuses` must give each status's
+ * `app_id` (the App whose bot set it), and a status without it never counts.
  */
 export const checkState = (check: RequiredCheck, statuses: unknown, runs: unknown): CheckState => {
   const matching = list(runs)
     .map(record)
     .filter((run) => run.name === check.context && (check.app === undefined || record(run.app).id === check.app));
-  const status = check.app === undefined ? list(statuses).map(record).find((entry) => entry.context === check.context) : undefined;
+  const status = list(statuses).map(record).find((entry) => entry.context === check.context && (check.app === undefined || entry.app_id === check.app));
   if (matching.length === 0 && status === undefined) return "missing";
   if (matching.some((run) => run.status === "completed" && !PASSING.includes(run.conclusion as string))) return "failed";
   if (status !== undefined && (status.state === "failure" || status.state === "error")) return "failed";

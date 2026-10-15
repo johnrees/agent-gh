@@ -1,0 +1,48 @@
+name: agent-review
+# Reusable: sets the agent-review and agent-threads commit statuses on a pull
+# request's head with the caller's GITHUB_TOKEN, so they come from GitHub
+# Actions (App 15368) and a ruleset can require them from that App alone. The
+# caller's template, events, and permissions are in the README ("Statuses
+# from GitHub Actions"). It never checks out or runs the pull request's code:
+# it downloads a released agent-gh, reads GitHub's API, and fetches only the
+# commits carry-forward compares into a scratch repository.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The agent-gh release that sets the statuses (a tag such as v0.7.0, or latest).
+        type: string
+        default: latest
+permissions: {}
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: write
+    # One run per pull request (or per issue, for a comment on one): every run
+    # derives both statuses from GitHub as it stands, so a newer run, on a new
+    # head or after a new comment, replaces an older one still in progress.
+    concurrency:
+      group: agent-review-status-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      cancel-in-progress: true
+    steps:
+      - name: Download agent-gh, checked against the release's SHA256SUMS
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          if [ "$VERSION" = latest ]; then base=https://github.com/johnrees/agent-gh/releases/latest/download
+          else base="https://github.com/johnrees/agent-gh/releases/download/$VERSION"; fi
+          curl -fsSL --retry 3 -o agent-gh-linux-x64 "$base/agent-gh-linux-x64"
+          curl -fsSL --retry 3 -o SHA256SUMS "$base/SHA256SUMS"
+          grep ' agent-gh-linux-x64$' SHA256SUMS | sha256sum -c -
+          chmod +x agent-gh-linux-x64
+          ./agent-gh-linux-x64 --version
+      - name: Set agent-review and agent-threads
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./agent-gh-linux-x64 status

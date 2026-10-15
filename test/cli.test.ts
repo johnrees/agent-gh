@@ -105,3 +105,11 @@ test("review takes sweep or full and their own flags, and refuses anything else 
     expect(result.stderr).toStartWith("usage:");
   }
 });
+
+test("status runs only in GitHub Actions, never in an agent session, and needs the workflow's token", async () => {
+  const refused = "agent-gh: deriving the statuses failed: `agent-gh status` runs in GitHub Actions, in the agent-review workflow, with its GITHUB_TOKEN; an agent runs `agent-gh review full`.";
+  expect((await cli(["status"], {})).stderr).toBe(`${refused}${NEXT}`);
+  expect((await cli(["status"], { GITHUB_ACTIONS: "true", CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1" })).stderr).toBe(`${refused}${NEXT}`);
+  expect((await cli(["status"], { GITHUB_ACTIONS: "true", GITHUB_REPOSITORY: "johnrees/widget" })).stderr).toStartWith("agent-gh: deriving the statuses failed: GITHUB_REPOSITORY and GITHUB_TOKEN must be set");
+  expect((await cli(["status", "--pr", "x"], { GITHUB_ACTIONS: "true" })).code).toBe(1);
+});

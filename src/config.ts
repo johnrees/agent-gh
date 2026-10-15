@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import registryJson from "../apps.json" with { type: "json" };
 import { Failure } from "./failure.ts";
+import { familyNames } from "./family.ts";
 
 /** What `agent-gh setup` records for one model family's App. No secret lives here. */
 export type AppConfig = {
@@ -38,6 +39,16 @@ export const REGISTRY: Registry = registryJson;
  * as it.
  */
 export const READ_APP = "read";
+
+/** A family App agents act through: its id, and the bot login commits credit. */
+export type AgentApp = { readonly family: string; readonly slug: string; readonly id: number; readonly bot: string };
+
+/** The family Apps in the registry (never the read App, which writes nothing). */
+export const agentApps = (registry: Registry = REGISTRY): AgentApp[] =>
+  familyNames().flatMap((family) => {
+    const entry = Object.hasOwn(registry, family) ? registry[family] : undefined;
+    return entry === undefined ? [] : [{ family, slug: entry.slug, id: entry.app_id, bot: `${entry.slug}[bot]` }];
+  });
 
 export const defaultConfigDir = (): string => join(homedir(), ".config", "agent-gh");
 

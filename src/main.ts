@@ -5,7 +5,7 @@
  * that App on the session's commits. GitHub shows each action as John with
  * the App's badge. The usage below lists every command.
  */
-import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runChild } from "./child.ts";
@@ -19,10 +19,11 @@ import { familyNames } from "./family.ts";
 import { detectIdentity, inAgentSession } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
-import { originUrl, parseRemoteUrl, type Repo, resolveRepo } from "./repo.ts";
+import { originUrl, parseRemoteUrl, parseRepo, type Repo, resolveRepo, slug } from "./repo.ts";
 import { EFFORTS, type Effort } from "./review.ts";
 import { dispatchGh, guardPush, type ReviewIo, reviewFull, reviewSweep, spawnCheck, spawnReviewer } from "./review-run.ts";
 import { type Context, runAs, withToken } from "./run.ts";
+import { type StatusIo, statusCommand } from "./status-run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
 import { readGitConfig } from "./target.ts";
@@ -48,7 +49,10 @@ const USAGE = `usage:
                                     a quick bug sweep of the branch by another model family; prints, records nothing
   agent-gh review full [--pr N] [--issue N] [--effort E]
                                     run the config's checks on the pull request's pushed head, review it against its issue,
-                                    and post the findings as a review and the agent-review status
+                                    and post the findings as a review and the agent-review status (or, with
+                                    status_writer "actions", wait for the agent-review workflow to set it)
+  agent-gh status [--pr N]          in the agent-review workflow (GitHub Actions, GITHUB_TOKEN): set agent-review
+                                    and agent-threads on the event's pull request
   agent-gh which <gh|git>           print the real program, past any agent-gh shim; copy this, never \`command -v gh\`, into a test's PATH`;
 
 /** Opens a URL in a local browser if there is one; the printed URL is always the fallback. */
@@ -102,7 +106,7 @@ const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): Re
     const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
     return code === 0 ? out.trim() : undefined;
   },
-  runCheck: (command, cwd, timeoutMs) => spawnCheck(command, cwd, process.env, timeoutMs),
+  runCheck: (command, cwd, timeoutMs, extra) => spawnCheck(command, cwd, process.env, timeoutMs, extra),
   runReviewer: async (command, stdin, cwd) => {
     const dir = mkdtempSync(join(tmpdir(), "agent-gh-reviewer-"));
     const log = join(dir, "stderr.log");
@@ -115,7 +119,39 @@ const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): Re
   tempDir: () => mkdtempSync(join(tmpdir(), "agent-gh-review-")),
   print: (line) => console.error(line),
   out: (text) => process.stdout.write(text),
+  sleep: (ms) => Bun.sleep(ms),
 });
+
+/**
+ * `agent-gh status`'s I/O in a GitHub Actions job: the workflow's
+ * GITHUB_TOKEN, and git in a scratch repository that fetches commits to
+ * compare, with the token in git's environment, never its arguments.
+ */
+const statusIo = (env: NodeJS.ProcessEnv, repo: Repo, token: string): StatusIo => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-gh-status-"));
+  const gitEnv: Record<string, string> = {
+    PATH: env.PATH ?? "/usr/bin:/bin",
+    HOME: dir,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+    GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
+  };
+  return {
+    api: GITHUB,
+    token,
+    repo,
+    remote: `https://github.com/${slug(repo)}.git`,
+    git: async (args, input) => {
+      const child = Bun.spawn(["git", ...args], { cwd: dir, env: gitEnv, stdin: input === undefined ? "ignore" : new Blob([input]), stdout: "pipe", stderr: "ignore" });
+      const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      return code === 0 ? out.trim() : undefined;
+    },
+    print: (line) => console.error(line),
+  };
+};
 
 /** `agent-gh review sweep|full` options; undefined when they do not parse. */
 const reviewOptions = (rest: readonly string[]) => {
@@ -207,6 +243,28 @@ const main = async (argv: readonly string[]): Promise<number> => {
     const failed = lines.some((line) => line.state === "FAIL");
     console.log(failed ? "Not set up yet: fix the FAIL lines above." : "This machine is set up: agents use agent-gh for GitHub writes.");
     return failed ? 1 : 0;
+  }
+  if (first === "status") {
+    const pr = rest.length === 0 ? undefined : rest.length === 2 && rest[0] === "--pr" && /^\d+$/.test(rest[1] ?? "") ? Number(rest[1]) : Number.NaN;
+    if (Number.isNaN(pr)) {
+      console.error(USAGE);
+      return 1;
+    }
+    const stage = "deriving the statuses";
+    if (env.GITHUB_ACTIONS !== "true" || inAgentSession(env)) {
+      throw new Failure(stage, "`agent-gh status` runs in GitHub Actions, in the agent-review workflow, with its GITHUB_TOKEN; an agent runs `agent-gh review full`");
+    }
+    const repo = parseRepo(env.GITHUB_REPOSITORY ?? "");
+    const token = env.GITHUB_TOKEN ?? "";
+    if (repo === undefined || token === "") throw new Failure(stage, "GITHUB_REPOSITORY and GITHUB_TOKEN must be set; pass `GITHUB_TOKEN: ${{ github.token }}` to the step");
+    let payload: unknown;
+    try {
+      payload = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH ?? "", "utf8"));
+    } catch {
+      throw new Failure(stage, "cannot read the event GITHUB_EVENT_PATH names");
+    }
+    await statusCommand(statusIo(env, repo, token), { name: env.GITHUB_EVENT_NAME ?? "", payload }, pr);
+    return 0;
   }
   if (first === "install-shims") {
     const agentMachine = rest.includes("--agent-machine");
