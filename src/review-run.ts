@@ -292,7 +292,7 @@ const gateUnreviewed = async (io: ReviewIo, stage: Stage, pr: Pull, config: Revi
   if (status?.state === "failure") {
     throw new Failure(
       stage,
-      `pull request #${number}'s head ${pr.head.slice(0, 8)} was reviewed and blocked (${status.description}); answer each finding on the pull request, push a fix, and run \`agent-gh review full\` on the new head, ${waive}`,
+      `pull request #${number}'s head ${pr.head.slice(0, 8)} was reviewed and blocked (${status.description}); answer each finding with \`agent-gh reply\`, push a fix, and run \`agent-gh review full\` on the new head, ${waive}`,
     );
   }
   throw new Failure(

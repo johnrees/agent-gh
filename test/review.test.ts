@@ -436,7 +436,7 @@ test("the gate refuses gh pr ready until the head is reviewed, and passes once i
 test("a review that requested changes blocks gh pr ready, naming the verdict and the next step", async () => {
   const blocked = world({ status: [{ context: "agent-review", state: "failure", description: "changes requested; checks passed: 2 finding(s) by gpt-6-astra at high" }] });
   expect(await gateRefusal(gateReady(blocked.io, { number: 12 }))).toBe(
-    "pull request #12's head aaaaaaaa was reviewed and blocked (changes requested; checks passed: 2 finding(s) by gpt-6-astra at high); answer each finding on the pull request, push a fix, and run `agent-gh review full` on the new head, or ask John to add the `review-waived` label",
+    "pull request #12's head aaaaaaaa was reviewed and blocked (changes requested; checks passed: 2 finding(s) by gpt-6-astra at high); answer each finding with `agent-gh reply`, push a fix, and run `agent-gh review full` on the new head, or ask John to add the `review-waived` label",
   );
   // John's waiver still passes it.
   await gateReady(world({ status: [{ context: "agent-review", state: "failure" }], labels: ["review-waived"], events: [labeled("johnrees", null)] }).io, { number: 12 });
