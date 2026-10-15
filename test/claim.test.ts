@@ -466,3 +466,27 @@ test("a session that read the issue as free and finds its branch's pull request 
   expect(a.printed.join("\n")).toContain("#7 went to draft #30 by a claude session (first) (https://github.com/johnrees/widget/pull/30) first, on the same branch");
   expect(w.state.deleted).toEqual([]);
 });
+
+test("a claim whose issue closes while it is posted undoes itself", async () => {
+  for (const noPr of [false, true]) {
+    const w = world();
+    const git = origin();
+    const a = session(w.fake, git, git.clone("a"), "claude", "s-one", async () => {
+      w.state.issues[0]!.state = "closed";
+    });
+    expect(await claim(a.io, { issue: 7, refs: false, noPr })).toBe(1);
+    expect(a.printed.join("\n")).toContain("#7 was closed while this claim was posted");
+    expect(w.state.issues[0]?.labels).toEqual([]);
+    if (noPr) expect(taken(REPO, OPEN, [], w.state.comments[7] ?? []).taken).toBe(false);
+    else expect(w.state.pulls[0]?.state).toBe("closed");
+  }
+});
+
+test("a claim refuses a clone that pushes somewhere else than it fetches from", async () => {
+  const w = world();
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  git.run(["remote", "set-url", "--push", "origin", "https://github.com/someone/fork.git"], a.dir);
+  await expect(claim(a.io, { issue: 7, refs: false, noPr: false })).rejects.toThrow("whose origin fetches from and pushes to johnrees/widget");
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], a.dir).stdout).toBe("main");
+});

@@ -163,18 +163,25 @@ const dropBranch = async (io: ClaimIo, stage: Stage, branch: string, previous: {
 const READ_BACK_ROUNDS = 3;
 
 /**
- * Reads the claims back after posting one, until GitHub lists it (its lists
- * can lag a write); undefined when it never does, since a claim that cannot
+ * Reads the issue and its claims back after posting one, until GitHub lists
+ * it (its lists can lag a write): "closed" when the issue closed meanwhile,
+ * and undefined when the claim is never listed, since a claim that cannot
  * see itself cannot tell whether it won.
  */
-const readBack = async (io: ClaimIo, stage: Stage, issue: Record<string, unknown>, ours: (item: Claim) => boolean): Promise<Taken | undefined> => {
+const readBack = async (io: ClaimIo, stage: Stage, number: number, ours: (item: Claim) => boolean): Promise<Taken | "closed" | undefined> => {
   for (let round = 1; round <= READ_BACK_ROUNDS; round++) {
     await io.sleep(io.recheckMs * round);
+    const issue = await issueOf(io, stage, number);
+    if (issue === undefined || text(issue.state) !== "open") return "closed";
     const state = await claimState(io, stage, issue);
     if (state.claims.some(ours)) return state;
   }
   return undefined;
 };
+
+/** How a claim that lost names what it lost to. */
+const lostTo = (after: Taken | "closed") =>
+  after === "closed" ? "was closed while this claim was posted" : `went to ${after.holder === undefined ? "nobody" : describeClaim(after.holder)} first`;
 
 export type ClaimOptions = { readonly issue: number; readonly refs: boolean; readonly noPr: boolean };
 
@@ -215,13 +222,15 @@ export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number>
   const { base } = await repository(io, stage);
   const label = await claimLabel(io, stage, base);
   const marker: ClaimMarker = { v: 1, issue: number, family: io.family, session: io.session, id: crypto.randomUUID().replaceAll("-", "") };
-  if (options.noPr) return claimByComment(io, issue, marker, label);
+  if (options.noPr) return claimByComment(io, marker, label);
 
-  const origin = (await io.git(["remote", "get-url", "origin"])).stdout;
-  const remote = parseRemoteUrl(origin);
-  if (origin === "" || (remote !== undefined && slug(remote).toLowerCase() !== slug(io.repo).toLowerCase())) {
-    throw new Failure(stage, `claim with a draft pull request from a clone whose origin is ${slug(io.repo)}`);
-  }
+  // Fetch and every push URL: a clone that fetches here but pushes to a fork would open nothing here.
+  const urls = [(await io.git(["remote", "get-url", "origin"])).stdout, ...(await io.git(["remote", "get-url", "--push", "--all", "origin"])).stdout.split("\n")];
+  const elsewhere = (url: string) => {
+    const remote = parseRemoteUrl(url);
+    return url === "" || (remote !== undefined && slug(remote).toLowerCase() !== slug(io.repo).toLowerCase());
+  };
+  if (urls.some(elsewhere)) throw new Failure(stage, `claim with a draft pull request from a clone whose origin fetches from and pushes to ${slug(io.repo)}`);
   if ((await git(io, stage, ["status", "--porcelain", "--untracked-files=no"])) !== "") {
     throw new Failure(stage, "the working tree has uncommitted changes; commit or stash them first, since the claim switches to a new branch");
   }
@@ -266,15 +275,15 @@ export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number>
     io.print(`agent-gh: #${number} went to ${describeClaim(holder)} first, on the same branch; this claim opened nothing. Pick another issue.`);
     return 1;
   }
-  const after = await readBack(io, stage, issue, (item) => item.pr === pr);
+  const after = await readBack(io, stage, number, (item) => item.pr === pr);
   if (after === undefined) {
     io.print(`agent-gh: GitHub does not list this claim's #${pr} yet, so whether it won is unknown; it stays open: run \`agent-gh claims\`, then keep it or \`agent-gh release ${number}\``);
     return 1;
   }
-  if (after.holder?.pr !== pr) {
+  if (after === "closed" || after.holder?.pr !== pr) {
     await call(io, stage, "PATCH", `${repoPath(io)}/pulls/${pr}`, { state: "closed" });
     await dropBranch(io, stage, branch, previous, true);
-    io.print(`agent-gh: #${number} went to ${after.holder === undefined ? "nobody" : describeClaim(after.holder)} first; closed this claim's #${pr} and deleted ${branch}. Pick another issue.`);
+    io.print(`agent-gh: #${number} ${lostTo(after)}; closed this claim's #${pr} and deleted ${branch}. Pick another issue.`);
     return 1;
   }
   await addLabel(io, stage, number, label, io.print);
@@ -283,18 +292,18 @@ export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number>
   return 0;
 };
 
-const claimByComment = async (io: ClaimIo, issue: Record<string, unknown>, marker: ClaimMarker, label: string): Promise<number> => {
+const claimByComment = async (io: ClaimIo, marker: ClaimMarker, label: string): Promise<number> => {
   const stage: Stage = "claiming";
   const posted = record((await call(io, stage, "POST", `${repoPath(io)}/issues/${marker.issue}/comments`, { body: claimCommentBody(marker) })).value);
   const id = posted.id;
-  const after = await readBack(io, stage, issue, (item) => item.comment === id);
+  const after = await readBack(io, stage, marker.issue, (item) => item.comment === id);
   if (after === undefined) {
     io.print(`agent-gh: GitHub does not list this claim's comment yet, so whether it won is unknown; it stands: run \`agent-gh claims\`, then keep it or \`agent-gh release ${marker.issue}\``);
     return 1;
   }
-  if (after.holder?.comment !== id) {
+  if (after === "closed" || after.holder?.comment !== id) {
     await call(io, stage, "POST", `${repoPath(io)}/issues/${marker.issue}/comments`, { body: releaseCommentBody({ v: 1, id: marker.id }) });
-    io.print(`agent-gh: #${marker.issue} went to ${after.holder === undefined ? "nobody" : describeClaim(after.holder)} first; released this claim's comment. Pick another issue.`);
+    io.print(`agent-gh: #${marker.issue} ${lostTo(after)}; released this claim's comment. Pick another issue.`);
     return 1;
   }
   await addLabel(io, stage, marker.issue, label, io.print);
