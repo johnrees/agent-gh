@@ -478,7 +478,7 @@ test("a full review runs the checks itself in a clone of the head, then the auth
     `-C ${dir} update-ref refs/remotes/origin/main ${OLD}`,
   ];
   expect(gitCalls).toEqual([...cloned(checked), ...cloned(cwd)]);
-  expect(command.slice(0, 8)).toEqual(["codex", "exec", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"', "-s", "read-only"]);
+  expect(command.slice(0, 8)).toEqual(["codex", "exec", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"', "-c", 'sandbox_mode="read-only"']);
   expect(command).not.toContain("workspace-write");
   // The merge base is the pull request's, from GitHub, not origin's.
   expect(stdin).toContain(`git diff ${OLD}...${HEAD}`);
@@ -1031,8 +1031,11 @@ test("a sweep prints the reviewer's text against the pull request's base and rec
 
 test("the reviewer is read-only, whatever checks the repository configures", () => {
   const files = { schema: "s.json", out: "o.json" };
-  expect(fullCommand({ family: "codex", model: "gpt-6-astra" }, "high", files).slice(6, 8)).toEqual(["-s", "read-only"]);
-  expect(sweepCommand({ family: "codex", model: "gpt-6-astra" }, "high", "origin/main", "o.md")).toContain("read-only");
+  expect(fullCommand({ family: "codex", model: "gpt-6-astra" }, "high", files).slice(6, 8)).toEqual(["-c", 'sandbox_mode="read-only"']);
+  // The whole argv, in flags `codex exec review --help` (v0.162) lists: it refuses `-s`, so the sandbox is set through config.
+  expect(sweepCommand({ family: "codex", model: "gpt-6-astra" }, "high", "origin/main", "o.md")).toEqual([
+    "codex", "exec", "review", "--base", "origin/main", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="high"', "-c", 'sandbox_mode="read-only"', "--ephemeral", "-o", "o.md",
+  ]);
   const claude = fullCommand({ family: "claude", model: "claude-opus-5-5" }, "high", files);
   expect(claude[claude.indexOf("--allowedTools") + 1]).toBe("Bash(git diff:*),Bash(git log:*),Bash(git show:*)");
 });

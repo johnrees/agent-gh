@@ -636,9 +636,10 @@ export const spawnReviewer = async (
 };
 
 // The reviewer only reads: agent-gh has already run the checks. Codex runs in its read-only
-// sandbox; Claude runs restricted to its own settings, with git's read commands the only
-// shell commands it is allowed.
-const CODEX_ACCESS = ["-s", "read-only"];
+// sandbox, set through config: `codex exec review` takes no `-s` (v0.162 refuses it), and
+// `-c` works for both commands. Claude runs restricted to its own settings, with git's read
+// commands the only shell commands it is allowed.
+const CODEX_ACCESS = ["-c", 'sandbox_mode="read-only"'];
 const CLAUDE_ACCESS = [
   "--restricted", "--tools", "Read,Grep,Glob,Bash",
   "--allowedTools", ["git diff", "git log", "git show"].map((command) => `Bash(${command}:*)`).join(","),

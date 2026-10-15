@@ -199,6 +199,8 @@ type Scenario = {
   combined?: unknown[];
   statusReply?: number;
   optedIn?: boolean;
+  /** A conversation comment posted the moment this run first sets a status, as when another run's event lands meanwhile. */
+  commentWhileWriting?: unknown;
 };
 
 const statusWorld = (scenario: Scenario) => {
@@ -216,7 +218,10 @@ const statusWorld = (scenario: Scenario) => {
     },
     [`GET ${REPO}/issues/12/events`]: () => reply(200, events),
     [`GET ${REPO}/pulls/12/reviews`]: () => reply(200, reviews),
-    [`GET ${REPO}/issues/12/comments`]: () => reply(200, comments),
+    [`GET ${REPO}/issues/12/comments`]: () => {
+      const wrote = fake.log.some((entry) => entry.method === "POST" && entry.path.startsWith(`${REPO}/statuses/`));
+      return reply(200, wrote && scenario.commentWhileWriting !== undefined ? [...comments, scenario.commentWhileWriting] : comments);
+    },
     [`GET ${REPO}/issues/7/comments`]: () => reply(200, []),
     [`GET ${REPO}/compare/main...${head}`]: () => reply(200, { merge_base_commit: { sha: scenario.mergeBase } }),
     [`GET ${REPO}/commits/${head}/statuses`]: () => reply(200, combined),
@@ -354,6 +359,20 @@ test("statuses are set only when they change, and a token that may not set them 
   const forked = statusWorld({ head: A, mergeBase: B, statusReply: 403 });
   await writeStatuses(forked.io, A, statuses);
   expect(forked.printed.at(-1)).toContain("this run's token may not set statuses (HTTP 403");
+});
+
+test("a run whose pull request changed while it wrote sets what GitHub shows now, so an older run never leaves its result over a newer one", async () => {
+  // The owner comments (on the closing issue, say, whose run is in another concurrency group) just as this older run writes "no comment awaits".
+  const john = { id: 21, user: { login: "johnrees" }, performed_via_github_app: null, created_at: "2026-10-11T00:00:00Z", html_url: "https://github.com/johnrees/widget/pull/12#issuecomment-21", body: "Wait." };
+  const w = statusWorld({ head: A, mergeBase: B, commentWhileWriting: john });
+  await statusCommand(w.io, { name: "pull_request_target", payload: { pull_request: { number: 12 } } }, undefined);
+  const threads = w.posted().filter((status) => status.context === "agent-threads").map((status) => status.state);
+  expect(threads).toEqual(["success", "failure"]);
+  expect(w.printed).toContain("agent-gh: #12 changed while this run wrote its statuses; setting what it shows now");
+  // Nothing changed: one derive after the write, and no second write.
+  const still = statusWorld({ head: A, mergeBase: B });
+  await statusCommand(still.io, { name: "pull_request_target", payload: { pull_request: { number: 12 } } }, undefined);
+  expect(still.posted()).toHaveLength(2);
 });
 
 test("a comment on an issue updates every open pull request here that closes it", async () => {

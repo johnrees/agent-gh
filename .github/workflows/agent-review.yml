@@ -25,7 +25,9 @@ jobs:
       statuses: write
     # One run per pull request (or per issue, for a comment on one): every run
     # derives both statuses from GitHub as it stands, so a newer run, on a new
-    # head or after a new comment, replaces an older one still in progress.
+    # head or after a new comment, replaces an older one still in progress. An
+    # issue's group cannot name its pull requests, so a run also derives them
+    # again after writing, and rewrites them if they changed meanwhile.
     concurrency:
       group: agent-review-status-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: true

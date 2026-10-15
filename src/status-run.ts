@@ -128,7 +128,7 @@ const ACTIONS_BOT = "github-actions[bot]";
  * Actions). A token that may not write statuses (a fork's run) is reported,
  * and nothing fails: a later run with a writable token sets them.
  */
-export const writeStatuses = async (io: StatusIo, head: string, statuses: readonly Status[]): Promise<void> => {
+export const writeStatuses = async (io: StatusIo, head: string, statuses: readonly Status[]): Promise<boolean> => {
   // Latest first; the first page holds the latest of each context this writes, or the status is set again.
   const listed = await get(io, STAGE, `${repoPath(io)}/commits/${head}/statuses?per_page=100`);
   const latest = Array.isArray(listed) ? listed.map(record) : [];
@@ -142,10 +142,39 @@ export const writeStatuses = async (io: StatusIo, head: string, statuses: readon
     const { status: code } = await request(io.api, STAGE, "POST", `${repoPath(io)}/statuses/${head}`, io.token, body);
     if (code === 403 || code === 404) {
       io.print(`agent-gh: this run's token may not set statuses (HTTP ${code}; a fork's pull request runs read-only); a run with \`statuses: write\` sets them`);
-      return;
+      return false;
     }
     if (code < 200 || code >= 300) throw new Failure(STAGE, `HTTP ${code} from POST ${repoPath(io)}/statuses`);
     io.print(`agent-gh: ${status.context} on ${head.slice(0, 8)}: ${status.state}: ${status.description}`);
+  }
+  return true;
+};
+
+const sameStatuses = (a: { readonly head: string; readonly statuses: readonly Status[] }, b: { readonly head: string; readonly statuses: readonly Status[] }) =>
+  a.head === b.head && JSON.stringify(a.statuses) === JSON.stringify(b.statuses);
+
+/** Rounds of derive-and-write before a run gives up chasing a pull request that keeps changing (the next event's run follows it). */
+const WRITE_ROUNDS = 3;
+
+/**
+ * Derives and sets pull request `number`'s statuses, then derives them again:
+ * when the pull request changed while this run wrote (a new head, or a comment
+ * whose own run, in another concurrency group, wrote first), it writes what
+ * GitHub shows now. A stale run therefore never leaves its older result over
+ * a newer one: the last write of any run follows a read made after it.
+ */
+const settle = async (io: StatusIo, number: number): Promise<void> => {
+  let derived = await deriveStatuses(io, number);
+  for (let round = 1; derived !== undefined; round++) {
+    if (!(await writeStatuses(io, derived.head, derived.statuses))) return;
+    const now = await deriveStatuses(io, number);
+    if (now === undefined || sameStatuses(now, derived)) return;
+    if (round >= WRITE_ROUNDS) {
+      io.print(`agent-gh: #${number} kept changing while this run wrote its statuses; the next event's run sets them`);
+      return;
+    }
+    io.print(`agent-gh: #${number} changed while this run wrote its statuses; setting what it shows now`);
+    derived = now;
   }
 };
 
@@ -171,8 +200,5 @@ export const statusCommand = async (io: StatusIo, event: { readonly name: string
   if (target === undefined) throw new Failure(STAGE, `a ${event.name} event names no pull request; run it from the agent-review workflow's events, or pass --pr N`);
   const numbers = "pull" in target ? [target.pull] : await closingPulls(io, target.issue);
   if (numbers.length === 0) io.print(`agent-gh: no open pull request closes #${"issue" in target ? target.issue : ""}; no status set`);
-  for (const number of numbers) {
-    const derived = await deriveStatuses(io, number);
-    if (derived !== undefined) await writeStatuses(io, derived.head, derived.statuses);
-  }
+  for (const number of numbers) await settle(io, number);
 };
