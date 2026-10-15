@@ -91,11 +91,17 @@ const issue = (number: number, labels: string[] = ["ready"], extra: Record<strin
 });
 const config = (value: unknown) => ({ content: Buffer.from(JSON.stringify(value)).toString("base64") });
 
+/** A route GitHub answers with 404. */
+const NOT_FOUND = Symbol("404");
+/** A list endpoint with no route reads as an empty list; anything else with none, and NOT_FOUND, as a 404. */
+const LIST = /(\/comments|\/dependencies\/blocked_by|\/pulls\?state=open|\/issues\?state=open&labels=[^/]*)$/;
+
 const reader = (routes: Record<string, unknown>) => {
   const asked: string[] = [];
   const read: Read = async (endpoint) => {
     asked.push(endpoint);
-    return Object.hasOwn(routes, endpoint) ? routes[endpoint] : undefined;
+    if (Object.hasOwn(routes, endpoint)) return routes[endpoint] === NOT_FOUND ? undefined : routes[endpoint];
+    return LIST.test(endpoint) ? [] : undefined;
   };
   return { read, asked };
 };
@@ -261,4 +267,22 @@ test("with no Queue, next orders by priority label, an issue with two taking the
   expect(wavesLines(result, () => {})[1]).toBe("  #6 T6 (priority:high)");
   const bad = reader({ ...BASE, "repos/johnrees/widget/contents/.github/agent-review.json?ref=main": config({ queue: { priority_labels: "priority:high" } }) });
   await expect(nextIssues(REPO, bad.read)).rejects.toThrow("queue.priority_labels must be a list of label names");
+});
+
+test("next fails, rather than offer an issue, when a list it judges by cannot be read", async () => {
+  const routes = {
+    ...BASE,
+    "repos/johnrees/widget/issues?state=open&labels=ready": [issue(7)],
+    "repos/johnrees/widget/issues/7/dependencies/blocked_by": [issue(8, [])],
+  };
+  // Read whole, #7 waits on #8, so nothing is offered.
+  expect(nextLines(await nextIssues(REPO, reader(routes).read), () => {})).not.toContain("#7 T7");
+  for (const endpoint of [
+    "repos/johnrees/widget/issues/7/dependencies/blocked_by",
+    "repos/johnrees/widget/issues/7/comments",
+    "repos/johnrees/widget/pulls?state=open",
+    "repos/johnrees/widget/issues?state=open&labels=ready",
+  ]) {
+    await expect(nextIssues(REPO, reader({ ...routes, [endpoint]: NOT_FOUND }).read)).rejects.toThrow(`GET /${endpoint.split("?")[0]} gave no list`);
+  }
 });

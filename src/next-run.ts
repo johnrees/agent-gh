@@ -23,6 +23,17 @@ const record = (value: unknown): Record<string, unknown> => (typeof value === "o
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
 const list = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 
+/**
+ * A list the order depends on: a 404 or anything but a list fails, rather
+ * than read as empty, since an empty blocker, pull request, or comment list
+ * would offer an issue that is blocked or claimed.
+ */
+const readList = async (read: Read, endpoint: string): Promise<unknown[]> => {
+  const value = await read(endpoint);
+  if (!Array.isArray(value)) throw new Failure(STAGE, `GET /${endpoint.split("?")[0]} gave no list (not found, or not readable with this token)`);
+  return value;
+};
+
 /** The reader over GitHub's REST API with a token; it refuses a list too long to read whole. */
 export const apiReader = (io: ApiIo, maxPages = 30): Read => async (endpoint) => {
   const items: unknown[] = [];
@@ -90,10 +101,10 @@ export const nextIssues = async (repo: Repo, read: Read): Promise<NextResult> =>
   const queueIssue = config.issue === undefined ? undefined : await read(`repos/${name}/issues/${config.issue}`);
   if (config.issue !== undefined && queueIssue === undefined) throw new Failure(STAGE, `the Queue issue #${config.issue} (\`queue.issue\` in ${CONFIG_PATH}) cannot be read`);
   const queue = queueIssue === undefined ? undefined : parseQueue(text(record(queueIssue).body));
-  const ready = list(await read(`repos/${name}/issues?state=open&labels=${encodeURIComponent(config.label)}`)).map(record).filter((item) => item.pull_request === undefined);
+  const ready = (await readList(read, `repos/${name}/issues?state=open&labels=${encodeURIComponent(config.label)}`)).map(record).filter((item) => item.pull_request === undefined);
   const known = new Map<number, Record<string, unknown>>(ready.map((item) => [item.number as number, item]));
   const readyNumbers = new Set(known.keys());
-  const pulls = list(await read(`repos/${name}/pulls?state=open`));
+  const pulls = await readList(read, `repos/${name}/pulls?state=open`);
   const nodes = new Map<number, Node>();
   const todo = [...(queue ?? []), ...[...readyNumbers].sort((a, b) => a - b)];
   const seen = new Set<number>();
@@ -103,7 +114,7 @@ export const nextIssues = async (repo: Repo, read: Read): Promise<NextResult> =>
     seen.add(number);
     const issue = known.get(number) ?? record(await read(`repos/${name}/issues/${number}`));
     if (text(issue.state) !== "open" || issue.pull_request !== undefined) continue;
-    const blockers = list(await read(`repos/${name}/issues/${number}/dependencies/blocked_by`)).map(record).map((item): Blocker => {
+    const blockers = (await readList(read, `repos/${name}/issues/${number}/dependencies/blocked_by`)).map(record).map((item): Blocker => {
       const from = repoOf(item);
       const here = from === undefined || from.toLowerCase() === name.toLowerCase();
       if (here) known.set(item.number as number, item);
@@ -111,7 +122,7 @@ export const nextIssues = async (repo: Repo, read: Read): Promise<NextResult> =>
     });
     for (const blocker of blockers) if (blocker.repo === undefined && blocker.open) todo.push(blocker.number);
     const dispatched = readyNumbers.has(number) && (queue === undefined || queue.includes(number));
-    const holder = dispatched ? taken(repo, issue, pulls, list(await read(`repos/${name}/issues/${number}/comments`))).holder : undefined;
+    const holder = dispatched ? taken(repo, issue, pulls, await readList(read, `repos/${name}/issues/${number}/comments`)).holder : undefined;
     const names = list(issue.labels).map((item) => text(record(item).name));
     const rank = config.priorityLabels.findIndex((name) => names.includes(name));
     nodes.set(number, { number, title: text(issue.title), dispatched, blockers, claim: holder, ...(rank === -1 ? {} : { priority: { label: config.priorityLabels[rank] as string, rank } }) });
