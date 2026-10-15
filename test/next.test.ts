@@ -286,3 +286,43 @@ test("next fails, rather than offer an issue, when a list it judges by cannot be
     await expect(nextIssues(REPO, reader({ ...routes, [endpoint]: NOT_FOUND }).read)).rejects.toThrow(`GET /${endpoint.split("?")[0]} gave no list`);
   }
 });
+
+test("a claim on a blocker that is not dispatched still shows in the waves", async () => {
+  const { read } = reader({
+    ...BASE,
+    "repos/johnrees/widget/pulls?state=open": [{ number: 32, state: "open", body: `Closes #5.\n${claimMarker({ v: 1, issue: 5, family: "codex", session: "w", id: "0123456789abcdef" })}`, user: { login: "johnrees" }, head: { ref: "codex/5-x" } }],
+    "repos/johnrees/widget/issues?state=open&labels=ready": [issue(4)],
+    "repos/johnrees/widget/issues/4/dependencies/blocked_by": [issue(5, [])],
+  });
+  const result = await nextIssues(REPO, read);
+  expect(wavesJson(REPO, result).waves[0]).toEqual({ wave: 1, issues: [expect.objectContaining({ issue: 5, claim: expect.objectContaining({ pr: 32, family: "codex" }) })] });
+  expect(wavesLines(result, () => {})).toContain("  #5 T5 (unblocks 1; not dispatched; in progress: #32 by codex w)");
+});
+
+test("next reads every page of the open pull requests and of an issue's comments", async () => {
+  const PATH = "/repos/johnrees/widget";
+  const pages = <T>(items: readonly T[], url: URL) => {
+    const size = Number(url.searchParams.get("per_page") ?? 30);
+    const page = Number(url.searchParams.get("page") ?? 1);
+    return items.slice((page - 1) * size, page * size);
+  };
+  const other = Array.from({ length: 100 }, (_, index) => ({ number: 100 + index, state: "open", body: "Unrelated", user: { login: "johnrees" }, head: { ref: `x-${index}` } }));
+  const pulls = [...other, { number: 300, state: "open", body: `Closes #8.\n${claimMarker({ v: 1, issue: 8, family: "codex", session: "late", id: "0123456789abcdef" })}`, user: { login: "johnrees" }, head: { ref: "codex/8-x" } }];
+  const chatter = Array.from({ length: 100 }, (_, index) => ({ id: index + 1, body: "Noted", author_association: "OWNER", user: { login: "johnrees" } }));
+  const comments = [...chatter, { id: 900, body: claimMarker({ v: 1, issue: 7, family: "glm", session: "late", id: "fedcba9876543210" }), author_association: "OWNER", user: { login: "johnrees" } }];
+  const fake = fakeGitHub({
+    [`GET ${PATH}`]: () => reply(200, { default_branch: "main" }),
+    [`GET ${PATH}/pulls`]: (_, url) => reply(200, pages(pulls, url)),
+    [`GET ${PATH}/issues`]: (_, url) => reply(200, pages([issue(7), issue(8)], url)),
+    [`GET ${PATH}/issues/7/dependencies/blocked_by`]: () => reply(200, []),
+    [`GET ${PATH}/issues/8/dependencies/blocked_by`]: () => reply(200, []),
+    [`GET ${PATH}/issues/7/comments`]: (_, url) => reply(200, pages(comments, url)),
+    [`GET ${PATH}/issues/8/comments`]: () => reply(200, []),
+  });
+  stops.push(fake.stop);
+  const io = { api: fake.api, token: "t", repo: REPO };
+  const result = await nextIssues(REPO, apiReader(io));
+  // Each issue's claim is on its list's second page, so neither is offered.
+  expect(nextLines(result, () => {})).toEqual(["No eligible issue: none is open, `ready`, unblocked, and unclaimed."]);
+  expect(nextJson(REPO, result).issues.map((item) => [item.issue, item.claim?.kind, item.claim?.pr])).toEqual([[7, "comment", null], [8, "pr", 300]]);
+});

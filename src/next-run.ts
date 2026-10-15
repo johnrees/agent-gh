@@ -122,7 +122,8 @@ export const nextIssues = async (repo: Repo, read: Read): Promise<NextResult> =>
     });
     for (const blocker of blockers) if (blocker.repo === undefined && blocker.open) todo.push(blocker.number);
     const dispatched = readyNumbers.has(number) && (queue === undefined || queue.includes(number));
-    const holder = dispatched ? taken(repo, issue, pulls, await readList(read, `repos/${name}/issues/${number}/comments`)).holder : undefined;
+    // Every open issue in the graph: a worker on a blocker that is not dispatched (no longer ready or queued) still shows.
+    const holder = taken(repo, issue, pulls, await readList(read, `repos/${name}/issues/${number}/comments`)).holder;
     const names = list(issue.labels).map((item) => text(record(item).name));
     const rank = config.priorityLabels.findIndex((name) => names.includes(name));
     nodes.set(number, { number, title: text(issue.title), dispatched, blockers, claim: holder, ...(rank === -1 ? {} : { priority: { label: config.priorityLabels[rank] as string, rank } }) });
