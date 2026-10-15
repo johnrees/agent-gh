@@ -4,6 +4,7 @@ import { request } from "./github.ts";
 import { pull, pullDiff, readReviewConfig, type ReviewIo, waiver } from "./review-run.ts";
 import { slug } from "./repo.ts";
 import { agentPull, carryCandidate, eventTarget, type FoundMarker, markerFor, type MarkerPost, reviewStatus, type Status, validMarkers } from "./status.ts";
+import { STATUS_CONTEXT, statusDescription } from "./review.ts";
 import { THREADS_CONTEXT, threadsStatus } from "./threads.ts";
 import { type ApiIo, everyPage, get, pullThreads, repoOwner } from "./threads-run.ts";
 
@@ -123,7 +124,8 @@ const ACTIONS_BOT = "github-actions[bot]";
 
 /**
  * Sets each status on `head` unless GitHub Actions already set the same one
- * last (an equal status from anyone else, such as an agent before the
+ * last, target link included, so a new review of the same verdict (a new
+ * link) is still set and `review full` sees it land (an equal status from anyone else, such as an agent before the
  * repository moved to the workflow, cannot meet a check tied to GitHub
  * Actions). A token that may not write statuses (a fork's run) is reported,
  * and nothing fails: a later run with a writable token sets them.
@@ -134,7 +136,8 @@ export const writeStatuses = async (io: StatusIo, head: string, statuses: readon
   const latest = Array.isArray(listed) ? listed.map(record) : [];
   for (const status of statuses) {
     const shown = latest.find((entry) => entry.context === status.context);
-    if (shown?.state === status.state && shown.description === status.description && text(record(shown.creator).login) === ACTIONS_BOT) {
+    const same = shown?.state === status.state && shown.description === status.description && text(shown.target_url) === (status.targetUrl ?? "");
+    if (same && text(record(shown?.creator).login) === ACTIONS_BOT) {
       io.print(`agent-gh: ${status.context} on ${head.slice(0, 8)} already reads ${status.state}: ${status.description}`);
       continue;
     }
@@ -178,6 +181,22 @@ const settle = async (io: StatusIo, number: number): Promise<void> => {
   }
 };
 
+/**
+ * When a run cannot derive the statuses, it sets both to error on the
+ * current head, so an earlier success never stands for a head this run
+ * could not judge; the run still fails. Best effort: if even the head
+ * cannot be read, nothing is set.
+ */
+const withdraw = async (io: StatusIo, number: number, error: unknown): Promise<void> => {
+  const why = statusDescription(`agent-gh could not derive it: ${error instanceof Failure ? error.detail : "an unexpected error"}; rerun the workflow`);
+  try {
+    const { head } = await pull(io, STAGE, number);
+    await writeStatuses(io, head, [STATUS_CONTEXT, THREADS_CONTEXT].map((context): Status => ({ context, state: "error", description: why, targetUrl: undefined })));
+  } catch {
+    io.print(`agent-gh: could not mark #${number}'s statuses as errors`);
+  }
+};
+
 /** The open pull requests in this repository that close `issue`. */
 const closingPulls = async (io: ApiIo, issue: number): Promise<number[]> => {
   const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){closedByPullRequestsReferences(first:25,includeClosedPrs:false){nodes{number repository{nameWithOwner}}}}}}`;
@@ -200,5 +219,12 @@ export const statusCommand = async (io: StatusIo, event: { readonly name: string
   if (target === undefined) throw new Failure(STAGE, `a ${event.name} event names no pull request; run it from the agent-review workflow's events, or pass --pr N`);
   const numbers = "pull" in target ? [target.pull] : await closingPulls(io, target.issue);
   if (numbers.length === 0) io.print(`agent-gh: no open pull request closes #${"issue" in target ? target.issue : ""}; no status set`);
-  for (const number of numbers) await settle(io, number);
+  for (const number of numbers) {
+    try {
+      await settle(io, number);
+    } catch (error) {
+      await withdraw(io, number, error);
+      throw error;
+    }
+  }
 };

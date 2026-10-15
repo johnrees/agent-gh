@@ -199,6 +199,8 @@ type Scenario = {
   combined?: unknown[];
   statusReply?: number;
   optedIn?: boolean;
+  /** GitHub's answer to GraphQL, when not 200. */
+  graphqlStatus?: number;
   /** A conversation comment posted the moment this run first sets a status, as when another run's event lands meanwhile. */
   commentWhileWriting?: unknown;
 };
@@ -227,7 +229,9 @@ const statusWorld = (scenario: Scenario) => {
     [`GET ${REPO}/commits/${head}/statuses`]: () => reply(200, combined),
     [`POST ${REPO}/statuses/${head}`]: () => reply(scenario.statusReply ?? 201, {}),
     "POST /graphql": (body) =>
-      body.includes("closedByPullRequestsReferences")
+      scenario.graphqlStatus !== undefined
+        ? reply(scenario.graphqlStatus, {})
+        : body.includes("closedByPullRequestsReferences")
         ? reply(200, { data: { repository: { issue: { closedByPullRequestsReferences: { nodes: [{ number: 12, repository: { nameWithOwner: "johnrees/widget" } }, { number: 99, repository: { nameWithOwner: "other/repo" } }] } } } } })
         : reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { nodes: [{ number: 7, repository: { nameWithOwner: "johnrees/widget" } }] } } } } }),
   });
@@ -344,11 +348,15 @@ test("statuses are set only when they change, and a token that may not set them 
     head: A, mergeBase: B,
     combined: [
       { context: "agent-review", state: "pending", description: "needs a review", creator: actions },
-      { context: "agent-threads", state: "success", description: "none", creator: actions },
+      { context: "agent-threads", state: "success", description: "none", target_url: "https://x", creator: actions },
     ],
   });
   await writeStatuses(fresh.io, A, statuses);
   expect(fresh.posted()).toEqual([]);
+  // A new review with the same verdict links elsewhere: set again, so `review full` sees the workflow handled it.
+  const relinked = statusWorld({ head: A, mergeBase: B, combined: [{ context: "agent-review", state: "pending", description: "needs a review", creator: actions }, { context: "agent-threads", state: "success", description: "none", target_url: "https://old", creator: actions }] });
+  await writeStatuses(relinked.io, A, statuses);
+  expect(relinked.posted().map((status) => status.context)).toEqual(["agent-threads"]);
   // The same status from an agent, which a check tied to GitHub Actions does not count, is set again by Actions.
   const migrated = statusWorld({ head: A, mergeBase: B, combined: [{ context: "agent-review", state: "pending", description: "needs a review", creator: { login: "johnrees" } }, { context: "agent-threads", state: "failure", description: "x", creator: actions }] });
   await writeStatuses(migrated.io, A, statuses);
@@ -373,6 +381,16 @@ test("a run whose pull request changed while it wrote sets what GitHub shows now
   const still = statusWorld({ head: A, mergeBase: B });
   await statusCommand(still.io, { name: "pull_request_target", payload: { pull_request: { number: 12 } } }, undefined);
   expect(still.posted()).toHaveLength(2);
+});
+
+test("a run that cannot derive the statuses sets both to error on the head, so an earlier success never stands, and still fails", async () => {
+  const w = statusWorld({ head: A, mergeBase: B, graphqlStatus: 502 });
+  let refusal = "";
+  await statusCommand(w.io, { name: "pull_request_target", payload: { pull_request: { number: 12 } } }, undefined).catch((error: Error) => (refusal = error.message));
+  expect(refusal).toContain("HTTP 502 from POST /graphql");
+  expect(w.posted()).toEqual(
+    ["agent-review", "agent-threads"].map((context) => ({ state: "error", context, description: "agent-gh could not derive it: HTTP 502 from POST /graphql; rerun the workflow" })),
+  );
 });
 
 test("a comment on an issue updates every open pull request here that closes it", async () => {
@@ -407,5 +425,6 @@ test("the README's caller template grants the reusable workflow every scope it d
   expect(caller.jobs["agent-review"].permissions).toEqual(reusable.jobs.status.permissions);
   expect(caller.jobs["agent-review"].uses).toStartWith("johnrees/agent-gh/.github/workflows/agent-review.yml@");
   expect(Object.keys(caller.on)).toEqual(["pull_request_target", "pull_request_review", "issue_comment"]);
-  expect(caller.on.pull_request_target.types).toEqual(["opened", "synchronize", "reopened", "ready_for_review", "labeled", "unlabeled"]);
+  // `edited`: a description that adds a closing issue brings that issue's comments into agent-threads.
+  expect(caller.on.pull_request_target.types).toEqual(["opened", "edited", "synchronize", "reopened", "ready_for_review", "labeled", "unlabeled"]);
 });

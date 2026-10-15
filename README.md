@@ -107,7 +107,7 @@ A repository adds this workflow (and `"status_writer": "actions"` in its config)
 name: agent-review
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled] # edited: a new closing issue
   pull_request_review:
   issue_comment:
 permissions: {}
