@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { agentApps, REGISTRY } from "./config.ts";
@@ -905,7 +906,7 @@ export const pullDiff = async (io: Pick<ReviewIo, "git">, mergeBase: string, hea
 const postReview = async (io: ReviewIo, number: number, head: string, review: Review, diff: string, body: (outside: readonly Finding[]) => string) => {
   const lines = diffLines(diff);
   const onDiff = (finding: Finding) => lines.get(finding.file)?.has(finding.line) === true;
-  const findings = withIds(head, review.findings);
+  const { findings } = review;
   const inline = findings.filter(onDiff);
   const path = `${repoPath(io)}/pulls/${number}/reviews`;
   const comments = inline.map((finding) => ({ path: finding.file, line: finding.line, side: "RIGHT", body: inlineComment(finding) }));
@@ -1006,7 +1007,9 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks, blockOn: config.blockOn, prior });
   const result = await inClone(io, head, (cwd) => io.runReviewer(fullCommand(reviewer, effort, files), prompt, cwd), base);
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
-  const review = await answer(io, reviewer, result.stdout, files.out);
+  const answered = await answer(io, reviewer, result.stdout, files.out);
+  // Each finding's id, in its posted marker and the printed JSON: what `agent-gh reply` answers. New for each review.
+  const review = { ...answered, findings: withIds(`${head}\n${randomUUID()}`, answered.findings) };
   const marker: ReviewMarker = {
     v: 1, head, merge_base: mergeBase, patch_id: patchId, verdict: review.verdict, checks: checks.state, reviewer: reviewer.family, priorities: review.findings.map((finding) => finding.priority),
   };
@@ -1017,9 +1020,8 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   else if ((await recordWaiver(await pull(io, stage, number))) === undefined) {
     await setStatus(io, head, reviewState(marker, config.blockOn), `${outcomeSummary(marker, config.blockOn)}; ${checksSummary(checks)}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
   }
-  // Each finding's id, as its posted marker carries it: what `agent-gh reply` answers.
   if (review.findings.length > 0) io.print('agent-gh: answer each finding with `agent-gh reply <id> --applied <sha>` or `agent-gh reply <id> --declined "<why>"`');
-  io.out(`${JSON.stringify({ ...review, findings: withIds(head, review.findings) }, null, 2)}\n`);
+  io.out(`${JSON.stringify(review, null, 2)}\n`);
 };
 
 const SWEEP_BASE = "agent-gh-sweep-base";

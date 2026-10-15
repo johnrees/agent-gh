@@ -902,22 +902,33 @@ export const parseFinding = (body: string): FindingMarker | undefined => {
 };
 
 /**
- * Each finding with its id: 12 hex digits of the SHA-256 of the reviewed head,
- * its place in the review, and its file, line, and summary, so ids differ
- * across findings and reviews. Any id the reviewer gave is replaced.
+ * Each finding with its id: 12 hex digits of the SHA-256 of `seed`, its place
+ * in the review, and its file, line, and summary. The seed is the review's
+ * own (its head and a random nonce, `review full`), so two reviews of one
+ * head, with the same finding, never share an id. Any id the reviewer gave is
+ * replaced.
  */
-export const withIds = (head: string, findings: readonly Finding[]): Finding[] =>
+export const withIds = (seed: string, findings: readonly Finding[]): Finding[] =>
   findings.map((finding, index) => ({
     ...finding,
-    id: createHash("sha256").update(`${head}\n${index}\n${finding.file}\n${finding.line}\n${finding.summary}`).digest("hex").slice(0, 12),
+    id: createHash("sha256").update(`${seed}\n${index}\n${finding.file}\n${finding.line}\n${finding.summary}`).digest("hex").slice(0, 12),
   }));
+
+/**
+ * Text agent-gh did not write (the reviewer's, or a quoted finding) with each
+ * HTML comment opener escaped, so it can carry no agent-gh marker: a forged
+ * `agent-finding` would take a finding's id, and a forged `agent-notify` in a
+ * reply would make it need an answer. GitHub shows it the same.
+ */
+export const inert = (text: string): string => text.replace(/<!--/g, "&lt;!--");
 
 const tagged = (finding: Finding): string => (finding.id === undefined ? "" : ` ${findingMarker({ v: 1, id: finding.id, priority: finding.priority })}`);
 
 /** A finding as an inline review comment on its line. */
-export const inlineComment = (finding: Finding): string => `**${finding.priority} ${finding.kind}**: ${finding.summary}${tagged(finding)}\n\n${finding.scenario}`;
+export const inlineComment = (finding: Finding): string => `**${finding.priority} ${finding.kind}**: ${inert(finding.summary)}${tagged(finding)}\n\n${inert(finding.scenario)}`;
 
-const listed = (finding: Finding): string => `- **${finding.priority} ${finding.kind}** \`${finding.file}:${finding.line}\`: ${finding.summary}${tagged(finding)}\n  ${finding.scenario}`;
+const listed = (finding: Finding): string =>
+  `- **${finding.priority} ${finding.kind}** \`${inert(finding.file)}:${finding.line}\`: ${inert(finding.summary)}${tagged(finding)}\n  ${inert(finding.scenario)}`;
 
 /**
  * The pull request review's body: the marker, the verdict and checks, the
@@ -938,7 +949,7 @@ export const reviewBody = (
     reviewMarker(meta.marker),
     `**${STATUS_CONTEXT}** of ${meta.marker.head.slice(0, 8)}${meta.since === undefined ? "" : ` (changes since ${meta.since.slice(0, 8)})`} against ${meta.issue} by ${meta.reviewer.model} (${meta.reviewer.family}) at ${meta.effort}: ${review.verdict === "approve" ? "approve" : "changes requested"}; ${checksSummary(meta.checks)}`,
     "",
-    review.spec,
+    inert(review.spec),
     ...(review.findings.length === 0
       ? ["", "No findings."]
       : [

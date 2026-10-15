@@ -6,7 +6,7 @@
 import { Failure } from "./failure.ts";
 import { checkedText } from "./notify.ts";
 import { parseRepo, type Repo } from "./repo.ts";
-import { parseFinding } from "./review.ts";
+import { inert, parseFinding } from "./review.ts";
 import { replyMarker } from "./threads.ts";
 
 const STAGE = "replying";
@@ -74,7 +74,7 @@ export const replyBody = (to: string | undefined, session: string | undefined, o
  */
 export const listedFinding = (body: string, id: string): string | undefined => {
   const line = body.split("\n").find((item) => parseFinding(item)?.id === id);
-  return line?.replace(/ ?<!-- agent-finding \{[^\n]*?\} -->/, "").replace(/^- /, "").trim();
+  return line === undefined ? undefined : inert(line.replace(/ ?<!-- agent-finding \{[^\n]*?\} -->/, "").replace(/^- /, "").trim());
 };
 
 /**
