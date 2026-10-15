@@ -272,9 +272,19 @@ export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number>
     url = text(opened.html_url);
     if (!Number.isSafeInteger(pr)) throw new Failure(stage, "opening the draft pull request: invalid response");
   } catch (error) {
-    // A branch another session's open pull request already uses is its, never this claim's to delete.
-    const used = pushed && (await openPulls(io, stage).catch(() => [])).some((item) => text(record(record(item).head).ref) === branch);
-    await dropBranch(io, stage, branch, previous, pushed && !used);
+    // A branch another session's open pull request already uses is its, never this claim's to delete;
+    // nor is one whose pull requests cannot be read, since another session's may use it.
+    let used = false;
+    let unread = false;
+    if (pushed) {
+      try {
+        used = (await openPulls(io, stage)).some((item) => text(record(record(item).head).ref) === branch);
+      } catch {
+        unread = true;
+      }
+    }
+    await dropBranch(io, stage, branch, previous, pushed && !used && !unread);
+    if (unread) io.print(`agent-gh: could not read ${slug(io.repo)}'s open pull requests, so ${branch} is left on GitHub in case another session's uses it; delete it if none does`);
     const holder = used ? (await claimState(io, stage, issue)).holder : undefined;
     if (holder === undefined) throw error;
     io.print(`agent-gh: #${number} went to ${describeClaim(holder)} first, on the same branch; this claim opened nothing. Pick another issue.`);

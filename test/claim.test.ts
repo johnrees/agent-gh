@@ -480,6 +480,20 @@ test("when GitHub refuses the pull request because another open one already uses
   expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], a.dir).stdout).toBe("main");
 });
 
+test("when the pull request is refused and the open pull requests cannot then be read, the branch is left on GitHub", async () => {
+  const w = world();
+  let refused = false;
+  w.routes[`POST ${PATH}/pulls`] = () => ((refused = true), reply(422, { message: "A pull request already exists" }));
+  const list = w.routes[`GET ${PATH}/pulls`] as (body: string, url: URL) => Response;
+  w.routes[`GET ${PATH}/pulls`] = (body, url) => (refused ? reply(502, {}) : list(body, url));
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  await expect(claim(a.io, { issue: 7, refs: false, noPr: false })).rejects.toThrow("HTTP 422");
+  expect(w.state.deleted).toEqual([]);
+  expect(a.printed.join("\n")).toContain("claude/7-fix-the-widget is left on GitHub");
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], a.dir).stdout).toBe("main");
+});
+
 test("a session that read the issue as free and finds its branch's pull request already open names the holder", async () => {
   const w = world({ pulls: [pull(30, `Closes #7.\n${marker(7, "claude", "first")}`, { head: { ref: "claude/7-fix-the-widget", sha: "a".repeat(40), repo: { full_name: "johnrees/widget" } } })] });
   w.state.staleReads = 1;
