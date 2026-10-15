@@ -370,10 +370,12 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
   const skip = /^repos$/i.test(segments[0] ?? "") ? 3 : /^repositories$/i.test(segments[0] ?? "") ? 2 : 0;
   let names: string[];
   try {
-    names = segments.slice(skip).map((segment) => decodeURIComponent(segment));
+    // An encoded separator (`heads%2Fmain`) names the same path to GitHub as a plain one.
+    names = segments.slice(skip).flatMap((segment) => decodeURIComponent(segment).split("/"));
   } catch {
     return unreadable;
   }
+  if (names.some((name) => name === "." || name === "..")) return unreadable;
   const operation = names.map((name) => name.toLowerCase());
   const refWrite = refPlan(path, skip, names, operation, call.method);
   if (refWrite !== undefined) return refWrite;
@@ -393,14 +395,16 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
 const refPlan = (path: string, skip: number, names: readonly string[], operation: readonly string[], method: string): ApiMerge | undefined => {
   const refs = operation[0] === "git" && (operation[1] === "refs" || operation[1] === "ref");
   const contents = operation[0] === "contents" && (method === "PUT" || method === "DELETE");
-  if (!refs && !contents) return undefined;
+  // A fork's merge-upstream moves its `branch` (the default when it names none) past any pull request.
+  const upstream = operation[0] === "merge-upstream";
+  if (!refs && !contents && !upstream) return undefined;
   if (skip !== 3) return { kind: "refuse", reason: `cannot tell which repository \`gh api ${path}\` writes to; name it as repos/OWNER/REPO` };
   const repoPart = /^repos\/([^/]+)\/([^/]+)\//i.exec(path);
   const [owner, name] = [repoPart?.[1] ?? "", repoPart?.[2] ?? ""];
   const placeholders = owner === "{owner}" && name === "{repo}";
   if (!placeholders && /[{}%]/.test(owner + name)) return { kind: "refuse", reason: `cannot tell which repository \`gh api ${path}\` writes to` };
   const repo = placeholders ? undefined : `${owner}/${name}`;
-  if (contents) return { kind: "ref-field", repo, field: "branch" };
+  if (contents || upstream) return { kind: "ref-field", repo, field: "branch" };
   if (operation.length === 2) return method === "POST" ? { kind: "ref-field", repo, field: "ref" } : { kind: "none" };
   // Only branches carry required checks; tags and other refs are not held.
   if (operation[2] !== "heads" || operation.length < 4) return { kind: "none" };
@@ -417,10 +421,10 @@ const masked = (query: string): string | undefined => {
   const out = query.split("");
   for (let at = 0; at < query.length; at++) {
     if (query[at] === "#") {
-      for (; at < query.length && query[at] !== "\n"; at++) out[at] = " ";
+      for (; at < query.length && query[at] !== "\n" && query[at] !== "\r"; at++) out[at] = " ";
     } else if (query[at] === '"') {
       if (query.startsWith('"""', at)) return undefined;
-      for (at++; at < query.length && query[at] !== '"' && query[at] !== "\n"; at++) {
+      for (at++; at < query.length && query[at] !== '"' && query[at] !== "\n" && query[at] !== "\r"; at++) {
         out[at] = " ";
         if (query[at] === "\\") out[++at] = " ";
       }

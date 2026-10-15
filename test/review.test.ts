@@ -762,6 +762,8 @@ test("each GraphQL merge mutation's pull request and expected head are read from
   expect(graphqlMerges("mutation { mergePullRequest # hidden\n (input: {}) { x } }", {})).toHaveProperty("refuse");
   expect(graphqlMerges('mutation { mergeBranch(input: {repositoryId: "R", base: "main", head: "x"}) { x } }', {})).toHaveProperty("refuse");
   // Comments and strings are not read as fields: GitHub ignores them, so the guard does too.
+  // GraphQL ends a comment at a bare carriage return too.
+  expect(graphqlMerges('# note\rmutation { mergePullRequest(input: {pullRequestId: "PR_R"}) { x } }', {})).toEqual([{ id: "PR_R", expectedHeadOid: undefined }]);
   expect(graphqlMerges(`mutation { mergePullRequest(input: {\n# pullRequestId: "PR_SAFE", expectedHeadOid: "${H}"\npullRequestId: "PR_BLOCKED"}) { x } }`, {})).toEqual([{ id: "PR_BLOCKED", expectedHeadOid: undefined }]);
   expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "pullRequestId: $safe", pullRequestId: "PR_B"}) { x } }', { safe: "PR_SAFE" })).toEqual([{ id: "PR_B", expectedHeadOid: undefined }]);
   expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "a ) b", pullRequestId: "PR_C"}) { x } }', {})).toEqual([{ id: "PR_C", expectedHeadOid: undefined }]);
@@ -869,6 +871,10 @@ test("an agent's gh api write that moves a held branch is refused, through REST 
   expect(await refuse(["api", "-X", "PUT", "repos/johnrees/widget/contents/a.txt", "-f", "message=m", "-f", "content=YQ=="])).toContain("default branch");
   expect(await refuse(["api", "graphql", "-f", 'query=mutation { createCommitOnBranch(input: {branch: {repositoryNameWithOwner: "johnrees/widget", branchName: "main"}, message: {headline: "x"}, expectedHeadOid: "a"}) { commit { oid } } }'])).toContain("default branch");
   expect(await refuse(["api", "graphql", "-f", 'query=mutation { updateRef(input: {refId: "REF_MAIN", oid: "a"}) { ref { name } } }'])).toContain("default branch");
+  expect(await refuse(["api", "-X", "PATCH", "repos/johnrees/widget/git/refs/heads%2Fmain", "-f", `sha=${HEAD}`])).toContain("default branch");
+  expect(await refuse(["api", "-X", "PATCH", "repos/johnrees/widget/git/refs%2Fheads%2Frelease", "-f", `sha=${HEAD}`])).toContain("`release` requires");
+  expect(await refuse(["api", "repos/johnrees/widget/merge-upstream", "-f", "branch=main"])).toContain("default branch");
+  expect(await refuse(["api", "repos/johnrees/widget/merge-upstream", "-f", "x=y"])).toContain("default branch");
   expect(await refuse(["api", "graphql", "-f", "query=mutation($i: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $i) { commit { oid } } }", "-F", "i[branch][repositoryNameWithOwner]=johnrees/widget", "-F", "i[branch][branchName]=release"])).toContain("`release` requires");
   expect(await refuse(["api", "graphql", "-f", 'query=mutation { updateRefs(input: {repositoryId: "R", refUpdates: []}) { clientMutationId } }'])).toContain("updateRefs");
   expect(await refuse(["api", "graphql", "-f", "query=mutation($id: ID!) { deleteRef(input: {refId: $id}) { clientMutationId } }"])).toBe("cannot read which branch a GraphQL ref write moves; push with git instead");
