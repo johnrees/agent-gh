@@ -9,6 +9,9 @@ import { parseRepo, type Repo, slug } from "./repo.ts";
 import { checkState, requiredChecks } from "./merge.ts";
 import {
   agentReviewStatus,
+  type ApiCall,
+  apiCall,
+  apiMerge,
   authorFamily,
   type ChecksResult,
   checksSummary,
@@ -18,6 +21,7 @@ import {
   effortFor,
   type Finding,
   fullPrompt,
+  graphqlMergeIds,
   inlineComment,
   mergeCommand,
   outputTail,
@@ -50,8 +54,8 @@ export type ReviewIo = {
   readonly family: string;
   /** Runs git in the working tree, with `input` on stdin; its trimmed stdout, or undefined when it fails. */
   readonly git: (args: readonly string[], input?: string) => Promise<string | undefined>;
-  /** Runs one of the config's checks, a shell command, in `cwd`; its exit code and its stdout and stderr together. */
-  readonly runCheck: (command: string, cwd: string) => Promise<{ readonly code: number; readonly output: string }>;
+  /** Runs one of the config's checks, a shell command, in `cwd`, stopping it after `timeoutMs`; its exit code and its stdout and stderr together. */
+  readonly runCheck: (command: string, cwd: string, timeoutMs: number) => Promise<CheckRun>;
   /** Runs a reviewer CLI in `cwd` with `stdin` (none when empty) and returns its exit code and stdout. */
   readonly runReviewer: (command: readonly string[], stdin: string, cwd: string) => Promise<{ readonly code: number; readonly stdout: string }>;
   readonly readFile: (path: string) => Promise<string>;
@@ -262,11 +266,12 @@ const pages = async (io: ReviewIo, stage: Stage, path: string): Promise<unknown[
   throw new Failure(stage, `${path.replace(/^\/repos\/[^/]+\/[^/]+/, "")} lists over 1,000 rules`);
 };
 
-/** `gh pr ready` behind the gate: `run` starts gh only once the gate passes. */
-/** What `dispatchGh` needs from the CLI: tokens, the gate's I/O, and gh itself. */
+/** What `dispatchGh` needs from the CLI: tokens, the gate's I/O, files, and gh itself. */
 export interface GhDispatch {
-  /** Runs `use` with one token for the repository, shared by the gate and the gh it lets through. */
-  withToken: (repo: Repo, use: (env: Record<string, string>) => Promise<number>) => Promise<number>;
+  /** Runs `use` with one token for the repository (none for a command that names none), shared by the gate and the gh it lets through. */
+  withToken: (repo: Repo | undefined, use: (env: Record<string, string>) => Promise<number>) => Promise<number>;
+  /** Reads a file `gh api` would read (`--input`, `-F name=@file`), or undefined when it cannot. */
+  readFile: (path: string) => Promise<string | undefined>;
   io: (repo: Repo, env: Record<string, string>) => ReviewIo;
   /** Runs gh with the token the gate used. */
   runWith: (args: readonly string[], env: Record<string, string>) => Promise<number>;
@@ -283,7 +288,10 @@ export const dispatchGh = async (args: readonly string[], repo: Repo | undefined
   const ready = readyTarget(args);
   const merge = ready === undefined ? mergeCommand(args) : undefined;
   const target = ready ?? merge?.target;
-  if (target === undefined) return deps.run(args);
+  if (target === undefined) {
+    const api = apiCall(args);
+    return api === undefined ? deps.run(args) : dispatchApi(args, api, repo, deps);
+  }
   // gh acts on a pull request URL's repository, whatever the clone or flags say.
   const targetRepo = "repo" in target && target.repo !== undefined ? parseRepo(target.repo) : repo;
   if (targetRepo === undefined) {
@@ -296,6 +304,81 @@ export const dispatchGh = async (args: readonly string[], repo: Repo | undefined
     else await gateReady(io, target);
     return deps.runWith(args, env);
   });
+};
+
+/**
+ * `gh api` behind the merge guard: a REST or GraphQL call that merges a pull
+ * request runs only when `gh pr merge` would; one that merges outside a pull
+ * request, or that the guard cannot read, is refused.
+ */
+const dispatchApi = async (args: readonly string[], api: ApiCall, repo: Repo | undefined, deps: GhDispatch): Promise<number> => {
+  const plan = apiMerge(api);
+  if (plan.kind === "none") return deps.run(args);
+  if (plan.kind === "refuse") throw new Failure(MERGE_STAGE, plan.reason);
+  if (plan.kind === "rest") {
+    const target = plan.repo === undefined ? repo : parseRepo(plan.repo);
+    if (target === undefined) throw new Failure(MERGE_STAGE, "cannot tell which repository `gh api` merges in; name it in the endpoint");
+    return deps.withToken(target, async (env) => {
+      await gateMerge(deps.io(target, env), { number: plan.number }, false);
+      return deps.runWith(args, env);
+    });
+  }
+  const request = await graphqlRequest(api, deps.readFile);
+  const ids = graphqlMergeIds(request.query, request.variables);
+  if ("refuse" in ids) throw new Failure(MERGE_STAGE, ids.refuse);
+  if (ids.length === 0) return deps.run(args);
+  return deps.withToken(repo, async (env) => {
+    for (const id of ids) {
+      // The node lookup is GraphQL, which names no repository; the io's own is unused.
+      const pr = await pullForNode(deps.io(repo ?? { owner: "-", name: "-" }, env), id);
+      await gateMerge(deps.io(pr.repo, env), { number: pr.number }, false);
+    }
+    return deps.runWith(args, env);
+  });
+};
+
+const UNREADABLE = "cannot read the GraphQL query `gh api graphql` sends; pass it with `-f query=...` or `--input <file>`";
+
+/** The query and variables `gh api graphql` sends, read as gh builds them: from `--input`, else from its fields. */
+export const graphqlRequest = async (
+  api: ApiCall,
+  readFile: (path: string) => Promise<string | undefined>,
+): Promise<{ readonly query: string; readonly variables: Readonly<Record<string, unknown>> }> => {
+  const file = async (path: string) => {
+    const content = path === "-" || path === "" ? undefined : await readFile(path);
+    if (content === undefined) throw new Failure(MERGE_STAGE, UNREADABLE);
+    return content;
+  };
+  if (api.input !== undefined) {
+    let body: Record<string, unknown>;
+    try {
+      body = record(JSON.parse(await file(api.input)));
+    } catch (error) {
+      if (error instanceof Failure) throw error;
+      throw new Failure(MERGE_STAGE, UNREADABLE);
+    }
+    if (typeof body.query !== "string") throw new Failure(MERGE_STAGE, UNREADABLE);
+    return { query: body.query, variables: record(body.variables) };
+  }
+  let query: string | undefined;
+  const variables: Record<string, unknown> = {};
+  for (const field of api.fields) {
+    // -F reads `@file` (`@-` is stdin); -f sends its value as it is.
+    const value = !field.raw && field.value.startsWith("@") ? await file(field.value.slice(1)) : field.value;
+    if (field.name === "query") query = value;
+    else if (field.name !== "operationName") variables[field.name] = value;
+  }
+  if (query === undefined) throw new Failure(MERGE_STAGE, UNREADABLE);
+  return { query, variables };
+};
+
+/** The pull request a GraphQL node id names, and its repository; refused when it names none. */
+const pullForNode = async (io: ReviewIo, id: string): Promise<{ readonly repo: Repo; readonly number: number }> => {
+  const query = "query($id:ID!){node(id:$id){... on PullRequest{number repository{nameWithOwner}}}}";
+  const node = record(record(record((await call(io, MERGE_STAGE, "POST", "/graphql", { query, variables: { id } })).value).data).node);
+  const repo = parseRepo(text(record(node.repository).nameWithOwner));
+  if (!Number.isSafeInteger(node.number) || repo === undefined) throw new Failure(MERGE_STAGE, "a GraphQL merge mutation names a node that is not a pull request agent-gh can find");
+  return { repo, number: node.number as number };
 };
 
 /** Runs a reviewer in its checkout, with the instructions on stdin and without the caller's harness. */
@@ -361,24 +444,56 @@ export const inClone = async <T>(io: ReviewIo, sha: string, use: (dir: string) =
   }
 };
 
-/** Runs the config's checks in order in `dir`, stopping at the first that fails. */
+/** Runs the config's checks in order in `dir`, stopping at the first that fails or runs out of time. */
 export const runChecks = async (io: ReviewIo, config: ReviewConfig, dir: string): Promise<ChecksResult> => {
   if (config.checks.length === 0) return { state: "not run" };
   let output = "";
+  const tail = () => outputTail(output, config.checksOutputLines);
   for (const command of config.checks) {
     io.print(`agent-gh: running \`${command}\``);
-    const result = await io.runCheck(command, dir);
+    const result = await io.runCheck(command, dir, config.checksTimeoutMinutes * 60_000);
     output += `$ ${command}\n${result.output}${result.output.endsWith("\n") || result.output === "" ? "" : "\n"}`;
-    if (result.code !== 0) return { state: "failed", command, code: result.code, tail: outputTail(output, config.checksOutputLines) };
+    if (result.timedOut) return { state: "timed out", command, minutes: config.checksTimeoutMinutes, tail: tail() };
+    if (result.code !== 0) return { state: "failed", command, code: result.code, tail: tail() };
   }
-  return { state: "passed", tail: outputTail(output, config.checksOutputLines) };
+  return { state: "passed", tail: tail() };
 };
 
-/** Runs a check through the shell in `cwd`, its stderr merged into its stdout, without the caller's harness. */
-export const spawnCheck = async (command: string, cwd: string, env: Env): Promise<{ code: number; output: string }> => {
-  const child = Bun.spawn(["sh", "-c", `exec 2>&1\n${command}`], { cwd, env: reviewerEnv(env), stdin: "ignore", stdout: "pipe", stderr: "inherit" });
-  const [code, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-  return { code, output };
+export type CheckRun = { readonly code: number; readonly output: string; readonly timedOut: boolean };
+
+/**
+ * Runs a check through the shell in `cwd`, its stderr merged into its
+ * stdout, without the caller's harness. It runs in its own process group, so
+ * a timeout, or agent-gh being interrupted, stops everything it started.
+ */
+export const spawnCheck = async (command: string, cwd: string, env: Env, timeoutMs: number): Promise<CheckRun> => {
+  const child = Bun.spawn(["sh", "-c", `exec 2>&1\n${command}`], { cwd, env: reviewerEnv(env), stdin: "ignore", stdout: "pipe", stderr: "inherit", detached: true });
+  const stop = () => {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      // The group has already exited.
+    }
+  };
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    stop();
+  }, timeoutMs);
+  const interrupted = (signal: NodeJS.Signals) => {
+    stop();
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  };
+  process.once("SIGINT", interrupted);
+  process.once("SIGTERM", interrupted);
+  try {
+    const [code, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+    return { code, output, timedOut };
+  } finally {
+    clearTimeout(timer);
+    process.off("SIGINT", interrupted);
+    process.off("SIGTERM", interrupted);
+  }
 };
 
 /** Reads a reviewer's structured answer from its output file (codex) or stdout (claude). */
@@ -544,7 +659,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
   const review = await answer(io, reviewer, result.stdout, files.out);
   const marker: ReviewMarker = { v: 1, head, merge_base: mergeBase, patch_id: patchId, verdict: review.verdict, checks: checks.state, reviewer: reviewer.family };
-  await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks }, outside));
+  await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput }, outside));
   // A waiver John added while the review ran stands: the labels are read afresh, and the verdict never overwrites it.
   if ((await recordWaiver(await pull(io, stage, number))) === undefined) {
     const verdict = review.verdict === "approve" ? "approved" : "changes requested";

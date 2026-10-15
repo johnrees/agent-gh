@@ -27,8 +27,12 @@ export type ReviewConfig = {
   readonly pin: ReviewerFamily | undefined;
   /** Commands agent-gh runs, in order, in a throwaway clone of the reviewed commit before the reviewer starts. */
   readonly checks: readonly string[];
-  /** How many of the checks' last output lines the reviewer, the review, and its log see. */
+  /** How many of the checks' last output lines the reviewer sees. */
   readonly checksOutputLines: number;
+  /** Whether the pull request review also shows those lines; off by default, since output can leak the machine's environment. */
+  readonly postChecksOutput: boolean;
+  /** How long one check may run before it is stopped and the checks count as timed out. */
+  readonly checksTimeoutMinutes: number;
   /**
    * The verdict that sets the agent-review status to failure. Its only value is
    * also the default; a repository sets it so that releases before it, which
@@ -72,12 +76,18 @@ const pinned = (value: unknown, reviewers: readonly Reviewer[]): ReviewerFamily 
   return value as ReviewerFamily;
 };
 
-const outputLines = (value: unknown): number => {
-  if (value === undefined) return 60;
-  if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > 1000) {
-    throw new Failure(STAGE, `${CONFIG_PATH}: checks_output_lines must be a whole number from 0 to 1000`);
+const whole = (value: unknown, key: string, fallback: number, min: number, max: number): number => {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || (value as number) < min || (value as number) > max) {
+    throw new Failure(STAGE, `${CONFIG_PATH}: ${key} must be a whole number from ${min} to ${max}`);
   }
   return value as number;
+};
+
+const flag = (value: unknown, key: string): boolean => {
+  if (value === undefined) return false;
+  if (typeof value !== "boolean") throw new Failure(STAGE, `${CONFIG_PATH}: ${key} must be true or false`);
+  return value;
 };
 
 const blockOn = (value: unknown): BlockOn => {
@@ -95,7 +105,7 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
     throw new Failure(STAGE, `${CONFIG_PATH} is not valid JSON`);
   }
   const top = object(raw, "the file");
-  known(top, ["reviewers", "effort", "checklist", "waiver_label", "pin", "checks", "checks_output_lines", "block_on"], "the file");
+  known(top, ["reviewers", "effort", "checklist", "waiver_label", "pin", "checks", "checks_output_lines", "post_checks_output", "checks_timeout_minutes", "block_on"], "the file");
   const checksRaw = top.checks ?? [];
   if (!Array.isArray(checksRaw)) throw new Failure(STAGE, `${CONFIG_PATH}: checks must be a list of commands`);
   const reviewersRaw = object(top.reviewers, "reviewers");
@@ -130,7 +140,9 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
     waiverLabel: top.waiver_label === undefined ? "review-waived" : string(top.waiver_label, "waiver_label"),
     pin: pinned(top.pin, reviewers),
     checks: checksRaw.map((check, index) => string(check, `checks[${index}]`)),
-    checksOutputLines: outputLines(top.checks_output_lines),
+    checksOutputLines: whole(top.checks_output_lines, "checks_output_lines", 60, 0, 1000),
+    postChecksOutput: flag(top.post_checks_output, "post_checks_output"),
+    checksTimeoutMinutes: whole(top.checks_timeout_minutes, "checks_timeout_minutes", 30, 1, 1440),
     blockOn: blockOn(top.block_on),
   };
 };
@@ -273,6 +285,113 @@ export const mergeCommand = (args: readonly string[]): { readonly target: ReadyT
   return { target: selector(words[2]), admin };
 };
 
+/**
+ * A `gh api` call, as gh reads its arguments: the endpoint, the method (GET
+ * unless given, POST once any field or `--input` is), the fields in order
+ * (`raw` for -f/--raw-field, whose values gh sends as they are), and the
+ * `--input` file.
+ */
+export type ApiCall = {
+  readonly endpoint: string | undefined;
+  readonly method: string;
+  readonly fields: readonly { readonly name: string; readonly value: string; readonly raw: boolean }[];
+  readonly input: string | undefined;
+};
+
+const API_VALUE_LONG = ["method", "header", "raw-field", "field", "input", "jq", "template", "cache", "hostname", "preview"];
+const API_VALUE_SHORT = "XHfFqtp";
+
+/** `gh api`'s endpoint, method, fields, and input; undefined for any other command. */
+export const apiCall = (args: readonly string[]): ApiCall | undefined => {
+  const words: string[] = [];
+  const values: [string, string][] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index] as string;
+    if (arg === "--") {
+      words.push(...args.slice(index + 1));
+      break;
+    }
+    if (arg.startsWith("--")) {
+      const [name, attached] = arg.includes("=") ? [arg.slice(2, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg.slice(2), undefined];
+      if (API_VALUE_LONG.includes(name)) values.push([name, attached ?? (args[++index] ?? "")]);
+    } else if (arg.startsWith("-") && arg.length > 1) {
+      for (let at = 1; at < arg.length; at++) {
+        const short = arg[at] as string;
+        if (!API_VALUE_SHORT.includes(short)) continue;
+        const rest = arg.slice(at + 1).replace(/^=/, "");
+        values.push([short, rest !== "" ? rest : (args[++index] ?? "")]);
+        break;
+      }
+    } else words.push(arg);
+  }
+  if (words[0] !== "api") return undefined;
+  const fields = values
+    .filter(([name]) => ["f", "raw-field", "F", "field"].includes(name))
+    .map(([name, pair]) => {
+      const at = pair.indexOf("=");
+      return { name: at < 0 ? pair : pair.slice(0, at), value: at < 0 ? "" : pair.slice(at + 1), raw: name === "f" || name === "raw-field" };
+    });
+  const input = values.findLast(([name]) => name === "input")?.[1];
+  const method = values.findLast(([name]) => name === "X" || name === "method")?.[1];
+  return { endpoint: words[1], method: (method ?? (fields.length > 0 || input !== undefined ? "POST" : "GET")).toUpperCase(), fields, input };
+};
+
+/**
+ * What a `gh api` call means for the merge guard: nothing; a REST merge of a
+ * pull request (`{owner}`/`{repo}` are gh's placeholders for the current
+ * repository); a GraphQL request whose query must be read; or a refusal,
+ * for a call that merges outside a pull request or that cannot be read
+ * confidently.
+ */
+export type ApiMerge =
+  | { readonly kind: "none" }
+  | { readonly kind: "rest"; readonly repo: string | undefined; readonly number: number }
+  | { readonly kind: "graphql" }
+  | { readonly kind: "refuse"; readonly reason: string };
+
+export const apiMerge = (call: ApiCall): ApiMerge => {
+  if (call.endpoint === undefined) return { kind: "none" };
+  const path = call.endpoint.replace(/^https?:\/\/api\.github\.com\//i, "").replace(/^\//, "").split(/[?#]/)[0] as string;
+  if (/^graphql\/?$/i.test(path)) return { kind: "graphql" };
+  if (call.method === "GET" || call.method === "HEAD") return { kind: "none" };
+  const segments = path.toLowerCase().split("/");
+  if (!segments.some((segment) => /merges?|%/.test(segment) || segment === "..")) return { kind: "none" };
+  const pr = /^repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)\/merge\/?$/i.exec(path);
+  if (pr === null) {
+    if (/^repos\/[^/]+\/[^/]+\/merges\/?$/i.test(path)) return { kind: "refuse", reason: "`gh api` merging a branch through the merges endpoint skips the pull request's checks; open a pull request" };
+    return { kind: "refuse", reason: `cannot tell whether \`gh api ${call.method} ${call.endpoint}\` merges a pull request; use \`gh pr merge\`` };
+  }
+  const [owner, name] = [pr[1] as string, pr[2] as string];
+  const placeholders = owner === "{owner}" && name === "{repo}";
+  if (!placeholders && (/[{}%]/.test(owner + name) || owner === ".." || name === "..")) {
+    return { kind: "refuse", reason: `cannot tell which repository \`gh api ${call.endpoint}\` merges in; use \`gh pr merge\`` };
+  }
+  return { kind: "rest", repo: placeholders ? undefined : `${owner}/${name}`, number: Number(pr[3]) };
+};
+
+/** GraphQL mutations that merge a pull request, or queue it to be merged. */
+const MERGE_MUTATIONS = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b/g;
+
+/**
+ * The pull request node ids a GraphQL document's merge mutations name, from
+ * literal `pullRequestId: "..."` arguments or variables. Empty when it merges
+ * nothing; a refusal when it merges a branch, or names fewer ids than it
+ * has merge mutations, or an id this cannot read.
+ */
+export const graphqlMergeIds = (query: string, variables: Readonly<Record<string, unknown>>): readonly string[] | { readonly refuse: string } => {
+  if (/\bmergeBranch\b/.test(query)) return { refuse: "the GraphQL mergeBranch mutation merges past a pull request's checks; open a pull request" };
+  const mutations = query.match(MERGE_MUTATIONS)?.length ?? 0;
+  if (mutations === 0) return [];
+  const ids: string[] = [];
+  for (const match of query.matchAll(/\bpullRequestId\s*:\s*(?:"((?:[^"\\]|\\.)*)"|\$(\w+))/g)) {
+    const id = match[1] ?? variables[match[2] as string];
+    if (typeof id !== "string" || id === "") return { refuse: "cannot read the pull request id a GraphQL merge mutation names; use `gh pr merge`" };
+    ids.push(id);
+  }
+  if (ids.length < mutations) return { refuse: "cannot read the pull request id a GraphQL merge mutation names; use `gh pr merge`" };
+  return ids;
+};
+
 export type Finding = {
   readonly priority: "P0" | "P1" | "P2" | "P3";
   readonly kind: "defect" | "spec" | "standards" | "tests";
@@ -344,17 +463,24 @@ export type PullRequest = { readonly number: number; readonly title: string; rea
 
 /**
  * The checks agent-gh ran in the reviewer's clone before the review: the
- * failing command and its exit code when one failed (the rest are skipped),
- * and the last lines of their combined output.
+ * command that failed or ran out of time (the rest are skipped), and the
+ * last lines of their combined output. Only "passed" counts as passing.
  */
 export type ChecksResult =
   | { readonly state: "not run" }
   | { readonly state: "passed"; readonly tail: string }
-  | { readonly state: "failed"; readonly command: string; readonly code: number; readonly tail: string };
+  | { readonly state: "failed"; readonly command: string; readonly code: number; readonly tail: string }
+  | { readonly state: "timed out"; readonly command: string; readonly minutes: number; readonly tail: string };
 
-/** One phrase for the prompt, the review, and the status description. */
+export const CHECKS_STATES: readonly ChecksResult["state"][] = ["passed", "failed", "timed out", "not run"];
+
+/** One phrase for the prompt, the review, and the status description: the state and the command, never its output. */
 export const checksSummary = (checks: ChecksResult): string =>
-  checks.state === "failed" ? `checks failed (\`${checks.command}\` exited ${checks.code})` : `checks ${checks.state}`;
+  checks.state === "failed"
+    ? `checks failed (\`${checks.command}\` exited ${checks.code})`
+    : checks.state === "timed out"
+      ? `checks timed out (\`${checks.command}\` ran over ${checks.minutes} min)`
+      : `checks ${checks.state}`;
 
 // GitHub refuses a body over 65,536 characters; the tail never crowds out the findings.
 const TAIL_CHARACTERS = 20_000;
@@ -379,7 +505,7 @@ const checksSection = (checks: ChecksResult): string[] =>
     : [
         `agent-gh ran the repository's checks on the reviewed commit before you started: ${checksSummary(checks)}.`,
         ...(checks.tail === "" ? [] : ["The last lines of their output:", ...fenced(checks.tail)]),
-        ...(checks.state === "failed" ? ["Report a failure as a finding where the change causes it."] : []),
+        ...(checks.state === "failed" || checks.state === "timed out" ? ["Report a failure as a finding where the change causes it."] : []),
       ];
 
 /** The full review's instructions and the ticket and pull request it is judged against. */
@@ -464,7 +590,7 @@ export const parseMarker = (body: string): ReviewMarker | undefined => {
     typeof value.merge_base === "string" && SHA.test(value.merge_base) &&
     (value.patch_id === null || (typeof value.patch_id === "string" && SHA.test(value.patch_id))) &&
     (value.verdict === "approve" || value.verdict === "changes_requested") &&
-    ["passed", "failed", "not run"].includes(value.checks as string) &&
+    CHECKS_STATES.includes(value.checks as ChecksResult["state"]) &&
     REVIEWER_FAMILIES.includes(value.reviewer as ReviewerFamily);
   return ok ? (value as unknown as ReviewMarker) : undefined;
 };
@@ -476,12 +602,12 @@ const listed = (finding: Finding): string => `- **${finding.priority} ${finding.
 
 /**
  * The pull request review's body: the marker, the verdict and checks, the
- * spec summary, the findings not posted inline (`outside`), and the checks'
- * output tail.
+ * spec summary, the findings not posted inline (`outside`), and, only when
+ * `postOutput`, the checks' output tail.
  */
 export const reviewBody = (
   review: Review,
-  meta: { readonly marker: ReviewMarker; readonly reviewer: Reviewer; readonly effort: Effort; readonly issue: string; readonly checks: ChecksResult },
+  meta: { readonly marker: ReviewMarker; readonly reviewer: Reviewer; readonly effort: Effort; readonly issue: string; readonly checks: ChecksResult; readonly postOutput: boolean },
   outside: readonly Finding[],
 ): string => {
   const inline = review.findings.length - outside.length;
@@ -496,7 +622,7 @@ export const reviewBody = (
           ...(inline === 0 ? [] : ["", `${inline} finding(s) are on their lines.`]),
           ...(outside.length === 0 ? [] : ["", ...(inline === 0 ? [] : ["On lines outside the diff:"]), ...outside.map(listed)]),
         ]),
-    ...(meta.checks.state === "not run" || meta.checks.tail === ""
+    ...(!meta.postOutput || meta.checks.state === "not run" || meta.checks.tail === ""
       ? []
       : ["", `<details><summary>Checks output (last lines)</summary>`, "", ...fenced(meta.checks.tail), "", "</details>"]),
     ...(review.findings.length === 0 ? [] : ["", "Reply with what was done about each finding: applied (with the commit), or not, and why."]),

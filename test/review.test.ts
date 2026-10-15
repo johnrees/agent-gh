@@ -4,9 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Failure } from "../src/failure.ts";
 import {
+  apiCall,
+  apiMerge,
   authorFamily,
   diffLines,
   effortFor,
+  graphqlMergeIds,
   labelMatches,
   mergeCommand,
   outputTail,
@@ -95,7 +98,10 @@ test("a config with a typo is refused with the field to fix, and defaults fill w
   const minimal = parseReviewConfig(JSON.stringify({ reviewers: { codex: { model: "gpt-6-astra" } } }));
   expect(minimal).toMatchObject({ effort: { default: "high", rules: [] }, checklist: undefined, waiverLabel: "review-waived", checks: [] });
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, checks: "make check" })))).toContain("checks must be a list");
-  expect(minimal).toMatchObject({ blockOn: "changes_requested", checksOutputLines: 60 });
+  expect(minimal).toMatchObject({ blockOn: "changes_requested", checksOutputLines: 60, postChecksOutput: false, checksTimeoutMinutes: 30 });
+  expect(parseReviewConfig(JSON.stringify({ ...EXAMPLE, post_checks_output: true, checks_timeout_minutes: 90 }))).toMatchObject({ postChecksOutput: true, checksTimeoutMinutes: 90 });
+  expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, post_checks_output: "yes" })))).toContain("post_checks_output must be true or false");
+  expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, checks_timeout_minutes: 0 })))).toContain("checks_timeout_minutes must be a whole number from 1 to 1440");
   expect(parseReviewConfig(JSON.stringify({ ...EXAMPLE, block_on: "changes_requested", checks_output_lines: 0 }))).toMatchObject({ blockOn: "changes_requested", checksOutputLines: 0 });
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, block_on: "nothing" })))).toBe('.github/agent-review.json: block_on must be "changes_requested"');
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, checks_output_lines: -1 })))).toContain("checks_output_lines must be a whole number");
@@ -214,7 +220,7 @@ type World = {
   /** Each head commit's Co-authored-by values. */
   coAuthors?: string[][];
   /** The checks' results, in the order they run; any more pass. */
-  checkResults?: { code: number; output: string }[];
+  checkResults?: { code: number; output: string; timedOut?: boolean }[];
   /** The statuses GitHub answers a posted review with, in order. */
   reviewReplies?: number[];
   /** The base branch's rules (rulesets), its branch record (classic protection), and the head's check runs. */
@@ -255,7 +261,10 @@ const world = ({
     [`GET ${REPO}/rules/branches/main`]: () => reply(200, rules),
     [`GET ${REPO}/branches/main`]: () => reply(200, branch),
     [`GET ${REPO}/issues/12/events`]: () => reply(200, events),
-    "POST /graphql": () => reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { nodes: [{ number: 7, repository: { nameWithOwner: closes } }] } } } } }),
+    "POST /graphql": (body) =>
+      body.includes("node(id")
+        ? reply(200, { data: { node: JSON.parse(body).variables.id === "PR_12" ? { number: 12, repository: { nameWithOwner: "johnrees/widget" } } : {} } })
+        : reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { nodes: [{ number: 7, repository: { nameWithOwner: closes } }] } } } } }),
     [`GET ${REPO}/issues/7`]: () => reply(200, { title: "The ticket", body: "Do it well.", labels: [{ name: "model:fable-astra" }], comments: 1 }),
     [`GET ${REPO}/issues/7/comments`]: () => reply(200, [{ body: "Last word." }]),
     ["GET /repos/johnrees/tracker/issues/7"]: () => reply(200, { title: "Elsewhere", body: "Tracked elsewhere.", labels: [{ name: "model:opus-sol" }], comments: 0 }),
@@ -265,7 +274,7 @@ const world = ({
   stops.push(fake.stop);
   const commands: { command: readonly string[]; stdin: string; cwd: string }[] = [];
   const gitCalls: string[] = [];
-  const checks: { command: string; cwd: string }[] = [];
+  const checks: { command: string; cwd: string; timeoutMs: number }[] = [];
   const steps: string[] = [];
   const printed: string[] = [];
   let output = "";
@@ -292,10 +301,11 @@ const world = ({
       if (args[0] === "cat-file") return args.at(-1) === `${OLD}^{commit}` ? "" : undefined;
       return undefined;
     },
-    runCheck: async (command, cwd) => {
-      checks.push({ command, cwd });
+    runCheck: async (command, cwd, timeoutMs) => {
+      checks.push({ command, cwd, timeoutMs });
       steps.push(`check ${command}`);
-      return checkResults.shift() ?? { code: 0, output: `${command}: ok\n` };
+      const result = checkResults.shift() ?? { code: 0, output: `${command}: ok\n` };
+      return { timedOut: false, ...result };
     },
     runReviewer: async (command, stdin, cwd) => {
       commands.push({ command, stdin, cwd });
@@ -382,7 +392,7 @@ test("a full review runs the checks itself in a clone of the head, then the auth
   const [{ command, stdin, cwd }] = commands as [{ command: readonly string[]; stdin: string; cwd: string }];
   // agent-gh runs the checks before the reviewer, in the same throwaway clone; the reviewer only reads.
   expect(steps).toEqual(["git clone", "git checkout", "check make check", "check make lint", "git reset", "git clean", "reviewer"]);
-  expect(checks).toEqual([{ command: "make check", cwd }, { command: "make lint", cwd }]);
+  expect(checks).toEqual([{ command: "make check", cwd, timeoutMs: 1_800_000 }, { command: "make lint", cwd, timeoutMs: 1_800_000 }]);
   expect(gitCalls[0]).toBe(`clone -q --shared --no-checkout /work/widget/.git ${cwd}`);
   expect(gitCalls[1]).toBe(`-C ${cwd} checkout -q --detach ${HEAD}`);
   expect(command.slice(0, 8)).toEqual(["codex", "exec", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"', "-s", "read-only"]);
@@ -431,9 +441,34 @@ test("a failing check stops the rest, and the reviewer, the review, and the stat
   expect(stdin).toContain("checks failed (`make check` exited 2).\nThe last lines of their output:\n```\nline 28\nline 29\nerror: it broke\n```\nReport a failure as a finding where the change causes it.");
   const body = posted(w.fake, `${REPO}/pulls/12/reviews`)[0]?.body as string;
   expect(body).toContain("changes requested; checks failed (`make check` exited 2)");
-  expect(body).toContain("<details><summary>Checks output (last lines)</summary>\n\n```\nline 28\nline 29\nerror: it broke\n```");
+  // The output can carry the machine's environment, so it reaches the pull request only when the repository opts in.
+  expect(body).not.toContain("it broke");
+  expect(body).not.toContain("<details>");
   expect(parseMarker(body)?.checks).toBe("failed");
   expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)[0]?.description).toBe("changes requested; checks failed (`make check` exited 2): 0 finding(s) by gpt-6-astra at xhigh");
+});
+
+test("a repository that opts in shows the checks' output tail on the review", async () => {
+  const w = world({
+    config: { ...EXAMPLE, checks_output_lines: 2, post_checks_output: true },
+    checkResults: [{ code: 1, output: "one\ntwo\nthree\n" }],
+    answer: { verdict: "changes_requested", spec: "Broken.", findings: [] },
+  });
+  await reviewFull(w.io, {});
+  expect(posted(w.fake, `${REPO}/pulls/12/reviews`)[0]?.body).toContain("<details><summary>Checks output (last lines)</summary>\n\n```\ntwo\nthree\n```");
+});
+
+test("a check that runs out of time stops the rest; the checks count as timed out and the reviewer still runs", async () => {
+  const w = world({
+    config: { ...EXAMPLE, checks_timeout_minutes: 5 },
+    checkResults: [{ code: 137, output: "compiling\n", timedOut: true }],
+    answer: { verdict: "approve", spec: "Fine.", findings: [] },
+  });
+  await reviewFull(w.io, {});
+  expect(w.checks).toEqual([{ command: "make check", cwd: w.commands[0]?.cwd as string, timeoutMs: 300_000 }]);
+  expect(w.commands[0]?.stdin).toContain("checks timed out (`make check` ran over 5 min).\nThe last lines of their output:\n```\n$ make check\ncompiling\n```\nReport a failure");
+  expect(parseMarker(posted(w.fake, `${REPO}/pulls/12/reviews`)[0]?.body as string)?.checks).toBe("timed out");
+  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)[0]?.description).toBe("approved; checks timed out (`make check` ran over 5 min): 0 finding(s) by gpt-6-astra at xhigh");
 });
 
 test("a repository with no checks reviews with checks not run", async () => {
@@ -523,9 +558,10 @@ test("gh pr ready runs only after the gate passes, with the gate's token; other 
   const calls: string[] = [];
   const deps = (io: ReviewIo): GhDispatch => ({
     withToken: async (repo, use) => {
-      calls.push(`token ${slug(repo)}`);
+      calls.push(`token ${repo === undefined ? "none" : slug(repo)}`);
       return use({ GH_TOKEN: "t" });
     },
+    readFile: async () => undefined,
     io: () => io,
     runWith: async (args, env) => {
       calls.push(`gated gh ${args.join(" ")} ${env.GH_TOKEN}`);
@@ -569,8 +605,9 @@ test("gh pr merge names its pull request as gh does, skipping flag values, and -
 const REQUIRED = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "build", integration_id: 15368 }, { context: "agent-review" }] } }];
 const PASSED = { status: [{ context: "agent-review", state: "success" }], checkRuns: [{ name: "build", status: "completed", conclusion: "success", app: { id: 15368 } }] };
 
-const mergeDeps = (io: ReviewIo, calls: string[]): GhDispatch => ({
+const mergeDeps = (io: ReviewIo, calls: string[], files: Record<string, string> = {}): GhDispatch => ({
   withToken: async (_, use) => use({ GH_TOKEN: "t" }),
+  readFile: async (path) => files[path],
   io: () => io,
   runWith: async (args) => {
     calls.push(`gh ${args.join(" ")}`);
@@ -607,6 +644,79 @@ test("an agent's gh pr merge --admin is always refused, and an unnamed repositor
     "cannot find the pull request `gh pr merge` names; name it by number",
   );
   expect(calls).toEqual([]);
+});
+
+test("gh api's endpoint, method, and fields are read as gh reads them", () => {
+  expect(apiCall(["api", "repos/o/r/pulls/1/merge", "-X", "put"])).toEqual({ endpoint: "repos/o/r/pulls/1/merge", method: "PUT", fields: [], input: undefined });
+  expect(apiCall(["api", "-XPUT", "/repos/o/r/pulls/1/merge"])?.method).toBe("PUT");
+  expect(apiCall(["api", "--method=PUT", "repos/o/r/pulls/1/merge"])?.method).toBe("PUT");
+  expect(apiCall(["api", "--method", "PUT", "-H", "Accept: x", "repos/o/r/pulls/1/merge"])?.endpoint).toBe("repos/o/r/pulls/1/merge");
+  // Fields make it a POST; -f is raw, -F reads @files.
+  expect(apiCall(["api", "graphql", "-f", "query=q", "-Fid=@id.txt"])).toEqual({
+    endpoint: "graphql", method: "POST", fields: [{ name: "query", value: "q", raw: true }, { name: "id", value: "@id.txt", raw: false }], input: undefined,
+  });
+  expect(apiCall(["api", "repos/o/r/pulls/1"])?.method).toBe("GET");
+  expect(apiCall(["pr", "view"])).toBeUndefined();
+});
+
+test("a gh api call that merges is found in every spelling, and one the guard cannot read is refused", () => {
+  const plan = (args: string[]) => apiMerge(apiCall(args) as NonNullable<ReturnType<typeof apiCall>>);
+  expect(plan(["api", "-X", "PUT", "repos/o/r/pulls/12/merge"])).toEqual({ kind: "rest", repo: "o/r", number: 12 });
+  expect(plan(["api", "--method", "put", "https://api.github.com/repos/o/r/pulls/12/merge?x=1"])).toEqual({ kind: "rest", repo: "o/r", number: 12 });
+  expect(plan(["api", "-X", "PUT", "repos/{owner}/{repo}/pulls/12/merge"])).toEqual({ kind: "rest", repo: undefined, number: 12 });
+  expect(plan(["api", "repos/o/r/pulls/12/merge", "-f", "merge_method=squash"])).toEqual({ kind: "rest", repo: "o/r", number: 12 });
+  expect(plan(["api", "repos/o/r/pulls/12/merge"])).toEqual({ kind: "none" });
+  expect(plan(["api", "-X", "PATCH", "repos/o/r/pulls/12"])).toEqual({ kind: "none" });
+  expect(plan(["api", "-X", "POST", "repos/o/r/merges", "-f", "base=main"])).toMatchObject({ kind: "refuse" });
+  expect(plan(["api", "-X", "PUT", "repos/o/r/pulls/{number}/merge"])).toMatchObject({ kind: "refuse" });
+  expect(plan(["api", "-X", "PUT", "repos/o/r/pulls/12/%6Derge"])).toMatchObject({ kind: "refuse" });
+  expect(plan(["api", "-X", "PUT", "repos/o/r/pulls/12/x/../merge"])).toMatchObject({ kind: "refuse" });
+  expect(plan(["api", "graphql", "-f", "query=q"])).toEqual({ kind: "graphql" });
+});
+
+test("a GraphQL merge mutation's pull request ids are read from the query or its variables", () => {
+  expect(graphqlMergeIds('mutation { mergePullRequest(input: {pullRequestId: "PR_1"}) { clientMutationId } }', {})).toEqual(["PR_1"]);
+  expect(graphqlMergeIds("mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }", { id: "PR_2" })).toEqual(["PR_2"]);
+  expect(graphqlMergeIds("query { viewer { login } }", {})).toEqual([]);
+  expect(graphqlMergeIds("mutation($input: MergePullRequestInput!) { mergePullRequest(input: $input) { clientMutationId } }", { input: { pullRequestId: "PR_3" } })).toHaveProperty("refuse");
+  expect(graphqlMergeIds("mutation($id: ID!) { mergePullRequest(input: {pullRequestId: $id}) { clientMutationId } }", {})).toHaveProperty("refuse");
+  expect(graphqlMergeIds('mutation { a: mergePullRequest(input: {pullRequestId: "PR_1"}) { x } b: mergePullRequest(input: $i) { x } }', {})).toHaveProperty("refuse");
+  expect(graphqlMergeIds('mutation { mergeBranch(input: {repositoryId: "R", base: "main", head: "x"}) { x } }', {})).toHaveProperty("refuse");
+});
+
+test("an agent's gh api merge runs only when gh pr merge would", async () => {
+  const here = parseRepo("johnrees/widget");
+  const calls: string[] = [];
+  const unmet = world({ rules: REQUIRED });
+  expect(await gateRefusal(dispatchGh(["api", "-X", "PUT", "repos/{owner}/{repo}/pulls/12/merge"], here, mergeDeps(unmet.io, calls)))).toContain(
+    "has not passed every check main requires (`build` missing, `agent-review` missing)",
+  );
+  const mutation = 'mutation { mergePullRequest(input: {pullRequestId: "PR_12"}) { clientMutationId } }';
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=${mutation}`], here, mergeDeps(unmet.io, calls)))).toContain("has not passed every check main requires");
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "--input", "body.json"], undefined, mergeDeps(unmet.io, calls, { "body.json": JSON.stringify({ query: mutation }) })))).toContain(
+    "has not passed every check main requires",
+  );
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-F", "query=@-"], here, mergeDeps(unmet.io, calls)))).toBe(
+    "cannot read the GraphQL query `gh api graphql` sends; pass it with `-f query=...` or `--input <file>`",
+  );
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", "id=PR_12"], here, mergeDeps(unmet.io, calls)))).toContain("cannot read the GraphQL query");
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "--input", "missing.json"], here, mergeDeps(unmet.io, calls)))).toContain("cannot read the GraphQL query");
+  expect(await gateRefusal(dispatchGh(["api", "-X", "POST", "repos/johnrees/widget/merges"], here, mergeDeps(unmet.io, calls)))).toContain("merges endpoint");
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", 'query=mutation { mergePullRequest(input: {pullRequestId: "MDQ6VXNlcjE="}) { x } }'], here, mergeDeps(unmet.io, calls)))).toBe(
+    "a GraphQL merge mutation names a node that is not a pull request agent-gh can find",
+  );
+  expect(calls).toEqual([]);
+  const passed = world({ rules: REQUIRED, ...PASSED });
+  expect(await dispatchGh(["api", "-X", "PUT", "repos/johnrees/widget/pulls/12/merge"], here, mergeDeps(passed.io, calls))).toBe(0);
+  expect(await dispatchGh(["api", "graphql", "-F", "query=@q.graphql"], here, mergeDeps(passed.io, calls, { "q.graphql": mutation }))).toBe(0);
+  expect(await dispatchGh(["api", "graphql", "-f", "query=query { viewer { login } }"], here, mergeDeps(unmet.io, calls))).toBe(0);
+  expect(await dispatchGh(["api", "repos/johnrees/widget/pulls/12/merge"], here, mergeDeps(unmet.io, calls))).toBe(0);
+  expect(calls).toEqual([
+    "gh api -X PUT repos/johnrees/widget/pulls/12/merge",
+    "gh api graphql -F query=@q.graphql",
+    "ungated gh api graphql -f query=query { viewer { login } }",
+    "ungated gh api repos/johnrees/widget/pulls/12/merge",
+  ]);
 });
 
 test("a waiver history longer than the gate reads is not trusted", async () => {
@@ -694,7 +804,7 @@ const realRepo = () => {
   const io = {
     family: "codex",
     git: async (args: readonly string[], input?: string) => git(args, input),
-    runCheck: (command: string, cwd: string) => spawnCheck(command, cwd, env),
+    runCheck: (command: string, cwd: string, timeoutMs: number) => spawnCheck(command, cwd, env, timeoutMs),
     tempDir: () => mkdtempSync(join(home, "tmp-")),
     print: (line: string) => printed.push(line),
   } as unknown as ReviewIo;
@@ -761,7 +871,20 @@ test("the patch id names the change, not its base: a rebase over unrelated work 
 
 test("a check runs through the shell in its directory, with stderr in its output and without the caller's harness", async () => {
   const dir = mkdtempSync(join(tmpdir(), "agent-gh-check-"));
-  const result = await spawnCheck('echo "in $(pwd) claude=${CLAUDECODE:-unset}"; echo oops >&2; exit 4', dir, { PATH: process.env.PATH ?? "", CLAUDECODE: "1" });
-  expect(result).toEqual({ code: 4, output: `in ${realpathSync(dir)} claude=unset\noops\n` });
+  const result = await spawnCheck('echo "in $(pwd) claude=${CLAUDECODE:-unset}"; echo oops >&2; exit 4', dir, { PATH: process.env.PATH ?? "", CLAUDECODE: "1" }, 60_000);
+  expect(result).toEqual({ code: 4, output: `in ${realpathSync(dir)} claude=unset\noops\n`, timedOut: false });
   expect(readdirSync(dir)).toEqual([]);
+});
+
+test("a check past its timeout is stopped with everything it started", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-gh-check-"));
+  const started = Date.now();
+  // The background child would keep the output open, and the check running, if only the shell were stopped.
+  const marker = `late-${process.pid}-${Date.now()}`;
+  const result = await spawnCheck(`echo begun; (sleep 20; touch ${marker}) & sleep 20`, dir, { PATH: process.env.PATH ?? "" }, 300);
+  expect(result).toMatchObject({ output: "begun\n", timedOut: true });
+  expect(Date.now() - started).toBeLessThan(5_000);
+  const running = () => Bun.spawnSync(["pgrep", "-f", marker]).stdout.toString().trim();
+  for (let wait = 0; wait < 40 && running() !== ""; wait++) await Bun.sleep(50);
+  expect(running()).toBe("");
 });

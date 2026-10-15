@@ -101,7 +101,7 @@ const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): Re
     const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
     return code === 0 ? out.trim() : undefined;
   },
-  runCheck: (command, cwd) => spawnCheck(command, cwd, process.env),
+  runCheck: (command, cwd, timeoutMs) => spawnCheck(command, cwd, process.env, timeoutMs),
   runReviewer: async (command, stdin, cwd) => {
     const dir = mkdtempSync(join(tmpdir(), "agent-gh-reviewer-"));
     const log = join(dir, "stderr.log");
@@ -330,6 +330,13 @@ const main = async (argv: readonly string[]): Promise<number> => {
   }
   return dispatchGh(args, repo, {
     withToken: (target, use) => withToken({ ...context, repo: target }, use),
+    readFile: async (path) => {
+      try {
+        return await Bun.file(path).text();
+      } catch {
+        return undefined;
+      }
+    },
     io: (target, childEnv) => reviewIo({ ...context, repo: target }, target, childEnv),
     runWith: async (ghArgs, childEnv) => (await runChild(["gh", ...ghArgs], childEnv)).code,
     run: (ghArgs) => runAs(context, ["gh", ...ghArgs]),
