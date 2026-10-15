@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { runChild } from "./child.ts";
 import { parseClaimArgs, sessionId as claimSession } from "./claim.ts";
 import { claim, type ClaimIo, claimsLines, eventIssues, listClaims, release, syncLabels } from "./claim-run.ts";
+import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, wavesLines } from "./next-run.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
 import { doctor } from "./doctor.ts";
@@ -68,6 +69,11 @@ const USAGE = `usage:
                                     take an issue before working on it: refuse a closed or taken one, else open a draft
                                     pull request closing it (--refs: referencing it) from a new <family>/<N>-<slug> branch,
                                     or (--no-pr) post a claim comment; a claim that loses a race undoes itself
+  agent-gh claim --next [--refs|--no-pr] [-R repo]
+                                    claim the first issue \`next\` offers; after a lost race, the next one (at most three)
+  agent-gh next [--json] [--waves] [-R repo]
+                                    the issues an agent may take, the next first: open, ready, queued (where a Queue issue
+                                    is configured), unblocked, and unclaimed; --waves: the blocked_by graph in waves
   agent-gh release <N> [-R repo]    release this session's claim: close its still-empty draft, or post a release comment
   agent-gh claims [--json] [-R repo]
                                     list live claims with their holder and last push and comment (--json: the stable form)
@@ -285,9 +291,16 @@ const claimCommand = async (first: string, rest: readonly string[], env: NodeJS.
   }
   const repo = await resolveRepo("gh", rest, env, () => originUrl(process.cwd()));
   if (repo === undefined) throw new Failure("resolving the repository", "no -R, GH_REPO, or github.com origin remote; run it inside a clone of the repository or pass -R OWNER/REPO");
-  if (parsed.command === "claims" && !inAgentSession(env)) {
+  const showNext = async (io: { api: typeof GITHUB; token: string; repo: Repo }, options: { readonly json: boolean; readonly waves: boolean }) => {
+    const result = await nextIssues(repo, apiReader(io));
+    const value = options.waves ? (options.json ? wavesJson(repo, result) : wavesLines(result, print)) : options.json ? nextJson(repo, result) : nextLines(result, print);
+    process.stdout.write(Array.isArray(value) ? `${value.join("\n")}\n` : `${JSON.stringify(value, null, 2)}\n`);
+    return 0;
+  };
+  if ((parsed.command === "claims" || parsed.command === "next") && !inAgentSession(env)) {
     // A person's listing reads with the read App.
     const token = await readToken({ api: GITHUB, dir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) });
+    if (parsed.command === "next") return showNext({ api: GITHUB, token, repo }, parsed);
     const list = await listClaims({ api: GITHUB, token, repo });
     process.stdout.write(parsed.json ? `${JSON.stringify(list, null, 2)}\n` : `${claimsLines(list, Date.now()).join("\n")}\n`);
     return 0;
@@ -306,6 +319,11 @@ const claimCommand = async (first: string, rest: readonly string[], env: NodeJS.
       return 0;
     }
     if (parsed.command === "release") return release(io, parsed.issue);
+    if (parsed.command === "next") return showNext(io, parsed);
+    if (parsed.command === "claim-next") {
+      if (session.generated) print(`agent-gh: no session id in the environment; this claim's is ${session.id}: set AGENT_GH_SESSION=${session.id} to release it later`);
+      return claimNext(io, apiReader(io), parsed);
+    }
     if (session.generated) print(`agent-gh: no session id in the environment; this claim's is ${session.id}: set AGENT_GH_SESSION=${session.id} to release it later`);
     return claim(io, parsed);
   });
@@ -492,7 +510,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     await login(family, deviceDeps());
     return 0;
   }
-  if (first === "claim" || first === "release" || first === "claims") return claimCommand(first, rest, env);
+  if (first === "claim" || first === "release" || first === "claims" || first === "next") return claimCommand(first, rest, env);
   const review = first === "review" ? reviewOptions(rest) : undefined;
   const replying = first === "reply" ? replyOptions(rest) : undefined;
   const notifying = first === "notify" ? await notifyOptions(rest) : undefined;

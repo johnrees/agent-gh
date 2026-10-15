@@ -180,6 +180,14 @@ jobs:
 
 A claim pull request is a draft with an agent's empty commit, so the agent-review workflow sets it pending ("needs a review"), one run when it opens and one per later event, as for any draft. It does not skip drafts: `review full` runs before `gh pr ready`, while the pull request is still a draft, and with `status_writer` `"actions"` it waits for the workflow's status. `gh pr ready` still needs a review, so a claim cannot slip through.
 
+### What to take next
+
+`agent-gh next [--json] [-R OWNER/REPO]` prints the issues an agent may take, the next first: open, labelled `ready`, listed in the repository's Queue issue where one is configured, with every `blocked_by` blocker closed, and unclaimed. Claimed ones are noted on stderr as in progress. It comes from soltui's `scripts/next-issues.ts`: a Queue entry is a numbered list item, and its first `#N` is the issue it queues; other mentions are context. The Queue is configured in `.github/agent-review.json` on the default branch, `"queue": {"issue": 735, "label": "ready"}` (both optional; `label` defaults to `ready`). Without a Queue it says so and falls back to every open `ready` issue. `--json` gives `{"v":1,"repo","queue","label","issues":[{"issue","title","claim"}]}`, where `claim` is null or the holder's `kind`, `pr`, `url`, `family`, and `session`.
+
+`agent-gh next --waves [--json]` lays out the dependency graph for parallel workers: the queued and `ready` issues and, transitively, their open blockers in this repository (a blocker in another repository is read, never followed or offered; a closed one is resolved). Wave 1 is the frontier, every issue with no open blocker: workable, in progress (claimed), or unblocked but not dispatched (not `ready` or not queued). Each later wave waits only on earlier ones, and each issue names what it waits on. Within a wave the Queue's order comes first, then the issues that unblock the most, then the lowest number; plain `next` is wave 1's workable issues in that order. Issues on a cycle, or behind one or behind an open issue in another repository, are listed as stuck with the cycle, and never offered. It schedules nothing.
+
+`agent-gh claim --next [--refs|--no-pr]` claims the first issue `next` offers. When that claim loses a race, it reads the frontier again and tries the next one, three times at most, so several workers running it spread across the frontier.
+
 ## Development
 
 `bun test` (offline: a fake GitHub API, real throwaway repositories and hooks, the shim under real shells, and `install.sh` against a fake release), `bun run typecheck`, `bun run build`. `bun run install-local` installs a checkout's build. A `v*` tag publishes a release with `SHA256SUMS`.
