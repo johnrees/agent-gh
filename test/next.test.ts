@@ -131,7 +131,7 @@ test("next reads the Queue, the ready issues, their blockers transitively, and t
   expect(notes).toEqual(["agent-gh: #3 T3: in progress: #31 by codex t"]);
   expect(nextJson(REPO, result)).toEqual({
     v: 1, repo: "johnrees/widget", queue: 100, label: "go",
-    issues: [{ issue: 2, title: "T2", claim: null }, { issue: 3, title: "T3", claim: { kind: "pr", pr: 31, url: "", family: "codex", session: "t" } }],
+    issues: [{ issue: 2, title: "T2", priority: null, claim: null }, { issue: 3, title: "T3", priority: null, claim: { kind: "pr", pr: 31, url: "", family: "codex", session: "t" } }],
   });
   expect(wavesJson(REPO, result).waves[1]).toEqual({ wave: 2, issues: [expect.objectContaining({ issue: 4, queued: 0, waiting_on: ["#5"] })] });
   expect(wavesLines(result, () => {})).toEqual([
@@ -226,5 +226,39 @@ test("claim --next stops when a claim stands unconfirmed, rather than claiming a
 
 test("a cycle is shown as the issues that block one another, not as a path", () => {
   const result = graph([node(1, [blocker(4)]), node(3, [blocker(1)]), node(2, [blocker(3)]), node(4, [blocker(2)])]);
-  expect(wavesLines({ ...result, config: { issue: undefined, label: "ready" }, queued: true }, () => {}).at(-1)).toBe("Cycle: #1, #2, #3, #4 block one another");
+  expect(wavesLines({ ...result, config: { issue: undefined, label: "ready", priorityLabels: [] }, queued: true }, () => {}).at(-1)).toBe("Cycle: #1, #2, #3, #4 block one another");
+});
+
+const high = { priority: { label: "priority:high", rank: 0 } };
+const low = { priority: { label: "priority:low", rank: 2 } };
+
+test("a queued low-priority issue still comes before an unqueued high one", () => {
+  expect(graph([node(1, [], low), node(2, [], high)], [1]).waves[0]?.map((item) => [item.issue, item.priority])).toEqual([[1, "priority:low"], [2, "priority:high"]]);
+});
+
+test("among unqueued issues, a higher priority comes before one that unblocks more", () => {
+  expect(graph([node(1, [], high), node(2, [], low), node(3, [blocker(2)])]).waves[0]?.map((item) => item.issue)).toEqual([1, 2]);
+});
+
+const prioritized = (priorityLabels?: string[]) =>
+  reader({
+    ...BASE,
+    ...(priorityLabels === undefined ? {} : { "repos/johnrees/widget/contents/.github/agent-review.json?ref=main": config({ queue: { priority_labels: priorityLabels } }) }),
+    "repos/johnrees/widget/issues?state=open&labels=ready": [issue(2, ["ready"]), issue(4, ["ready", "priority:medium", "P0"]), issue(6, ["ready", "priority:low", "priority:high"]), issue(8, ["ready", "P1"])],
+    ...Object.fromEntries([2, 4, 6, 8].map((number) => [`repos/johnrees/widget/issues/${number}/comments`, []])),
+  });
+
+test("with no Queue, next orders by priority label, an issue with two taking the higher; the labels are configurable, and [] turns them off", async () => {
+  const order = async (labels?: string[]) => {
+    const result = await nextIssues(REPO, prioritized(labels).read);
+    return frontier(result).map((item) => [item.issue, item.priority]);
+  };
+  expect(await order()).toEqual([[6, "priority:high"], [4, "priority:medium"], [2, null], [8, null]]);
+  expect(await order(["P0", "P1"])).toEqual([[4, "P0"], [8, "P1"], [2, null], [6, null]]);
+  expect(await order([])).toEqual([[2, null], [4, null], [6, null], [8, null]]);
+  const result = await nextIssues(REPO, prioritized().read);
+  expect(nextJson(REPO, result).issues[0]).toEqual({ issue: 6, title: "T6", priority: "priority:high", claim: null });
+  expect(wavesLines(result, () => {})[1]).toBe("  #6 T6 (priority:high)");
+  const bad = reader({ ...BASE, "repos/johnrees/widget/contents/.github/agent-review.json?ref=main": config({ queue: { priority_labels: "priority:high" } }) });
+  await expect(nextIssues(REPO, bad.read)).rejects.toThrow("queue.priority_labels must be a list of label names");
 });

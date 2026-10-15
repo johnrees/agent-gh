@@ -40,13 +40,16 @@ export const apiReader = (io: ApiIo, maxPages = 30): Read => async (endpoint) =>
   throw new Failure(STAGE, `/${endpoint.split("?")[0]} lists over ${maxPages * 100} items`);
 };
 
-export type QueueConfig = { readonly issue: number | undefined; readonly label: string };
+export type QueueConfig = { readonly issue: number | undefined; readonly label: string; readonly priorityLabels: readonly string[] };
+
+/** penmon's and soltui's priority labels, highest first. */
+export const DEFAULT_PRIORITY_LABELS = ["priority:high", "priority:medium", "priority:low"];
 
 /** `queue` in the review config on the default branch: `{"issue": N, "label": "ready"}`, both optional. */
 export const queueConfig = async (repo: Repo, read: Read): Promise<QueueConfig> => {
   const base = text(record(await read(`repos/${slug(repo)}`)).default_branch);
   const file = await read(`repos/${slug(repo)}/contents/${CONFIG_PATH}?ref=${encodeURIComponent(base)}`);
-  if (file === undefined) return { issue: undefined, label: "ready" };
+  if (file === undefined) return { issue: undefined, label: "ready", priorityLabels: DEFAULT_PRIORITY_LABELS };
   let config: unknown;
   try {
     config = JSON.parse(Buffer.from(text(record(file).content), "base64").toString("utf8"));
@@ -54,14 +57,18 @@ export const queueConfig = async (repo: Repo, read: Read): Promise<QueueConfig> 
     throw new Failure(STAGE, `${CONFIG_PATH} on ${base} is not valid JSON`);
   }
   const queue = record(config).queue;
-  if (queue === undefined) return { issue: undefined, label: "ready" };
+  if (queue === undefined) return { issue: undefined, label: "ready", priorityLabels: DEFAULT_PRIORITY_LABELS };
   const value = record(queue);
-  if (typeof queue !== "object" || queue === null || Array.isArray(queue) || Object.keys(value).some((key) => key !== "issue" && key !== "label")) {
-    throw new Failure(STAGE, `${CONFIG_PATH}: queue takes issue and label`);
+  if (typeof queue !== "object" || queue === null || Array.isArray(queue) || Object.keys(value).some((key) => !["issue", "label", "priority_labels"].includes(key))) {
+    throw new Failure(STAGE, `${CONFIG_PATH}: queue takes issue, label, and priority_labels`);
   }
   if (value.issue !== undefined && !(Number.isSafeInteger(value.issue) && (value.issue as number) > 0)) throw new Failure(STAGE, `${CONFIG_PATH}: queue.issue must be an issue number`);
   if (value.label !== undefined && (typeof value.label !== "string" || value.label.trim() === "")) throw new Failure(STAGE, `${CONFIG_PATH}: queue.label must be a label name`);
-  return { issue: value.issue as number | undefined, label: (value.label as string | undefined) ?? "ready" };
+  const priority = value.priority_labels;
+  if (priority !== undefined && !(Array.isArray(priority) && priority.every((name) => typeof name === "string" && name.trim() !== ""))) {
+    throw new Failure(STAGE, `${CONFIG_PATH}: queue.priority_labels must be a list of label names, highest first ([] for none)`);
+  }
+  return { issue: value.issue as number | undefined, label: (value.label as string | undefined) ?? "ready", priorityLabels: (priority as string[] | undefined) ?? DEFAULT_PRIORITY_LABELS };
 };
 
 /** `owner/name` of an issue's `repository_url`. */
@@ -105,7 +112,9 @@ export const nextIssues = async (repo: Repo, read: Read): Promise<NextResult> =>
     for (const blocker of blockers) if (blocker.repo === undefined && blocker.open) todo.push(blocker.number);
     const dispatched = readyNumbers.has(number) && (queue === undefined || queue.includes(number));
     const holder = dispatched ? taken(repo, issue, pulls, list(await read(`repos/${name}/issues/${number}/comments`))).holder : undefined;
-    nodes.set(number, { number, title: text(issue.title), dispatched, blockers, claim: holder });
+    const names = list(issue.labels).map((item) => text(record(item).name));
+    const rank = config.priorityLabels.findIndex((name) => names.includes(name));
+    nodes.set(number, { number, title: text(issue.title), dispatched, blockers, claim: holder, ...(rank === -1 ? {} : { priority: { label: config.priorityLabels[rank] as string, rank } }) });
   }
   return { ...waves({ queue, nodes }), config, queued: queue !== undefined };
 };
@@ -115,7 +124,7 @@ const claimNote = (item: WaveIssue) =>
 
 /** The note when no Queue is configured: the order falls back to issue numbers. */
 const fallback = (result: NextResult) =>
-  `agent-gh: no Queue issue is configured (\`queue.issue\` in ${CONFIG_PATH}); falling back to open \`${result.config.label}\` issues, the ones that unblock the most first, then by number`;
+  `agent-gh: no Queue issue is configured (\`queue.issue\` in ${CONFIG_PATH}); falling back to open \`${result.config.label}\` issues by priority label, then the ones that unblock the most, then by number`;
 
 /** Plain `next`: one workable issue per line, the next first; claimed ones go to `print`. */
 export const nextLines = (result: NextResult, print: (line: string) => void): string[] => {
@@ -134,7 +143,7 @@ export const nextJson = (repo: Repo, result: NextResult) => ({
   repo: slug(repo),
   queue: result.config.issue ?? null,
   label: result.config.label,
-  issues: frontier(result).map((item) => ({ issue: item.issue, title: item.title, claim: item.claim })),
+  issues: frontier(result).map((item) => ({ issue: item.issue, title: item.title, priority: item.priority, claim: item.claim })),
 });
 
 /** `next --waves --json`. */
@@ -154,6 +163,7 @@ export const wavesLines = (result: NextResult, print: (line: string) => void): s
   const line = (item: WaveIssue) => {
     const notes = [
       item.queued === null ? "" : `queue ${item.queued + 1}`,
+      item.priority ?? "",
       item.unblocks === 0 ? "" : `unblocks ${item.unblocks}`,
       item.waiting_on.length === 0 ? "" : `waits on ${item.waiting_on.join(", ")}`,
       item.state === "not_dispatched" ? `not dispatched` : "",

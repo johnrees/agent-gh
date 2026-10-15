@@ -34,6 +34,8 @@ export type Node = {
   readonly blockers: readonly Blocker[];
   /** The claim holding it, if any. */
   readonly claim: Claim | undefined;
+  /** Its highest priority label, and that label's rank (0 highest); undefined for none. */
+  readonly priority?: { readonly label: string; readonly rank: number };
 };
 
 export type GraphInput = {
@@ -55,6 +57,8 @@ export type WaveIssue = {
   readonly waiting_on: readonly string[];
   /** How many issues of the graph wait on it, directly or not. */
   readonly unblocks: number;
+  /** Its highest priority label, or null. */
+  readonly priority: string | null;
   readonly claim: { readonly kind: "pr" | "comment"; readonly pr: number | null; readonly url: string; readonly family: string | null; readonly session: string | null } | null;
 };
 
@@ -117,7 +121,8 @@ const cyclesOf = (nodes: ReadonlyMap<number, Node>, edges: (number: number) => n
 
 /**
  * Layers the graph into waves and orders each: the Queue's order first,
- * then the issues that unblock the most, then by number. An issue on a
+ * then the highest priority label, then the issues that unblock the most,
+ * then by number. An issue on a
  * cycle, or waiting (directly or not) on one or on an open issue in another
  * repository, is stuck and never offered.
  */
@@ -166,10 +171,17 @@ export const waves = (input: GraphInput): Waves => {
     const waitingOn = node.blockers.filter((blocker) => blocker.open).map(ref);
     const state: IssueState = layer !== 1 ? "waiting" : !node.dispatched ? "not_dispatched" : node.claim !== undefined ? "in_progress" : "workable";
     const claim = node.claim === undefined ? null : { kind: node.claim.kind, pr: node.claim.pr, url: node.claim.url, family: node.claim.family, session: node.claim.session };
-    return { issue: number, title: node.title, state, queued: queued(number), waiting_on: waitingOn, unblocks: unblocks(number), claim };
+    return { issue: number, title: node.title, state, queued: queued(number), waiting_on: waitingOn, unblocks: unblocks(number), priority: node.priority?.label ?? null, claim };
   };
+  const rank = (item: WaveIssue) => nodes.get(item.issue)?.priority?.rank ?? Number.MAX_SAFE_INTEGER;
   const order = (a: WaveIssue, b: WaveIssue) =>
-    a.queued !== null && b.queued !== null ? a.queued - b.queued : a.queued !== null ? -1 : b.queued !== null ? 1 : b.unblocks - a.unblocks || a.issue - b.issue;
+    a.queued !== null && b.queued !== null
+      ? a.queued - b.queued
+      : a.queued !== null
+        ? -1
+        : b.queued !== null
+          ? 1
+          : rank(a) - rank(b) || b.unblocks - a.unblocks || a.issue - b.issue;
   const layers: WaveIssue[][] = [];
   const stuck: WaveIssue[] = [];
   for (const number of nodes.keys()) {
