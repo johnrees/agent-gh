@@ -17,6 +17,18 @@ test("the required checks are every ruleset's and classic protection's, once eac
 
 const run = (name: string, conclusion: string | null, app = 15368, status = "completed") => ({ name, status, conclusion, app: { id: app } });
 
+test("only the newest run of a required check counts, as GitHub judges it", () => {
+  const build = { context: "build", app: 15368 };
+  const at = (conclusion: string | null, started_at: string, id: number, status = "completed") => ({ ...run("build", conclusion, 15368, status), started_at, id });
+  // penmon #387: the draft's run failed, the ready run passed.
+  expect(checkState(build, [], [at("failure", "2026-10-15T14:20:56Z", 1), at("success", "2026-10-15T14:23:57Z", 2)])).toBe("passed");
+  expect(checkState(build, [], [at("success", "2026-10-15T14:20:56Z", 1), at("failure", "2026-10-15T14:23:57Z", 2)])).toBe("failed");
+  expect(checkState(build, [], [at("success", "2026-10-15T14:20:56Z", 1), at(null, "2026-10-15T14:23:57Z", 2, "in_progress")])).toBe("pending");
+  // Same start: the later id wins; another App's newer run is not the required App's.
+  expect(checkState(build, [], [at("failure", "2026-10-15T14:20:56Z", 1), at("success", "2026-10-15T14:20:56Z", 2)])).toBe("passed");
+  expect(checkState(build, [], [at("failure", "2026-10-15T14:20:56Z", 1), { ...at("success", "2026-10-15T14:23:57Z", 2), app: { id: 99 } }])).toBe("failed");
+});
+
 test("a required check passes only when every matching run or status passed", () => {
   const build = { context: "build", app: 15368 };
   expect(checkState(build, [], [run("build", "success")])).toBe("passed");

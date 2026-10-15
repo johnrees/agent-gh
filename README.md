@@ -115,9 +115,9 @@ on:
 permissions: {}
 jobs:
   agent-review:
-    uses: johnrees/agent-gh/.github/workflows/agent-review.yml@v0.7.0
+    uses: johnrees/agent-gh/.github/workflows/agent-review.yml@v0.8.0
     with:
-      version: v0.7.0 # the agent-gh release that sets the statuses
+      version: v0.8.0 # the agent-gh release that sets the statuses
     # Declaring permissions drops the defaults, so each read is named, though nothing is checked out:
     # contents (the config, compare, fetching commits), pull-requests (the PR, its commits and reviews),
     # issues (comments, labels' events, reactions, closing issues), statuses (read and set them).

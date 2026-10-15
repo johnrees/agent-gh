@@ -42,17 +42,33 @@ export type CheckState = "passed" | "failed" | "pending" | "missing";
 
 const PASSING = ["success", "neutral", "skipped"];
 
+const started = (run: Record<string, unknown>) => (typeof run.started_at === "string" ? run.started_at : "");
+const runId = (run: Record<string, unknown>) => (Number.isSafeInteger(run.id) ? (run.id as number) : 0);
+
+/** The runs that started last (by `started_at`, then `id`): the ones GitHub judges a required check by. */
+const newest = (runs: Record<string, unknown>[]): Record<string, unknown>[] => {
+  const last = runs.reduce<Record<string, unknown> | undefined>(
+    (best, run) => (best === undefined || started(run) > started(best) || (started(run) === started(best) && runId(run) > runId(best)) ? run : best),
+    undefined,
+  );
+  return last === undefined ? [] : runs.filter((run) => started(run) === started(last) && runId(run) === runId(last));
+};
+
 /**
  * Whether a commit passed a required check, from its statuses, latest first,
- * and the check runs named `check.context` (the latest of each suite). Every
- * matching run must pass. A check tied to an App counts only that App's
+ * and the check runs named `check.context` (the latest of each suite). Only
+ * the newest matching run counts, as GitHub's own rules judge it: a draft's
+ * failed run in one workflow run is superseded by the ready one's pass in
+ * the next. Runs started together (or undated) must all pass. A check tied to an App counts only that App's
  * check runs and statuses: for one, `statuses` must give each status's
  * `app_id` (the App whose bot set it), and a status without it never counts.
  */
 export const checkState = (check: RequiredCheck, statuses: unknown, runs: unknown): CheckState => {
-  const matching = list(runs)
-    .map(record)
-    .filter((run) => run.name === check.context && (check.app === undefined || record(run.app).id === check.app));
+  const matching = newest(
+    list(runs)
+      .map(record)
+      .filter((run) => run.name === check.context && (check.app === undefined || record(run.app).id === check.app)),
+  );
   const status = list(statuses).map(record).find((entry) => entry.context === check.context && (check.app === undefined || entry.app_id === check.app));
   if (matching.length === 0 && status === undefined) return "missing";
   if (matching.some((run) => run.status === "completed" && !PASSING.includes(run.conclusion as string))) return "failed";
