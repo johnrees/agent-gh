@@ -494,6 +494,20 @@ test("when the pull request is refused and the open pull requests cannot then be
   expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], a.dir).stdout).toBe("main");
 });
 
+test("a claim whose pull request GitHub opened, though its answer was lost, goes on with it", async () => {
+  const w = world();
+  const open = w.routes[`POST ${PATH}/pulls`] as (body: string, url: URL) => Response;
+  w.routes[`POST ${PATH}/pulls`] = (body, url) => (open(body, url), reply(502, {}));
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  expect(await claim(a.io, { issue: 7, refs: false, noPr: false })).toBe(0);
+  expect(a.printed.join("\n")).toContain("GitHub opened this claim's #31, though its answer to the request was lost");
+  expect(w.state.pulls[0]?.state).toBe("open");
+  expect(w.state.deleted).toEqual([]);
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], a.dir).stdout).toBe("claude/7-fix-the-widget");
+  expect(w.state.issues[0]?.labels).toEqual([{ name: "claimed" }]);
+});
+
 test("a session that read the issue as free and finds its branch's pull request already open names the holder", async () => {
   const w = world({ pulls: [pull(30, `Closes #7.\n${marker(7, "claude", "first")}`, { head: { ref: "claude/7-fix-the-widget", sha: "a".repeat(40), repo: { full_name: "johnrees/widget" } } })] });
   w.state.staleReads = 1;

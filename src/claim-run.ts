@@ -12,6 +12,7 @@ import {
   claimCommentBody,
   claimCommitMessage,
   type ClaimMarker,
+  claimsOn,
   DEFAULT_CLAIM_LABEL,
   describeClaim,
   emptyClaim,
@@ -247,8 +248,8 @@ export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number>
   await git(io, stage, ["fetch", "-q", "origin", `+refs/heads/${base}:refs/remotes/origin/${base}`]);
   await git(io, stage, ["switch", "-q", "--no-track", "-c", branch, `refs/remotes/origin/${base}`]);
   let pushed = false;
-  let pr: number;
-  let url: string;
+  let pr = 0;
+  let url = "";
   try {
     // The commit-msg hook adds the session's Agent-* trailers and co-author.
     await git(io, stage, ["commit", "-q", "--allow-empty", "-m", claimCommitMessage(number, title)]);
@@ -276,19 +277,28 @@ export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number>
     // nor is one whose pull requests cannot be read, since another session's may use it.
     let used = false;
     let unread = false;
+    let own: Claim | undefined;
     if (pushed) {
       try {
-        used = (await openPulls(io, stage)).some((item) => text(record(record(item).head).ref) === branch);
+        const open = await openPulls(io, stage);
+        used = open.some((item) => text(record(record(item).head).ref) === branch);
+        // One carrying this claim's own marker is this claim's: GitHub opened it, and only its answer was lost.
+        own = claimsOn(io.repo, number, open, []).find((item) => item.kind === "pr" && item.id === marker.id && item.branch === branch);
       } catch {
         unread = true;
       }
     }
-    await dropBranch(io, stage, branch, previous, pushed && !used && !unread);
-    if (unread) io.print(`agent-gh: could not read ${slug(io.repo)}'s open pull requests, so ${branch} is left on GitHub in case another session's uses it; delete it if none does`);
-    const holder = used ? (await claimState(io, stage, issue)).holder : undefined;
-    if (holder === undefined) throw error;
-    io.print(`agent-gh: #${number} went to ${describeClaim(holder)} first, on the same branch; this claim opened nothing. Pick another issue.`);
-    return 1;
+    if (own === undefined) {
+      await dropBranch(io, stage, branch, previous, pushed && !used && !unread);
+      if (unread) io.print(`agent-gh: could not read ${slug(io.repo)}'s open pull requests, so ${branch} is left on GitHub in case another session's uses it; delete it if none does`);
+      const holder = used ? (await claimState(io, stage, issue)).holder : undefined;
+      if (holder === undefined) throw error;
+      io.print(`agent-gh: #${number} went to ${describeClaim(holder)} first, on the same branch; this claim opened nothing. Pick another issue.`);
+      return 1;
+    }
+    pr = own.pr as number;
+    url = own.url;
+    io.print(`agent-gh: GitHub opened this claim's #${pr}, though its answer to the request was lost; reading the claims back`);
   }
   const after = await readBack(io, stage, number, (item) => item.pr === pr);
   if (after === undefined) {
