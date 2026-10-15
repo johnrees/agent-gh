@@ -144,6 +144,42 @@ To make both required: in the repository's settings, Rules, Rulesets, edit the d
 - `agent-gh notify <issue or pr> --severity P0|P1|P2 --body "<text>" | --body-file <file|-> [--from <issue or pr>]` posts a finding on another thread, linked back to `--from` or the current branch's pull request, and refuses without one. A P3 needs no answer, so it is no notify. Its id is a hash of its thread and text, so the same notify twice is refused. Its marker, `<!-- agent-notify {"v":1,"id":"<hex>","severity":"P1","session":"claude:<id>"} -->`, names the harness session that sent it where the harness tells (Claude Code, Codex, pi).
 - A reply carries `<!-- agent-reply {"v":1,"to":"<id>"} -->` (with the session too) and never needs an answer itself; neither command posts text holding an agent-gh marker of its own, so two agents cannot start a loop.
 
+## Claims
+
+An agent claims an issue when it starts work, so parallel sessions see what is taken and never start the same issue by accident. A repository opts in by saying so in its own agent docs; the managed instructions do not tell agents to claim, since a claim opens a branch and a pull request.
+
+- `agent-gh claim <N>`, in a clone with no uncommitted changes: refuses, naming the holder, an issue that is closed or taken (below). Otherwise it fetches the default branch, creates `<family>/<N>-<slug>` from it with one empty commit (the commit-msg hook credits the session; the message is the issue's title and `Refs #N`, so a squash merge reads well), pushes it (never over an existing branch), and opens a draft pull request whose description says `Closes #N` (`--refs`: `Refs #N`, for work that will not finish the issue) and carries a claim marker, `<!-- agent-claim {"v":1,"issue":N,"family":"claude","session":"…","id":"…"} -->`. Keep the marker when rewriting the description. It then reads the claims back: if an earlier claim holds the issue, it closes its own pull request, deletes its branch, returns to where it was, and exits nonzero naming the winner. `--no-pr`, for an issue with no code (research, a decision), claims with a comment carrying the marker instead, under the same check, and a losing comment posts its own release.
+- The session is `AGENT_GH_SESSION` if set, else Claude Code's `CLAUDE_CODE_SESSION_ID`, Codex's `CODEX_THREAD_ID`, or pi's `PI_SESSION_ID`, else a new id that `claim` prints.
+- `agent-gh release <N>` releases this session's own claim: it closes the draft and deletes its branch while the pull request holds only the claim's empty commit (one with work on it is closed deliberately, with `gh pr close`), or posts `<!-- agent-release {"v":1,"id":"…"} -->` for a comment claim. Another session's claim is John's to release, by closing its pull request. There is no expiry: nobody infers a release from silence.
+- `agent-gh claims [--json] [-R OWNER/REPO]` lists each live claim with its holder and when it last saw a push or a comment, so John can see a claim going quiet. Outside an agent session it reads with the read App.
+
+**The rule**, which anything with REST alone (a cloud session, a repository script) can apply: an issue is taken when it is open and either an open pull request in its repository links it in its description, with a closing keyword (close, fix, resolve, in any tense) or `Ref`/`Refs` followed by `#N`, `OWNER/REPO#N`, or the issue's URL, or carries a claim marker for it; or a comment on it carries a claim marker, its author has write access (`author_association` `OWNER`, `MEMBER`, or `COLLABORATOR`), and no such author's comment releases that marker's `id`. A bare mention ("unlike #12") takes nothing. Of several claims, the one created first (`created_at`) holds the issue; within the same second, a pull request before a comment, then the lowest number or id. So a claim that saw itself win is never displaced by one posted after it, whichever kind each is. It reads `GET /repos/{o}/{r}/issues/{n}`, every page of `GET /repos/{o}/{r}/pulls?state=open`, and every page of `GET /repos/{o}/{r}/issues/{n}/comments`. In TypeScript it is `taken(repo, issue, pulls, comments)` in `src/claim.ts`, which takes those three responses as they are.
+
+**`claims --json`** is the stable interface for repository scripts (a next-issue picker, a frontier): `{"v":1,"repo","label","claims":[…],"mismatches":[…]}`. Each claim has `issue`, `title`, `kind` (`pr` or `comment`), `pr` (or null), `url`, `author`, `family` and `session` (null for a pull request without a marker, such as a person's), `branch`, `holds` (whether it is the issue's first claim), `created_at`, `last_push_at` (the head commit's committer date), `last_comment_at` (on the issue or the pull request), and `labeled`. Every issue with a claim is taken. It finds pull request claims everywhere, and comment claims on the issues that carry the label; the per-issue rule above sees every comment claim.
+
+**The label.** A claim also labels the issue (`claimed`, or `"claims": {"label": "…"}` in `.github/agent-review.json` on the default branch), creating the label when it is missing, so a person or a script can filter with `-label:claimed`. Releases before v0.9.0 refuse a config with the `claims` key, so a repository moves its agent-review workflow's pin to v0.9.0 or later before adding it. It only mirrors the claims: anyone can add or remove a label, so neither the rule nor `claims` trusts it, and `claims` reports where the two disagree. `release` removes it once nothing claims the issue, and `agent-gh claims sync [--issue N]...` removes it from every labelled issue nothing claims. To have it removed when a claim's pull request closes or merges, a repository adds:
+
+```yaml
+# .github/workflows/agent-claims.yml
+name: agent-claims
+on:
+  pull_request_target:
+    types: [closed]
+permissions: {}
+jobs:
+  agent-claims:
+    uses: johnrees/agent-gh/.github/workflows/agent-claims.yml@v0.9.0
+    with:
+      version: v0.9.0
+    # contents (the label's name), pull-requests (the open pull requests), issues (the issues, comments, and the label).
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+```
+
+A claim pull request is a draft with an agent's empty commit, so the agent-review workflow sets it pending ("needs a review"), one run when it opens and one per later event, as for any draft. It does not skip drafts: `review full` runs before `gh pr ready`, while the pull request is still a draft, and with `status_writer` `"actions"` it waits for the workflow's status. `gh pr ready` still needs a review, so a claim cannot slip through.
+
 ## Development
 
 `bun test` (offline: a fake GitHub API, real throwaway repositories and hooks, the shim under real shells, and `install.sh` against a fake release), `bun run typecheck`, `bun run build`. `bun run install-local` installs a checkout's build. A `v*` tag publishes a release with `SHA256SUMS`.

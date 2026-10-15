@@ -9,6 +9,8 @@ import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runChild } from "./child.ts";
+import { parseClaimArgs, sessionId as claimSession } from "./claim.ts";
+import { claim, type ClaimIo, claimsLines, eventIssues, listClaims, release, syncLabels } from "./claim-run.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
 import { doctor } from "./doctor.ts";
@@ -62,6 +64,15 @@ const USAGE = `usage:
                                     it waits for an agent's \`agent-gh reply\`
   agent-gh status [--pr N]          in the agent-review workflow (GitHub Actions, GITHUB_TOKEN): set agent-review
                                     and agent-threads on the event's pull request
+  agent-gh claim <N> [--refs|--no-pr] [-R repo]
+                                    take an issue before working on it: refuse a closed or taken one, else open a draft
+                                    pull request closing it (--refs: referencing it) from a new <family>/<N>-<slug> branch,
+                                    or (--no-pr) post a claim comment; a claim that loses a race undoes itself
+  agent-gh release <N> [-R repo]    release this session's claim: close its still-empty draft, or post a release comment
+  agent-gh claims [--json] [-R repo]
+                                    list live claims with their holder and last push and comment (--json: the stable form)
+  agent-gh claims sync [--issue N]... [-R repo]
+                                    remove the claim label from issues nothing claims (in GitHub Actions: the closed PR's)
   agent-gh which <gh|git>           print the real program, past any agent-gh shim; copy this, never \`command -v gh\`, into a test's PATH`;
 
 /** Opens a URL in a local browser if there is one; the printed URL is always the fallback. */
@@ -228,6 +239,76 @@ const notifyOptions = async (rest: readonly string[]): Promise<NotifyOptions | u
   }
   const from = values["--from"];
   return { target: positional[0] as string, severity: values["--severity"], text, ...(from === undefined ? {} : { from }) };
+};
+
+/** The claim commands' I/O: git in the working tree with the App's token, its stderr shown as it runs. */
+const claimIo = (context: Context, repo: Repo, env: Record<string, string>, session: string): ClaimIo => ({
+  api: context.api,
+  token: env.GH_TOKEN ?? "",
+  repo,
+  family: context.identity.family,
+  session,
+  git: async (args) => {
+    const child = Bun.spawn(["git", ...args], { env, stdin: "ignore", stdout: "pipe", stderr: "inherit" });
+    const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+    return { code, stdout: out.trim() };
+  },
+  print: (line) => console.error(line),
+  out: (text) => process.stdout.write(text),
+  sleep: (ms) => Bun.sleep(ms),
+  nowMs: () => Date.now(),
+  recheckMs: 2000,
+});
+
+/** `agent-gh claim`, `release`, and `claims`. */
+const claimCommand = async (first: string, rest: readonly string[], env: NodeJS.ProcessEnv): Promise<number> => {
+  const parsed = parseClaimArgs(first, rest);
+  if (parsed === undefined) {
+    console.error(USAGE);
+    return 1;
+  }
+  const print = (line: string) => console.error(line);
+  if (parsed.command === "sync" && env.GITHUB_ACTIONS === "true" && !inAgentSession(env)) {
+    // The agent-claims workflow, with its GITHUB_TOKEN: the closed pull request's issues.
+    const repo = parseRepo(env.GITHUB_REPOSITORY ?? "");
+    const token = env.GITHUB_TOKEN ?? "";
+    if (repo === undefined || token === "") throw new Failure("listing claims", "GITHUB_REPOSITORY and GITHUB_TOKEN must be set; pass `GITHUB_TOKEN: ${{ github.token }}` to the step");
+    const io = { api: GITHUB, token, repo };
+    let payload: unknown;
+    try {
+      payload = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH ?? "", "utf8"));
+    } catch {
+      payload = undefined;
+    }
+    await syncLabels(io, print, parsed.issues.length > 0 ? parsed.issues : eventIssues(io, payload));
+    return 0;
+  }
+  const repo = await resolveRepo("gh", rest, env, () => originUrl(process.cwd()));
+  if (repo === undefined) throw new Failure("resolving the repository", "no -R, GH_REPO, or github.com origin remote; run it inside a clone of the repository or pass -R OWNER/REPO");
+  if (parsed.command === "claims" && !inAgentSession(env)) {
+    // A person's listing reads with the read App.
+    const token = await readToken({ api: GITHUB, dir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) });
+    const list = await listClaims({ api: GITHUB, token, repo });
+    process.stdout.write(parsed.json ? `${JSON.stringify(list, null, 2)}\n` : `${claimsLines(list, Date.now()).join("\n")}\n`);
+    return 0;
+  }
+  const context: Context = { identity: detectIdentity(env), repo, env, api: GITHUB, configDir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) };
+  const session = claimSession(env);
+  return withToken(context, async (childEnv) => {
+    const io = claimIo(context, repo, childEnv, session.id);
+    if (parsed.command === "claims") {
+      const list = await listClaims(io);
+      io.out(parsed.json ? `${JSON.stringify(list, null, 2)}\n` : `${claimsLines(list, io.nowMs()).join("\n")}\n`);
+      return 0;
+    }
+    if (parsed.command === "sync") {
+      await syncLabels(io, print, parsed.issues.length > 0 ? parsed.issues : undefined);
+      return 0;
+    }
+    if (parsed.command === "release") return release(io, parsed.issue);
+    if (session.generated) print(`agent-gh: no session id in the environment; this claim's is ${session.id}: set AGENT_GH_SESSION=${session.id} to release it later`);
+    return claim(io, parsed);
+  });
 };
 
 const main = async (argv: readonly string[]): Promise<number> => {
@@ -411,6 +492,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     await login(family, deviceDeps());
     return 0;
   }
+  if (first === "claim" || first === "release" || first === "claims") return claimCommand(first, rest, env);
   const review = first === "review" ? reviewOptions(rest) : undefined;
   const replying = first === "reply" ? replyOptions(rest) : undefined;
   const notifying = first === "notify" ? await notifyOptions(rest) : undefined;
