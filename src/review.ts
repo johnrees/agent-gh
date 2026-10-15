@@ -379,55 +379,95 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
   return { kind: "rest", repo: placeholders ? undefined : `${owner}/${name}`, number: Number(pr[3]) };
 };
 
-/** GraphQL mutations that merge a pull request, or queue it to be merged; each takes `expectedHeadOid`. */
-const MERGE_MUTATIONS = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\s*\(/g;
+/**
+ * The document with its comments and the insides of its strings blanked to
+ * spaces, so field names are matched only where GraphQL reads them, at the
+ * same positions as in the document. Undefined for a block string (`"""`)
+ * or an unterminated string, which this does not read.
+ */
+const masked = (query: string): string | undefined => {
+  const out = query.split("");
+  for (let at = 0; at < query.length; at++) {
+    if (query[at] === "#") {
+      for (; at < query.length && query[at] !== "\n"; at++) out[at] = " ";
+    } else if (query[at] === '"') {
+      if (query.startsWith('"""', at)) return undefined;
+      for (at++; at < query.length && query[at] !== '"' && query[at] !== "\n"; at++) {
+        out[at] = " ";
+        if (query[at] === "\\") out[++at] = " ";
+      }
+      if (query[at] !== '"') return undefined;
+    }
+  }
+  return out.join("");
+};
 
-/** The text between the parenthesis at `open` and its match, skipping strings; undefined when it never closes. */
-const parenthesised = (text: string, open: number): string | undefined => {
+/** The text between the parenthesis at `open` and its match, as an offset range; undefined when it never closes. */
+const parenthesised = (text: string, open: number): { readonly from: number; readonly to: number } | undefined => {
   let depth = 0;
   for (let at = open; at < text.length; at++) {
-    const char = text[at];
-    if (char === '"') {
-      for (at++; at < text.length && text[at] !== '"'; at++) if (text[at] === "\\") at++;
-    } else if (char === "(") depth++;
-    else if (char === ")" && --depth === 0) return text.slice(open + 1, at);
+    if (text[at] === "(") depth++;
+    else if (text[at] === ")" && --depth === 0) return { from: open + 1, to: at };
   }
   return undefined;
 };
 
-/** A string-valued input field, as a literal or a variable, inside one mutation's arguments; or from its `input: $var` object. */
-const inputField = (args: string, field: string, variables: Readonly<Record<string, unknown>>): string | undefined => {
-  const direct = new RegExp(`\\b${field}\\s*:\\s*(?:"((?:[^"\\\\]|\\\\.)*)"|\\$(\\w+))`).exec(args);
-  if (direct !== null) {
-    const value = direct[1] ?? variables[direct[2] as string];
-    return typeof value === "string" && value !== "" ? value : undefined;
+/**
+ * A string-valued input field inside one mutation's arguments (`query` and
+ * `mask` sliced alike), as a literal or a variable, or from its `input: $var`
+ * object. Undefined when absent; `null` when it appears more than once or
+ * its value cannot be read.
+ */
+const inputField = (query: string, mask: string, field: string, variables: Readonly<Record<string, unknown>>): string | undefined | null => {
+  const found = [...mask.matchAll(new RegExp(`\\b${field}\\s*:\\s*(?:"|\\$(\\w+))`, "g"))];
+  if (found.length > 1) return null;
+  const read = (value: unknown) => (typeof value === "string" && value !== "" ? value : null);
+  const direct = found[0];
+  if (direct !== undefined) {
+    if (direct[1] !== undefined) return read(variables[direct[1]]);
+    const start = (direct.index as number) + direct[0].length;
+    try {
+      return read(JSON.parse(`"${query.slice(start, mask.indexOf('"', start))}"`));
+    } catch {
+      return null;
+    }
   }
-  const whole = /\binput\s*:\s*\$(\w+)/.exec(args);
-  const value = whole === null ? undefined : (variables[whole[1] as string] as Record<string, unknown> | undefined)?.[field];
-  return typeof value === "string" && value !== "" ? value : undefined;
+  const whole = [...mask.matchAll(/\binput\s*:\s*\$(\w+)/g)];
+  if (whole.length > 1) return null;
+  if (whole[0] === undefined) return undefined;
+  const object = variables[whole[0][1] as string];
+  if (typeof object !== "object" || object === null) return null;
+  const value = (object as Record<string, unknown>)[field];
+  return value === undefined ? undefined : read(value);
 };
 
 /** A pull request a GraphQL merge mutation names, and the head it requires (`expectedHeadOid`), if any. */
 export type GraphqlMerge = { readonly id: string; readonly expectedHeadOid: string | undefined };
 
+const MERGE_NAMES = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b/g;
+
 /**
- * Each merge mutation in a GraphQL document, read from its own arguments:
- * the pull request id and the head it requires. Empty when it merges
- * nothing; a refusal when it merges a branch, or a mutation's pull request
- * id cannot be read.
+ * Each merge mutation in a GraphQL document, read from its own arguments,
+ * outside comments and strings: the pull request id and the head it
+ * requires. Empty when it merges nothing; a refusal when it merges a branch,
+ * or this cannot read a merge's pull request id with certainty.
  */
 export const graphqlMerges = (query: string, variables: Readonly<Record<string, unknown>>): readonly GraphqlMerge[] | { readonly refuse: string } => {
-  if (/\bmergeBranch\b/.test(query)) return { refuse: "the GraphQL mergeBranch mutation merges past a pull request's checks; open a pull request" };
   const unreadable = { refuse: "cannot read the pull request id a GraphQL merge mutation names; use `gh pr merge`" };
+  const mask = masked(query);
+  if (mask === undefined) return /\b(mergeBranch|mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b/.test(query) ? unreadable : [];
+  if (/\bmergeBranch\b/.test(mask)) return { refuse: "the GraphQL mergeBranch mutation merges past a pull request's checks; open a pull request" };
   const merges: GraphqlMerge[] = [];
-  for (const match of query.matchAll(MERGE_MUTATIONS)) {
-    const args = parenthesised(query, (match.index as number) + match[0].length - 1);
-    const id = args === undefined ? undefined : inputField(args, "pullRequestId", variables);
-    if (args === undefined || id === undefined) return unreadable;
-    merges.push({ id, expectedHeadOid: inputField(args, "expectedHeadOid", variables) });
+  for (const match of mask.matchAll(MERGE_NAMES)) {
+    const open = /^\s*\(/.exec(mask.slice((match.index as number) + match[0].length));
+    const range = open === null ? undefined : parenthesised(mask, (match.index as number) + match[0].length + open[0].length - 1);
+    if (range === undefined) return unreadable;
+    const [text, args] = [query.slice(range.from, range.to), mask.slice(range.from, range.to)];
+    const id = inputField(text, args, "pullRequestId", variables);
+    const expectedHeadOid = inputField(text, args, "expectedHeadOid", variables);
+    if (typeof id !== "string" || expectedHeadOid === null) return unreadable;
+    merges.push({ id, expectedHeadOid });
   }
-  // A mention the pattern above did not take as a call (a comment, a stray name) is not trusted either.
-  if ((query.match(/\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b/g)?.length ?? 0) !== merges.length) return unreadable;
   return merges;
 };
 

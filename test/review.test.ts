@@ -230,6 +230,13 @@ type World = {
   checkRuns?: unknown[];
 };
 
+/** The page of `items` a request asks for, as GitHub pages them (all of them when it names no page). */
+const page = <T>(items: readonly T[], url: URL): T[] => {
+  const size = Number(url.searchParams.get("per_page") ?? items.length);
+  const number = Number(url.searchParams.get("page") ?? 1);
+  return items.slice((number - 1) * size, number * size);
+};
+
 const bot = (family: string) => `johnrees-${family}[bot] <1+johnrees-${family}[bot]@users.noreply.github.com>`;
 
 /** The pull request's diff: src/a.ts's lines 1 to 4 are on it. */
@@ -256,9 +263,11 @@ const world = ({
       optedIn ? reply(200, { content: Buffer.from(JSON.stringify(config)).toString("base64") }) : reply(404, {}),
     // The pull request's own merge base; origin's (below) would be a fork's.
     [`GET ${REPO}/compare/main...${HEAD}`]: () => reply(200, { merge_base_commit: { sha: OLD } }),
-    [`GET ${REPO}/commits/${head}/status`]: () => reply(200, { state: "success", statuses: status }),
-    [`GET ${REPO}/commits/${head}/check-runs`]: (_, url) =>
-      reply(200, { check_runs: checkRuns.filter((run) => (run as { name: string }).name === url.searchParams.get("check_name")) }),
+    [`GET ${REPO}/commits/${head}/status`]: (_, url) => reply(200, { state: "success", total_count: status.length, statuses: page(status, url) }),
+    [`GET ${REPO}/commits/${head}/check-runs`]: (_, url) => {
+      const runs = checkRuns.filter((run) => (run as { name: string }).name === url.searchParams.get("check_name"));
+      return reply(200, { total_count: runs.length, check_runs: page(runs, url) });
+    },
     [`GET ${REPO}/rules/branches/main`]: () => reply(200, rules),
     [`GET ${REPO}/branches/main`]: () => reply(200, branch),
     [`GET ${REPO}/issues/12/events`]: () => reply(200, events),
@@ -649,6 +658,15 @@ test("an agent's gh pr merge runs only once every check the base branch requires
   expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD} -- x`]);
 });
 
+test("the merge guard reads every page of statuses and check runs", async () => {
+  const calls: string[] = [];
+  const here = parseRepo("johnrees/widget");
+  const passing = Array.from({ length: 150 }, () => ({ name: "build", status: "completed", conclusion: "success", app: { id: 15368 } }));
+  const late = world({ rules: REQUIRED, status: [...Array.from({ length: 120 }, (_, n) => ({ context: `other-${n}`, state: "success" })), { context: "agent-review", state: "success" }], checkRuns: [...passing, { name: "build", status: "completed", conclusion: "failure", app: { id: 15368 } }] });
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(late.io, calls)))).toContain("(`build` failed)");
+  expect(calls).toEqual([]);
+});
+
 test("gh pr merge checks the repository a clustered -R names, as gh merges there", async () => {
   const calls: string[] = [];
   const checked: string[] = [];
@@ -722,6 +740,12 @@ test("each GraphQL merge mutation's pull request and expected head are read from
   expect(graphqlMerges('mutation { a: mergePullRequest(input: {pullRequestId: "PR_1"}) { x } b: mergePullRequest(input: $i) { x } }', {})).toHaveProperty("refuse");
   expect(graphqlMerges("mutation { mergePullRequest # hidden\n (input: {}) { x } }", {})).toHaveProperty("refuse");
   expect(graphqlMerges('mutation { mergeBranch(input: {repositoryId: "R", base: "main", head: "x"}) { x } }', {})).toHaveProperty("refuse");
+  // Comments and strings are not read as fields: GitHub ignores them, so the guard does too.
+  expect(graphqlMerges(`mutation { mergePullRequest(input: {\n# pullRequestId: "PR_SAFE", expectedHeadOid: "${H}"\npullRequestId: "PR_BLOCKED"}) { x } }`, {})).toEqual([{ id: "PR_BLOCKED", expectedHeadOid: undefined }]);
+  expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "pullRequestId: $safe", pullRequestId: "PR_B"}) { x } }', { safe: "PR_SAFE" })).toEqual([{ id: "PR_B", expectedHeadOid: undefined }]);
+  expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "a ) b", pullRequestId: "PR_C"}) { x } }', {})).toEqual([{ id: "PR_C", expectedHeadOid: undefined }]);
+  expect(graphqlMerges('mutation { mergePullRequest(input: {pullRequestId: "PR_1", pullRequestId: "PR_2"}) { x } }', {})).toHaveProperty("refuse");
+  expect(graphqlMerges('mutation { mergePullRequest(input: {pullRequestId: "PR_1", commitBody: """x"""}) { x } }', {})).toHaveProperty("refuse");
 });
 
 test("an agent's gh api merge runs only when gh pr merge would", async () => {

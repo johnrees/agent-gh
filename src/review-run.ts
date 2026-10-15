@@ -241,12 +241,10 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
   const branch = (await call(io, stage, "GET", `${repoPath(io)}/branches/${base}`)).value;
   const required = requiredChecks(rules, branch);
   if (required.length === 0) return pr.head;
-  const statuses = record((await call(io, stage, "GET", `${repoPath(io)}/commits/${pr.head}/status?per_page=100`)).value).statuses;
+  const statuses = await counted(io, stage, `${repoPath(io)}/commits/${pr.head}/status?`, "statuses");
   const unmet: string[] = [];
   for (const check of required) {
-    const runs = record(
-      (await call(io, stage, "GET", `${repoPath(io)}/commits/${pr.head}/check-runs?check_name=${encodeURIComponent(check.context)}&filter=latest&per_page=100`)).value,
-    ).check_runs;
+    const runs = await counted(io, stage, `${repoPath(io)}/commits/${pr.head}/check-runs?check_name=${encodeURIComponent(check.context)}&filter=latest&`, "check_runs");
     const state = checkState(check, statuses, runs);
     if (state !== "passed") unmet.push(`\`${check.context}\` ${state}`);
   }
@@ -255,6 +253,22 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
     stage,
     `pull request #${number}'s head ${pr.head.slice(0, 8)} has not passed every check ${pr.base} requires (${unmet.join(", ")}); wait for them to pass, fix what fails, or ask John to merge it`,
   );
+};
+
+/** Every item of a paginated response that reports its `total_count`, refusing one too long, or too short, to trust. */
+const counted = async (io: ReviewIo, stage: Stage, path: string, field: string): Promise<unknown[]> => {
+  const items: unknown[] = [];
+  const where = path.replace(/^\/repos\/[^/]+\/[^/]+/, "").split("?")[0];
+  for (let page = 1; page <= 10; page++) {
+    const value = record((await call(io, stage, "GET", `${path}per_page=100&page=${page}`)).value);
+    const list = value[field];
+    if (!Array.isArray(list) || !Number.isSafeInteger(value.total_count)) throw new Failure(stage, `${where}: invalid response`);
+    items.push(...list);
+    if (items.length >= (value.total_count as number)) return items;
+    // A short page before the total means results the guard cannot see.
+    if (list.length < 100) throw new Failure(stage, `${where} lists fewer results than its total`);
+  }
+  throw new Failure(stage, `${where} lists over 1,000 results`);
 };
 
 /** Every item of a paginated list endpoint, refusing one too long to read whole. */
