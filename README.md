@@ -54,12 +54,15 @@ A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify`
 
 ## Reviews
 
-A repository opts in to cross-family review by committing `.github/agent-review.json` to its base branch. There, in an agent session, the gh shim refuses `gh pr ready` until the pull request's current head has a successful `agent-review` status, so work is reviewed before CI runs on it. A repository without the file, and a person's own `gh`, are never gated.
+A repository opts in to cross-family review by committing `.github/agent-review.json` to its base branch. There, in an agent session, the gh shim refuses `gh pr ready` until the pull request's current head has a successful `agent-review` status, so work is reviewed before CI runs on it. A review that requested changes sets a failing status, and the refusal names it: answer the findings, push a fix, and review the new head. A repository without the file, and a person's own `gh`, are never gated.
 
-- `agent-gh review full` reviews the pushed head of the branch's pull request against the issue it closes (or `--issue N`), from the merge base GitHub reports for the pull request's own repository. It runs the first configured reviewer from another family than the session's (or the config's `pin`), with the issue, its last comment, the pull request's description, and the repository's checklist. The reviewer works in a throwaway checkout of the reviewed commit and may run the config's `checks` there to confirm a finding: Codex in its workspace-write sandbox with network access (read-only when there are no checks), Claude restricted to git's read commands and those checks. The caller's tree is never touched. It posts the findings as a comment for the agent to answer and sets the status on that head. A new commit needs a new review.
-- `agent-gh review sweep` is a quick bug sweep of the branch with no ticket; it prints and records nothing.
+- `agent-gh review full` reviews the pushed head of the branch's pull request against the issue it closes (or `--issue N`), from the merge base GitHub reports for the pull request's own repository. First it runs the config's `checks` itself, in order until one fails, in a throwaway `git clone --shared` of the head, which has its own `.git`, so nothing they write reaches the caller's repository. Then it runs the first configured reviewer from another family than the author's (or the config's `pin`), with the checks' result and the last `checks_output_lines` lines of their output, the issue, its last comment, the pull request's description, and the repository's checklist. The author is the family App every commit since the merge base credits as `Co-authored-by`; when they credit none or a mix, the session's family, and it says which. The reviewer only reads: Codex in its read-only sandbox, Claude restricted to git's read commands. It posts the findings as a pull request review (a comment: agents act as John, who cannot approve his own pull requests), each on its line where the diff shows that line and otherwise in the body, and sets the status on that head: failure for a `changes_requested` verdict, success for `approve`, with "checks passed", "failed", or "not run". A new commit needs a new review.
+- The review's body starts with a marker, `<!-- agent-review {...} -->`, holding the full head sha, the merge base, the `git patch-id --stable` of the diff, the verdict, the checks' result, and the reviewer's family as one JSON object.
+- `agent-gh review sweep` is a quick bug sweep of the branch with no ticket; it runs no checks, and prints and records nothing.
 - Effort comes from the ticket's labels through the config's rules (`--effort` overrides). Reviewers are the `codex` and `claude` CLIs on PATH.
-- John waives the review of one pull request by adding the waiver label himself. A label an agent adds, through its App, waives nothing; `review full` then records "waived by" on the status.
+- John waives the review of one pull request by adding the waiver label himself. A label an agent adds, through its App, waives nothing; `review full` then records "waived by" on the status, and reads the label again before it sets the status, so a waiver added while it ran stands.
+
+In any repository, an agent session's `gh pr merge` runs only when every status check its base branch requires, by ruleset or classic branch protection, has passed on the pull request's head; `--admin` is always refused. Agents act as John, who may bypass those rules, so without this an agent's merge would skip them. A check a rule ties to one App counts only that App's check runs.
 
 ```json
 {
@@ -72,12 +75,16 @@ A repository opts in to cross-family review by committing `.github/agent-review.
     ]
   },
   "checklist": "docs/agents/review-checklist.md",
-  "checks": ["bun test", "bun run typecheck"],
-  "waiver_label": "review-waived"
+  "checks": ["make check"],
+  "checks_output_lines": 60,
+  "waiver_label": "review-waived",
+  "block_on": "changes_requested"
 }
 ```
 
-The family Apps need the Commit statuses permission (write; the read App, read). An App created before it needs it added on its permissions page (`agent-gh settings <family>` prints the link), and each installation must accept the change; until then `review full` posts its comment but cannot set the status.
+`block_on` names the verdict that fails the status; `changes_requested` is its only value and the default. Setting it makes releases before it, which refuse a config key they do not know, refuse to review or to pass `gh pr ready` rather than pass a review that requested changes. `checks_output_lines` defaults to 60; 0 leaves the output out.
+
+The family Apps need the Commit statuses permission (write; the read App, read). An App created before it needs it added on its permissions page (`agent-gh settings <family>` prints the link), and each installation must accept the change; until then `review full` posts its review but cannot set the status.
 
 The first rule whose label patterns (`*` matches anything) all match one of the ticket's labels sets the effort. The config is read from the pull request's base branch, so a branch cannot switch off its own review. The status is set by the agent that asked for the review: it shows that a review was recorded, not that nobody could forge one. A branch ruleset that requires `agent-review` makes it a merge condition too.
 

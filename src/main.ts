@@ -21,7 +21,7 @@ import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
 import { originUrl, type Repo, resolveRepo } from "./repo.ts";
 import { EFFORTS, type Effort } from "./review.ts";
-import { dispatchGh, type ReviewIo, reviewFull, reviewSweep, spawnReviewer } from "./review-run.ts";
+import { dispatchGh, type ReviewIo, reviewFull, reviewSweep, spawnCheck, spawnReviewer } from "./review-run.ts";
 import { type Context, runAs, withToken } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
@@ -46,7 +46,8 @@ const USAGE = `usage:
   agent-gh review sweep [--base REF] [--effort E]
                                     a quick bug sweep of the branch by another model family; prints, records nothing
   agent-gh review full [--pr N] [--issue N] [--effort E]
-                                    review the pull request's pushed head against its issue; posts the findings and the agent-review status
+                                    run the config's checks on the pull request's pushed head, review it against its issue,
+                                    and post the findings as a review and the agent-review status
   agent-gh which <gh|git>           print the real program, past any agent-gh shim; copy this, never \`command -v gh\`, into a test's PATH`;
 
 /** Opens a URL in a local browser if there is one; the printed URL is always the fallback. */
@@ -95,11 +96,12 @@ const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): Re
   token: env.GH_TOKEN ?? "",
   repo,
   family: context.identity.family,
-  git: async (args) => {
-    const child = Bun.spawn(["git", ...args], { env, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+  git: async (args, input) => {
+    const child = Bun.spawn(["git", ...args], { env, stdin: input === undefined ? "ignore" : new Blob([input]), stdout: "pipe", stderr: "ignore" });
     const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
     return code === 0 ? out.trim() : undefined;
   },
+  runCheck: (command, cwd) => spawnCheck(command, cwd, process.env),
   runReviewer: async (command, stdin, cwd) => {
     const dir = mkdtempSync(join(tmpdir(), "agent-gh-reviewer-"));
     const log = join(dir, "stderr.log");

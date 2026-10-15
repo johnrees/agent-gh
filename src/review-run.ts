@@ -1,13 +1,26 @@
+import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { REGISTRY } from "./config.ts";
 import { Failure, type Stage } from "./failure.ts";
+import { familyNames } from "./family.ts";
 import { type Api, request } from "./github.ts";
 import { HARNESSES, type Env } from "./harness.ts";
 import { parseRepo, type Repo, slug } from "./repo.ts";
+import { checkState, requiredChecks } from "./merge.ts";
 import {
+  agentReviewStatus,
+  authorFamily,
+  type ChecksResult,
+  checksSummary,
   CONFIG_PATH,
+  diffLines,
   type Effort,
   effortFor,
+  type Finding,
   fullPrompt,
+  inlineComment,
+  mergeCommand,
+  outputTail,
   parseReview,
   parseReviewConfig,
   type PullRequest,
@@ -15,11 +28,12 @@ import {
   readyTarget,
   REVIEW_SCHEMA,
   type Review,
-  reviewComment,
-  reviewed,
+  reviewBody,
+  type ReviewMarker,
   type Reviewer,
   type ReviewConfig,
   reviewerFor,
+  reviewState,
   STATUS_CONTEXT,
   statusDescription,
   sweepPrompt,
@@ -34,8 +48,10 @@ export type ReviewIo = {
   readonly repo: Repo;
   /** The session's family: its work is reviewed by another family. */
   readonly family: string;
-  /** Runs git in the working tree; its trimmed stdout, or undefined when it fails. */
-  readonly git: (args: readonly string[]) => Promise<string | undefined>;
+  /** Runs git in the working tree, with `input` on stdin; its trimmed stdout, or undefined when it fails. */
+  readonly git: (args: readonly string[], input?: string) => Promise<string | undefined>;
+  /** Runs one of the config's checks, a shell command, in `cwd`; its exit code and its stdout and stderr together. */
+  readonly runCheck: (command: string, cwd: string) => Promise<{ readonly code: number; readonly output: string }>;
   /** Runs a reviewer CLI in `cwd` with `stdin` (none when empty) and returns its exit code and stdout. */
   readonly runReviewer: (command: readonly string[], stdin: string, cwd: string) => Promise<{ readonly code: number; readonly stdout: string }>;
   readonly readFile: (path: string) => Promise<string>;
@@ -137,8 +153,8 @@ const waiver = async (io: ReviewIo, stage: Stage, target: Pull, config: ReviewCo
   return waivedBy(events, config.waiverLabel);
 };
 
-const setStatus = (io: ReviewIo, sha: string, description: string) =>
-  call(io, "reviewing", "POST", `${repoPath(io)}/statuses/${sha}`, { state: "success", context: STATUS_CONTEXT, description: statusDescription(description) });
+const setStatus = (io: ReviewIo, sha: string, state: "success" | "failure", description: string) =>
+  call(io, "reviewing", "POST", `${repoPath(io)}/statuses/${sha}`, { state, context: STATUS_CONTEXT, description: statusDescription(description) });
 
 const currentBranch = async (io: ReviewIo): Promise<string | undefined> => {
   const upstream = await io.git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
@@ -155,15 +171,7 @@ const currentBranch = async (io: ReviewIo): Promise<string | undefined> => {
  */
 export const gateReady = async (io: ReviewIo, target: ReadyTarget): Promise<void> => {
   const stage = "checking the review";
-  let number = "number" in target ? target.number : undefined;
-  if (number === undefined) {
-    const branch = "branch" in target && target.branch !== undefined ? target.branch : await currentBranch(io);
-    if (branch !== undefined) number = await pullForBranch(io, stage, branch);
-    if (number === undefined && !("branch" in target && target.branch !== undefined)) {
-      const head = await io.git(["rev-parse", "HEAD"]);
-      if (head !== undefined) number = await pullForCommit(io, stage, head);
-    }
-  }
+  const number = await pullNumber(io, stage, target);
   if (number === undefined) {
     // gh may resolve a selector this lookup does not, so an opted-in repository fails closed.
     const branch = text(record((await call(io, stage, "GET", repoPath(io))).value).default_branch);
@@ -173,17 +181,85 @@ export const gateReady = async (io: ReviewIo, target: ReadyTarget): Promise<void
   const pr = await pull(io, stage, number);
   const config = await readReviewConfig(io, stage, pr.base);
   if (config === undefined) return;
-  const status = record((await call(io, stage, "GET", `${repoPath(io)}/commits/${pr.head}/status`)).value);
-  if (reviewed(status)) return;
+  const status = agentReviewStatus(record((await call(io, stage, "GET", `${repoPath(io)}/commits/${pr.head}/status`)).value));
+  if (status?.state === "success") return;
   const person = await waiver(io, stage, pr, config);
   if (person !== undefined) {
     io.print(`agent-gh: the review of #${number} was waived by ${person}`);
     return;
   }
+  const waive = `or ask John to add the \`${config.waiverLabel}\` label`;
+  if (status?.state === "failure") {
+    throw new Failure(
+      stage,
+      `pull request #${number}'s head ${pr.head.slice(0, 8)} was reviewed and blocked (${status.description}); answer each finding on the pull request, push a fix, and run \`agent-gh review full\` on the new head, ${waive}`,
+    );
+  }
   throw new Failure(
     stage,
-    `pull request #${number}'s head ${pr.head.slice(0, 8)} has no ${STATUS_CONTEXT} status; run \`agent-gh review full\` on it (it reviews the pushed head), or ask John to add the \`${config.waiverLabel}\` label`,
+    `pull request #${number}'s head ${pr.head.slice(0, 8)} has no ${STATUS_CONTEXT} status; run \`agent-gh review full\` on it (it reviews the pushed head), ${waive}`,
   );
+};
+
+/** The pull request a gh selector names, as gh resolves it: by number, by branch, else the current branch's or HEAD's. */
+const pullNumber = async (io: ReviewIo, stage: Stage, target: ReadyTarget): Promise<number | undefined> => {
+  if ("number" in target) return target.number;
+  const named = target.branch;
+  const branch = named ?? (await currentBranch(io));
+  const number = branch === undefined ? undefined : await pullForBranch(io, stage, branch);
+  if (number !== undefined || named !== undefined) return number;
+  const head = await io.git(["rev-parse", "HEAD"]);
+  return head === undefined ? undefined : pullForCommit(io, stage, head);
+};
+
+const MERGE_STAGE = "checking the merge";
+
+const branchPath = (branch: string) => branch.split("/").map(encodeURIComponent).join("/");
+
+/**
+ * The guard on `gh pr merge` in an agent session: agents act as John, who may
+ * bypass the base branch's rules, so every check the branch requires (its
+ * rulesets' and classic protection's) must have passed on the pull request's
+ * head. `--admin` is always refused, and so is a pull request the guard
+ * cannot find. A branch that requires no checks is not held.
+ */
+export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolean): Promise<void> => {
+  const stage = MERGE_STAGE;
+  if (admin) throw new Failure(stage, "an agent never merges with `--admin`, which skips the base branch's requirements; merge without it once the required checks pass, or ask John");
+  const number = await pullNumber(io, stage, target);
+  if (number === undefined) throw new Failure(stage, "cannot find the pull request `gh pr merge` names; name it by number");
+  const pr = await pull(io, stage, number);
+  const base = branchPath(pr.base);
+  const rules = await pages(io, stage, `${repoPath(io)}/rules/branches/${base}`);
+  const branch = (await call(io, stage, "GET", `${repoPath(io)}/branches/${base}`)).value;
+  const required = requiredChecks(rules, branch);
+  if (required.length === 0) return;
+  const statuses = record((await call(io, stage, "GET", `${repoPath(io)}/commits/${pr.head}/status?per_page=100`)).value).statuses;
+  const unmet: string[] = [];
+  for (const check of required) {
+    const runs = record(
+      (await call(io, stage, "GET", `${repoPath(io)}/commits/${pr.head}/check-runs?check_name=${encodeURIComponent(check.context)}&filter=latest&per_page=100`)).value,
+    ).check_runs;
+    const state = checkState(check, statuses, runs);
+    if (state !== "passed") unmet.push(`\`${check.context}\` ${state}`);
+  }
+  if (unmet.length === 0) return;
+  throw new Failure(
+    stage,
+    `pull request #${number}'s head ${pr.head.slice(0, 8)} has not passed every check ${pr.base} requires (${unmet.join(", ")}); wait for them to pass, fix what fails, or ask John to merge it`,
+  );
+};
+
+/** Every item of a paginated list endpoint, refusing one too long to read whole. */
+const pages = async (io: ReviewIo, stage: Stage, path: string): Promise<unknown[]> => {
+  const items: unknown[] = [];
+  for (let page = 1; page <= 10; page++) {
+    const { value } = await call(io, stage, "GET", `${path}?per_page=100&page=${page}`);
+    if (!Array.isArray(value)) throw new Failure(stage, `${path.replace(/^\/repos\/[^/]+\/[^/]+/, "")}: invalid response`);
+    items.push(...value);
+    if (value.length < 100) return items;
+  }
+  throw new Failure(stage, `${path.replace(/^\/repos\/[^/]+\/[^/]+/, "")} lists over 1,000 rules`);
 };
 
 /** `gh pr ready` behind the gate: `run` starts gh only once the gate passes. */
@@ -198,14 +274,26 @@ export interface GhDispatch {
   run: (args: readonly string[]) => Promise<number>;
 }
 
-/** Runs a gh command, holding `gh pr ready` until its pull request's head is reviewed. */
+/**
+ * Runs a gh command, holding `gh pr ready` until its pull request's head is
+ * reviewed and `gh pr merge` until its required checks pass. The gh shim
+ * sends only agent sessions' gh here; a person's gh never reaches it.
+ */
 export const dispatchGh = async (args: readonly string[], repo: Repo | undefined, deps: GhDispatch): Promise<number> => {
   const ready = readyTarget(args);
+  const merge = ready === undefined ? mergeCommand(args) : undefined;
+  const target = ready ?? merge?.target;
+  if (target === undefined) return deps.run(args);
   // gh acts on a pull request URL's repository, whatever the clone or flags say.
-  const readyRepo = ready !== undefined && "repo" in ready && ready.repo !== undefined ? parseRepo(ready.repo) : repo;
-  if (ready === undefined || readyRepo === undefined) return deps.run(args);
-  return deps.withToken(readyRepo, async (env) => {
-    await gateReady(deps.io(readyRepo, env), ready);
+  const targetRepo = "repo" in target && target.repo !== undefined ? parseRepo(target.repo) : repo;
+  if (targetRepo === undefined) {
+    if (merge === undefined) return deps.run(args);
+    throw new Failure(MERGE_STAGE, "cannot tell which repository `gh pr merge` acts on; pass -R OWNER/REPO");
+  }
+  return deps.withToken(targetRepo, async (env) => {
+    const io = deps.io(targetRepo, env);
+    if (merge !== undefined) await gateMerge(io, merge.target, merge.admin);
+    else await gateReady(io, target);
     return deps.runWith(args, env);
   });
 };
@@ -228,39 +316,69 @@ export const spawnReviewer = async (
   return { code, stdout, stderr };
 };
 
-// The reviewer works in a throwaway checkout of the reviewed commit and may run the
-// repository's configured checks there. Codex's sandbox confines writes to that checkout
-// (with network, for the checks); Claude runs restricted to its own settings, with git's
-// read commands and the checks the only shell commands it is allowed.
-const codexAccess = (checks: readonly string[]): string[] =>
-  checks.length === 0 ? ["-s", "read-only"] : ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"];
-const claudeAccess = (checks: readonly string[]): string[] => [
+// The reviewer only reads: agent-gh has already run the checks. Codex runs in its read-only
+// sandbox; Claude runs restricted to its own settings, with git's read commands the only
+// shell commands it is allowed.
+const CODEX_ACCESS = ["-s", "read-only"];
+const CLAUDE_ACCESS = [
   "--restricted", "--tools", "Read,Grep,Glob,Bash",
-  "--allowedTools", ["git diff", "git log", "git show", ...checks].map((command) => `Bash(${command}:*)`).join(","),
+  "--allowedTools", ["git diff", "git log", "git show"].map((command) => `Bash(${command}:*)`).join(","),
   "--permission-mode", "dontAsk", "--no-session-persistence",
 ];
 
 /** The reviewer command for a full review, answering in REVIEW_SCHEMA. */
-export const fullCommand = (reviewer: Reviewer, effort: Effort, files: { readonly schema: string; readonly out: string }, checks: readonly string[]): string[] =>
+export const fullCommand = (reviewer: Reviewer, effort: Effort, files: { readonly schema: string; readonly out: string }): string[] =>
   reviewer.family === "codex"
-    ? ["codex", "exec", "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, ...codexAccess(checks), "--ephemeral", "--output-schema", files.schema, "-o", files.out, "-"]
-    : ["claude", "-p", "--model", reviewer.model, "--effort", effort, "--output-format", "json", "--json-schema", JSON.stringify(REVIEW_SCHEMA), ...claudeAccess(checks)];
+    ? ["codex", "exec", "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, ...CODEX_ACCESS, "--ephemeral", "--output-schema", files.schema, "-o", files.out, "-"]
+    : ["claude", "-p", "--model", reviewer.model, "--effort", effort, "--output-format", "json", "--json-schema", JSON.stringify(REVIEW_SCHEMA), ...CLAUDE_ACCESS];
 
 /** The reviewer command for a sweep: plain text, no ticket. */
-export const sweepCommand = (reviewer: Reviewer, effort: Effort, base: string, out: string, checks: readonly string[]): string[] =>
+export const sweepCommand = (reviewer: Reviewer, effort: Effort, base: string, out: string): string[] =>
   reviewer.family === "codex"
-    ? ["codex", "exec", "review", "--base", base, "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, ...codexAccess(checks), "--ephemeral", "-o", out]
-    : ["claude", "-p", "--model", reviewer.model, "--effort", effort, ...claudeAccess(checks)];
+    ? ["codex", "exec", "review", "--base", base, "-m", reviewer.model, "-c", `model_reasoning_effort="${effort}"`, ...CODEX_ACCESS, "--ephemeral", "-o", out]
+    : ["claude", "-p", "--model", reviewer.model, "--effort", effort, ...CLAUDE_ACCESS];
 
-/** Runs `use` in a detached checkout of `sha`, removed afterwards whatever the reviewer left in it. */
-const inCheckout = async <T>(io: ReviewIo, sha: string, use: (dir: string) => Promise<T>): Promise<T> => {
+/**
+ * Runs `use` in a throwaway clone of `sha`, removed afterwards whatever was
+ * left in it. The clone borrows the caller's objects (`--shared`) but has its
+ * own `.git`, so whatever runs there writes only inside it, never into the
+ * caller's repository.
+ */
+export const inClone = async <T>(io: ReviewIo, sha: string, use: (dir: string) => Promise<T>): Promise<T> => {
+  const common = await io.git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
   const dir = join(io.tempDir(), "checkout");
-  if ((await io.git(["worktree", "add", "--detach", dir, sha])) === undefined) throw new Failure("reviewing", `could not check out ${sha.slice(0, 8)} for the reviewer`);
   try {
+    if (
+      common === undefined ||
+      (await io.git(["clone", "-q", "--shared", "--no-checkout", common, dir])) === undefined ||
+      (await io.git(["-C", dir, "checkout", "-q", "--detach", sha])) === undefined
+    ) {
+      throw new Failure("reviewing", `could not clone ${sha.slice(0, 8)} for the review`);
+    }
     return await use(dir);
   } finally {
-    await io.git(["worktree", "remove", "--force", dir]);
+    rmSync(dir, { recursive: true, force: true });
   }
+};
+
+/** Runs the config's checks in order in `dir`, stopping at the first that fails. */
+export const runChecks = async (io: ReviewIo, config: ReviewConfig, dir: string): Promise<ChecksResult> => {
+  if (config.checks.length === 0) return { state: "not run" };
+  let output = "";
+  for (const command of config.checks) {
+    io.print(`agent-gh: running \`${command}\``);
+    const result = await io.runCheck(command, dir);
+    output += `$ ${command}\n${result.output}${result.output.endsWith("\n") || result.output === "" ? "" : "\n"}`;
+    if (result.code !== 0) return { state: "failed", command, code: result.code, tail: outputTail(output, config.checksOutputLines) };
+  }
+  return { state: "passed", tail: outputTail(output, config.checksOutputLines) };
+};
+
+/** Runs a check through the shell in `cwd`, its stderr merged into its stdout, without the caller's harness. */
+export const spawnCheck = async (command: string, cwd: string, env: Env): Promise<{ code: number; output: string }> => {
+  const child = Bun.spawn(["sh", "-c", `exec 2>&1\n${command}`], { cwd, env: reviewerEnv(env), stdin: "ignore", stdout: "pipe", stderr: "inherit" });
+  const [code, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+  return { code, output };
 };
 
 /** Reads a reviewer's structured answer from its output file (codex) or stdout (claude). */
@@ -313,11 +431,69 @@ const headSha = async (io: ReviewIo): Promise<string> => {
 
 export type FullOptions = { readonly pr?: number; readonly issue?: number; readonly effort?: Effort };
 
+/** Bot logins of the family Apps, as commits credit them: `johnrees-claude[bot]`. */
+const BOTS: Readonly<Record<string, string>> = Object.fromEntries(
+  familyNames().flatMap((family) => (REGISTRY[family] === undefined ? [] : [[family, `${REGISTRY[family].slug}[bot]`]])),
+);
+
+/**
+ * The family whose work this is: the App every commit since the merge base
+ * credits as co-author, else (none, or a mix) the session's. Says which.
+ */
+export const authoredBy = async (io: ReviewIo, mergeBase: string, head: string): Promise<string> => {
+  const log = await io.git(["log", "--no-merges", "--format=%(trailers:key=Co-authored-by,valueonly,separator=%x1f)%x1e", `${mergeBase}..${head}`]);
+  // One entry per commit, each ended by \x1e, its co-authors separated by \x1f.
+  const commits = (log ?? "").split("\x1e").slice(0, -1).map((entry) => entry.split("\x1f").map((value) => value.trim()).filter((value) => value !== ""));
+  const family = authorFamily(commits, BOTS);
+  if (family !== undefined) {
+    io.print(`agent-gh: the head commits credit ${BOTS[family]}, so this is ${family}'s work`);
+    return family;
+  }
+  io.print(`agent-gh: the head commits credit no single family App as co-author, so this is taken as this session's (${io.family}) work`);
+  return io.family;
+};
+
+/**
+ * The pull request's diff, as `git diff` prints it with fixed options so its
+ * patch id does not depend on local config, and that patch id. git patch-id
+ * ignores whitespace, so the trimmed output gives the same id.
+ */
+export const pullDiff = async (io: ReviewIo, mergeBase: string, head: string): Promise<{ readonly diff: string; readonly patchId: string | null }> => {
+  const diff = await io.git(["diff", "--no-color", "--no-ext-diff", "-M", "--src-prefix=a/", "--dst-prefix=b/", mergeBase, head]);
+  if (diff === undefined) throw new Failure("reviewing", `could not diff ${mergeBase.slice(0, 8)}..${head.slice(0, 8)}`);
+  if (diff === "") return { diff, patchId: null };
+  const id = (await io.git(["patch-id", "--stable"], `${diff}\n`))?.split(" ")[0];
+  if (id === undefined || !/^[0-9a-f]{40}$/.test(id)) throw new Failure("reviewing", "git patch-id gave no id for the pull request's diff");
+  return { diff, patchId: id };
+};
+
+/**
+ * Posts the review as a COMMENT-type pull request review (agents act as John,
+ * who cannot approve his own pull requests): findings on a line the diff
+ * shows go on that line, the rest in the body. If GitHub still refuses a
+ * line (422), every finding goes in the body instead.
+ */
+const postReview = async (io: ReviewIo, number: number, head: string, review: Review, diff: string, body: (outside: readonly Finding[]) => string) => {
+  const lines = diffLines(diff);
+  const onDiff = (finding: Finding) => lines.get(finding.file)?.has(finding.line) === true;
+  const inline = review.findings.filter(onDiff);
+  const path = `${repoPath(io)}/pulls/${number}/reviews`;
+  const comments = inline.map((finding) => ({ path: finding.file, line: finding.line, side: "RIGHT", body: inlineComment(finding) }));
+  const first = await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(review.findings.filter((finding) => !onDiff(finding))), comments }, [422]);
+  if (first.status !== 422) return;
+  if (comments.length === 0) throw new Failure("reviewing", `HTTP 422 from POST ${path}`);
+  io.print("agent-gh: GitHub refused a finding's line, so every finding is in the review's body");
+  await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(review.findings), comments: [] });
+};
+
 /**
  * `agent-gh review full`: the pull request's pushed head, reviewed by another
- * family against the issue it closes. Posts the findings and sets the
- * agent-review status on that head; prints the findings as JSON. A waiver a
- * person added sets the status without a review.
+ * family than its author's against the issue it closes. agent-gh runs the
+ * config's checks in a throwaway clone of the head, then the reviewer reads
+ * it, read-only. Posts the findings as a pull request review and sets the
+ * agent-review status on that head from the verdict; prints the findings as
+ * JSON. A waiver a person added sets the status without a review, and one
+ * added while the review ran is never overwritten.
  */
 export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<void> => {
   const stage = "reviewing";
@@ -331,10 +507,16 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   }
   const config = await readReviewConfig(io, stage, target.base);
   if (config === undefined) throw new Failure(stage, `${slug(io.repo)} has no ${CONFIG_PATH} on ${target.base}, so it has not opted in to reviews`);
-  const person = await waiver(io, stage, target, config);
-  if (person !== undefined) {
-    await setStatus(io, head, `waived by ${person}`);
+  /** Records a person's waiver on the head, and returns who waived, if one did. */
+  const recordWaiver = async (labels: Pull): Promise<string | undefined> => {
+    const person = await waiver(io, stage, labels, config);
+    if (person === undefined) return undefined;
+    await setStatus(io, head, "success", `waived by ${person}`);
     io.print(`agent-gh: the review of #${number} was waived by ${person}; ${STATUS_CONTEXT} set on ${head.slice(0, 8)}`);
+    return person;
+  };
+  const person = await recordWaiver(target);
+  if (person !== undefined) {
     io.out(`${JSON.stringify({ waived_by: person }, null, 2)}\n`);
     return;
   }
@@ -342,19 +524,32 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   if (issue === undefined) throw new Failure(stage, `pull request #${number} closes no issue; pass --issue N for the ticket it implements`);
   const tick = await ticket(io, issue);
   const effort = options.effort ?? effortFor(config, tick.labels);
-  const reviewer = reviewerFor(config, io.family);
   const mergeBase = await mergeBaseOf(io, target.base, head);
+  const reviewer = reviewerFor(config, await authoredBy(io, mergeBase, head));
+  const { diff, patchId } = await pullDiff(io, mergeBase, head);
   const dir = io.tempDir();
   const files = { schema: join(dir, "schema.json"), out: join(dir, "review.json") };
   await Bun.write(files.schema, JSON.stringify(REVIEW_SCHEMA));
-  io.print(`agent-gh: ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against ${tick.ref}`);
-  const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks: config.checks });
-  const result = await inCheckout(io, head, (cwd) => io.runReviewer(fullCommand(reviewer, effort, files, config.checks), prompt, cwd));
+  const { result, checks } = await inClone(io, head, async (cwd) => {
+    const checks = await runChecks(io, config, cwd);
+    io.print(`agent-gh: ${checksSummary(checks)}; ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against ${tick.ref}`);
+    // The reviewer reads the commit as reviewed, not what the checks built or changed.
+    if (checks.state !== "not run") {
+      await io.git(["-C", cwd, "reset", "-q", "--hard", head]);
+      await io.git(["-C", cwd, "clean", "-qffdx"]);
+    }
+    const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks });
+    return { result: await io.runReviewer(fullCommand(reviewer, effort, files), prompt, cwd), checks };
+  });
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
   const review = await answer(io, reviewer, result.stdout, files.out);
-  await call(io, stage, "POST", `${repoPath(io)}/issues/${number}/comments`, { body: reviewComment(review, { reviewer, effort, head, issue: tick.ref }) });
-  const verdict = review.verdict === "approve" ? "approved" : "changes requested";
-  await setStatus(io, head, `${verdict}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
+  const marker: ReviewMarker = { v: 1, head, merge_base: mergeBase, patch_id: patchId, verdict: review.verdict, checks: checks.state, reviewer: reviewer.family };
+  await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks }, outside));
+  // A waiver John added while the review ran stands: the labels are read afresh, and the verdict never overwrites it.
+  if ((await recordWaiver(await pull(io, stage, number))) === undefined) {
+    const verdict = review.verdict === "approve" ? "approved" : "changes requested";
+    await setStatus(io, head, reviewState(review.verdict, config.blockOn), `${verdict}; ${checksSummary(checks)}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
+  }
   io.out(`${JSON.stringify(review, null, 2)}\n`);
 };
 
@@ -386,8 +581,8 @@ export const reviewSweep = async (io: ReviewIo, options: SweepOptions): Promise<
   const out = join(io.tempDir(), "sweep.md");
   io.print(`agent-gh: ${reviewer.model} (${reviewer.family}) at ${effort} is sweeping the changes since ${base}`);
   // `codex exec review` takes no prompt beside --base; claude reads the instructions on stdin.
-  const result = await inCheckout(io, head, (cwd) =>
-    io.runReviewer(sweepCommand(reviewer, effort, base, out, config.checks), reviewer.family === "codex" ? "" : sweepPrompt(base, config.checks), cwd),
+  const result = await inClone(io, head, (cwd) =>
+    io.runReviewer(sweepCommand(reviewer, effort, base, out), reviewer.family === "codex" ? "" : sweepPrompt(base), cwd),
   );
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
   io.out(`${reviewer.family === "codex" ? await io.readFile(out) : result.stdout}`.trimEnd() + "\n");
