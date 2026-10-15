@@ -113,12 +113,13 @@ type Pull = ReturnType<typeof pull> & { commits?: number; changed_files?: number
 const page = <T>(items: readonly T[], url: URL): T[] => (Number(url.searchParams.get("page") ?? 1) === 1 ? [...items] : []);
 
 const world = ({ issues = [{ ...OPEN, labels: [] }] as Issue[], pulls = [] as Pull[], comments = {} as Record<number, unknown[]>, label = true, labelCreate = 201, config = undefined as unknown } = {}) => {
-  const state = { issues, pulls, comments, label, deleted: [] as string[], nextPull: 31, nextComment: 500, lagUntilPulls: 0, onPost: () => {} };
+  const state = { issues, pulls, comments, label, deleted: [] as string[], nextPull: 31, nextComment: 500, lagUntilPulls: 0, staleReads: 0, onPost: () => {} };
   const issue = (number: number) => state.issues.find((item) => item.number === number);
   const routes: Record<string, (body: string, url: URL) => Response> = {
     [`GET ${PATH}`]: () => reply(200, { default_branch: "main", owner: { login: "johnrees" } }),
     [`GET ${PATH}/contents/.github/agent-review.json`]: () => (config === undefined ? reply(404, {}) : reply(200, { content: Buffer.from(JSON.stringify(config)).toString("base64") })),
-    [`GET ${PATH}/pulls`]: (_, url) => reply(200, state.nextPull - 31 < state.lagUntilPulls ? [] : page(state.pulls.filter((item) => item.state === "open"), url)),
+    [`GET ${PATH}/pulls`]: (_, url) =>
+      reply(200, state.nextPull - 31 < state.lagUntilPulls || state.staleReads-- > 0 ? [] : page(state.pulls.filter((item) => item.state === "open"), url)),
     [`POST ${PATH}/pulls`]: (body) => {
       const sent = JSON.parse(body) as { title: string; head: string; body: string; draft: boolean };
       if (state.pulls.some((item) => item.state === "open" && item.head.ref === sent.head)) return reply(422, { message: "A pull request already exists" });
@@ -454,4 +455,14 @@ test("when GitHub refuses the pull request because another open one already uses
   await expect(claim(a.io, { issue: 7, refs: false, noPr: false })).rejects.toThrow("HTTP 422");
   expect(w.state.deleted).toEqual([]);
   expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], a.dir).stdout).toBe("main");
+});
+
+test("a session that read the issue as free and finds its branch's pull request already open names the holder", async () => {
+  const w = world({ pulls: [pull(30, `Closes #7.\n${marker(7, "claude", "first")}`, { head: { ref: "claude/7-fix-the-widget", sha: "a".repeat(40), repo: { full_name: "johnrees/widget" } } })] });
+  w.state.staleReads = 1;
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"), "claude", "second");
+  expect(await claim(a.io, { issue: 7, refs: false, noPr: false })).toBe(1);
+  expect(a.printed.join("\n")).toContain("#7 went to draft #30 by a claude session (first) (https://github.com/johnrees/widget/pull/30) first, on the same branch");
+  expect(w.state.deleted).toEqual([]);
 });

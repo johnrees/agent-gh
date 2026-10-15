@@ -261,7 +261,10 @@ export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number>
     // A branch another session's open pull request already uses is its, never this claim's to delete.
     const used = pushed && (await openPulls(io, stage).catch(() => [])).some((item) => text(record(record(item).head).ref) === branch);
     await dropBranch(io, stage, branch, previous, pushed && !used);
-    throw error;
+    const holder = used ? (await claimState(io, stage, issue)).holder : undefined;
+    if (holder === undefined) throw error;
+    io.print(`agent-gh: #${number} went to ${describeClaim(holder)} first, on the same branch; this claim opened nothing. Pick another issue.`);
+    return 1;
   }
   const after = await readBack(io, stage, issue, (item) => item.pr === pr);
   if (after === undefined) {
