@@ -1,5 +1,5 @@
 import type { AgentApp } from "./config.ts";
-import { type BlockOn, parseMarker, type ReviewMarker, reviewState, STATUS_CONTEXT, statusDescription } from "./review.ts";
+import { type BlockOn, outcomeSummary, parseMarker, type ReviewMarker, reviewState, STATUS_CONTEXT, statusDescription } from "./review.ts";
 
 /**
  * The agent-review workflow's pure decisions: which pull requests an event
@@ -44,9 +44,11 @@ export type MarkerPost = {
   readonly at: string;
   readonly body: string;
   readonly url: string;
+  /** A review's id, whose inline comments hold the findings posted on their lines. */
+  readonly reviewId?: number;
 };
 
-export type FoundMarker = { readonly marker: ReviewMarker; readonly at: string; readonly url: string };
+export type FoundMarker = { readonly marker: ReviewMarker; readonly at: string; readonly url: string; readonly reviewId?: number };
 
 /**
  * The review markers that count, oldest first: posted by the repository
@@ -60,7 +62,7 @@ export const validMarkers = (posts: readonly MarkerPost[], owner: string, apps: 
     .filter((post) => post.kind === "review" || (post.appId !== undefined && apps.some((app) => app.id === post.appId)))
     .flatMap((post) => {
       const marker = parseMarker(post.body);
-      return marker === undefined ? [] : [{ marker, at: post.at, url: post.url }];
+      return marker === undefined ? [] : [{ marker, at: post.at, url: post.url, ...(post.reviewId === undefined ? {} : { reviewId: post.reviewId }) }];
     })
     .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
 
@@ -93,18 +95,21 @@ export const agentPull = (
   return pull.commits === undefined || pull.commits.some((message) => agentCommit(message, apps));
 };
 
+/** Whether a marker's review passes `block_on`. */
+export const passes = (found: FoundMarker, blockOn: BlockOn): boolean => reviewState(found.marker, blockOn) === "success";
+
 /**
  * The marker a head with no review of its own may carry forward: the latest
  * for the same patch (`git patch-id --stable` of its diff from its merge
- * base), when that one approved. A later `changes_requested` on the same
- * patch is never skipped for an earlier approval. The caller still checks
+ * base), when that one passes `block_on`. A later blocking review of the
+ * same patch is never skipped for an earlier pass. The caller still checks
  * that the base's changes since the marker's merge base touch none of the
  * patch's files.
  */
-export const carryCandidate = (markers: readonly FoundMarker[], patchId: string | null): FoundMarker | undefined => {
+export const carryCandidate = (markers: readonly FoundMarker[], patchId: string | null, blockOn: BlockOn): FoundMarker | undefined => {
   if (patchId === null) return undefined;
   const latest = markers.findLast((found) => found.marker.patch_id === patchId);
-  return latest?.marker.verdict === "approve" ? latest : undefined;
+  return latest !== undefined && passes(latest, blockOn) ? latest : undefined;
 };
 
 /** The latest marker for `head`, which decides its status. */
@@ -120,7 +125,7 @@ const status = (state: Status["state"], description: string, targetUrl?: string)
 /**
  * agent-review for pull request `number`'s head: success for a pull request
  * that is not an agent's, or that a person waived; else the head's own
- * marker's verdict (`block_on` fails it); else an approval carried forward;
+ * marker, which `block_on` judges; else a passing review carried forward;
  * else pending, naming the command that reviews it.
  */
 export const reviewStatus = (input: {
@@ -135,15 +140,12 @@ export const reviewStatus = (input: {
   if (input.waivedBy !== undefined) return status("success", `waived by ${input.waivedBy}`);
   if (input.current !== undefined) {
     const { marker } = input.current;
-    return status(
-      reviewState(marker.verdict, input.blockOn),
-      `${marker.verdict === "approve" ? "approved" : "changes requested"}; checks ${marker.checks} (${marker.reviewer} review)`,
-      input.current.url,
-    );
+    return status(reviewState(marker, input.blockOn), `${outcomeSummary(marker, input.blockOn)}; checks ${marker.checks} (${marker.reviewer} review)`, input.current.url);
   }
   if (input.carried !== undefined) {
     const { marker } = input.carried;
-    return status("success", `approved at ${marker.head.slice(0, 8)}, carried forward: same patch, base changes miss its files; checks ${marker.checks}`, input.carried.url);
+    const passed = input.blockOn === "changes_requested" ? "approved" : "passed";
+    return status("success", `${passed} at ${marker.head.slice(0, 8)}, carried forward: same patch, base changes miss its files; checks ${marker.checks}`, input.carried.url);
   }
   return status("pending", `needs a review: run \`gh pr checkout ${input.number} && agent-gh review full --pr ${input.number}\``);
 };

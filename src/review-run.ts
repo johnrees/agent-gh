@@ -1,6 +1,6 @@
 import { rmSync } from "node:fs";
 import { join } from "node:path";
-import { REGISTRY } from "./config.ts";
+import { agentApps, REGISTRY } from "./config.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { familyNames } from "./family.ts";
 import { type Api, request } from "./github.ts";
@@ -8,6 +8,7 @@ import { HARNESSES, type Env } from "./harness.ts";
 import { parseRemoteUrl, parseRepo, type Repo, slug } from "./repo.ts";
 import { checkState, pushedBranches, requiredChecks } from "./merge.ts";
 import { type ApiIo, describeRequired, everyPage, pullThreads, repoOwner } from "./threads-run.ts";
+import { type MarkerPost, validMarkers } from "./status.ts";
 import {
   agentReviewStatus,
   type ApiCall,
@@ -27,8 +28,12 @@ import {
   graphqlRefWrites,
   inlineComment,
   mergeCommand,
+  outcomeSummary,
   outputTail,
+  parseMarker,
+  type PostedComment,
   prRepoFlag,
+  type PriorReview,
   parseReview,
   parseReviewConfig,
   type PullRequest,
@@ -159,6 +164,63 @@ const ticket = async (io: ReviewIo, { repo, number }: IssueRef): Promise<Ticket>
   }
   const ref = slug(repo).toLowerCase() === slug(io.repo).toLowerCase() ? `#${number}` : `${slug(repo)}#${number}`;
   return { ref, number, title: text(issue.title), labels: labelNames(issue.labels), body: text(issue.body), lastComment };
+};
+
+/** Every review and conversation comment on pull request `number` that may hold a review marker. */
+export const markerPosts = async (io: ApiIo, stage: Stage, number: number): Promise<MarkerPost[]> => {
+  const reviews = (await everyPage(io, stage, `${repoPath(io)}/pulls/${number}/reviews`)).map(record).map((review): MarkerPost => ({
+    author: text(record(review.user).login), appId: undefined, kind: "review", at: text(review.submitted_at), body: text(review.body), url: text(review.html_url),
+    ...(Number.isSafeInteger(review.id) ? { reviewId: review.id as number } : {}),
+  }));
+  const comments = (await everyPage(io, stage, `${repoPath(io)}/issues/${number}/comments`)).map(record).map((comment): MarkerPost => {
+    const app = record(comment.performed_via_github_app).id;
+    return { author: text(record(comment.user).login), appId: Number.isSafeInteger(app) ? (app as number) : undefined, kind: "comment", at: text(comment.created_at), body: text(comment.body), url: text(comment.html_url) };
+  });
+  return [...reviews, ...comments];
+};
+
+/**
+ * The pull request's latest earlier review, from the markers the workflow
+ * counts: its head, whether that head is an ancestor of `head` (so the diff
+ * since it shows what changed), its findings as posted, and every comment the
+ * pull request's author has posted since, outside that review, without a
+ * marker. Undefined when it has none.
+ */
+const priorReview = async (io: ReviewIo, pr: Pull, head: string): Promise<PriorReview | undefined> => {
+  const stage = "reviewing";
+  const posts = await markerPosts(io, stage, pr.number);
+  const found = validMarkers(posts, await repoOwner(io, stage), agentApps()).at(-1);
+  if (found === undefined) return undefined;
+  const prior = found.marker.head;
+  const reachable = (await io.git(["merge-base", "--is-ancestor", prior, head])) !== undefined;
+  io.print(
+    reachable
+      ? `agent-gh: re-reviewing the changes since the review of ${prior.slice(0, 8)}`
+      : `agent-gh: the earlier review's head ${prior.slice(0, 8)} is not in ${head.slice(0, 8)}'s history, so this is a full review`,
+  );
+  if (!reachable) return { head: prior, reachable, body: "", inline: [], replies: [] };
+  const lines = (await everyPage(io, stage, `${repoPath(io)}/pulls/${pr.number}/comments`)).map(record);
+  const onLine = (comment: Record<string, unknown>): PostedComment => {
+    const line = comment.line ?? comment.original_line;
+    return { where: `\`${text(comment.path)}${Number.isSafeInteger(line) ? `:${line as number}` : ""}\``, body: text(comment.body) };
+  };
+  const inline = found.reviewId === undefined ? [] : lines.filter((comment) => comment.pull_request_review_id === found.reviewId).map(onLine);
+  const author = (login: string) => login.toLowerCase() === pr.author.toLowerCase();
+  const since = (at: string) => at > found.at;
+  const replies: (PostedComment & { readonly at: string })[] = [
+    ...lines
+      .filter((comment) => author(text(record(comment.user).login)) && since(text(comment.created_at)) && comment.pull_request_review_id !== found.reviewId)
+      .map((comment) => ({ ...onLine(comment), where: `On ${onLine(comment).where}`, at: text(comment.created_at) })),
+    ...posts
+      .filter((post) => author(post.author) && since(post.at) && post.body.trim() !== "" && parseMarker(post.body) === undefined)
+      .map((post) => ({ where: `On the conversation`, body: post.body, at: post.at })),
+  ].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  return {
+    head: prior, reachable,
+    body: (posts.find((post) => post.url === found.url)?.body ?? "").replace(/<!-- agent-review \{[^\n]*?\} -->\n?/, ""),
+    inline,
+    replies: replies.map(({ where, body }) => ({ where, body })),
+  };
 };
 
 /** The person who waived the review of this pull request, if one did and the label is still on it. */
@@ -937,19 +999,21 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const base: PullBase = { ref: target.base, sha: mergeBase };
   const checks: ChecksResult = config.checks.length === 0 ? { state: "not run" } : await inClone(io, head, (cwd) => runChecks(io, config, cwd, base), base);
   io.print(`agent-gh: ${checksSummary(checks)}; ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against ${tick.ref}`);
+  const prior = await priorReview(io, target, head);
   // A fresh clone: the reviewer reads the commit as pushed, never what the checks built or changed.
-  const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks });
+  const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks, blockOn: config.blockOn, prior });
   const result = await inClone(io, head, (cwd) => io.runReviewer(fullCommand(reviewer, effort, files), prompt, cwd), base);
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
   const review = await answer(io, reviewer, result.stdout, files.out);
-  const marker: ReviewMarker = { v: 1, head, merge_base: mergeBase, patch_id: patchId, verdict: review.verdict, checks: checks.state, reviewer: reviewer.family };
+  const marker: ReviewMarker = {
+    v: 1, head, merge_base: mergeBase, patch_id: patchId, verdict: review.verdict, checks: checks.state, reviewer: reviewer.family, priorities: review.findings.map((finding) => finding.priority),
+  };
   const before = actions ? await headStatus(io, head) : undefined;
-  await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput }, outside));
+  await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined }, outside));
   if (actions) await awaitWorkflowStatus(io, head, before);
   // A waiver John added while the review ran stands: the labels are read afresh, and the verdict never overwrites it.
   else if ((await recordWaiver(await pull(io, stage, number))) === undefined) {
-    const verdict = review.verdict === "approve" ? "approved" : "changes requested";
-    await setStatus(io, head, reviewState(review.verdict, config.blockOn), `${verdict}; ${checksSummary(checks)}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
+    await setStatus(io, head, reviewState(marker, config.blockOn), `${outcomeSummary(marker, config.blockOn)}; ${checksSummary(checks)}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
   }
   io.out(`${JSON.stringify(review, null, 2)}\n`);
 };

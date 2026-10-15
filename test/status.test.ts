@@ -66,10 +66,18 @@ test("an approval carries forward only from the latest marker for the same patch
   const approved = found({ head: A, patch_id: C }, "1");
   const blocked = found({ head: B, patch_id: C, verdict: "changes_requested" }, "2");
   const other = found({ head: D, patch_id: D }, "3");
-  expect(carryCandidate([approved, other], C)).toBe(approved);
-  expect(carryCandidate([approved, blocked, other], C)).toBeUndefined();
-  expect(carryCandidate([approved], D)).toBeUndefined();
-  expect(carryCandidate([found({ patch_id: null }, "1")], null)).toBeUndefined();
+  expect(carryCandidate([approved, other], C, "changes_requested")).toBe(approved);
+  expect(carryCandidate([approved, blocked, other], C, "changes_requested")).toBeUndefined();
+  expect(carryCandidate([approved], D, "changes_requested")).toBeUndefined();
+  expect(carryCandidate([found({ patch_id: null }, "1")], null, "changes_requested")).toBeUndefined();
+});
+
+test("under a priority threshold, a review carries forward when it passes the threshold, never one that records no priorities", () => {
+  const minor = found({ patch_id: C, verdict: "changes_requested", priorities: ["P3"] }, "1");
+  const major = found({ patch_id: C, verdict: "approve", priorities: ["P2"] }, "2");
+  expect(carryCandidate([minor], C, "P2")).toBe(minor);
+  expect(carryCandidate([minor, major], C, "P2")).toBeUndefined();
+  expect(carryCandidate([found({ patch_id: C }, "1")], C, "P2")).toBeUndefined();
 });
 
 test("agent-review: not an agent's, waived, the head's own verdict, carried forward, else pending with the command", () => {
@@ -84,6 +92,23 @@ test("agent-review: not an agent's, waived, the head's own verdict, carried forw
     state: "success", description: "approved at aaaaaaaa, carried forward: same patch, base changes miss its files; checks passed",
   });
   expect(reviewStatus(base)).toMatchObject({ state: "pending", description: "needs a review: run `gh pr checkout 12 && agent-gh review full --pr 12`", targetUrl: undefined });
+});
+
+test("agent-review at block_on P2: the head's marker fails on a P2 or above, passes on P3s whatever the verdict, and fails closed without priorities", () => {
+  const base = { number: 12, agent: true, waivedBy: undefined, current: undefined, carried: undefined, blockOn: "P2" } as const;
+  expect(reviewStatus({ ...base, current: found({ verdict: "changes_requested", priorities: ["P3", "P3"] }, "1") })).toMatchObject({
+    state: "success", description: "changes requested; 0 finding(s) at P2 or above; checks passed (codex review)",
+  });
+  expect(reviewStatus({ ...base, current: found({ verdict: "approve", priorities: ["P3", "P2"] }, "1") })).toMatchObject({
+    state: "failure", description: "approved; 1 finding(s) at P2 or above; checks passed (codex review)",
+  });
+  expect(reviewStatus({ ...base, current: found({}, "1") })).toMatchObject({
+    state: "failure", description: "approved; the review records no finding priorities, which block_on P2 needs: review again; checks passed (codex review)",
+  });
+  expect(reviewStatus({ ...base, waivedBy: "johnrees", current: found({ priorities: ["P0"] }, "1") })).toMatchObject({ state: "success", description: "waived by johnrees" });
+  expect(reviewStatus({ ...base, carried: found({ priorities: ["P3"] }, "1") })).toMatchObject({
+    state: "success", description: "passed at aaaaaaaa, carried forward: same patch, base changes miss its files; checks passed",
+  });
 });
 
 const comment = (id: number, author: string, appId: number | undefined, createdAt: string, extra: Partial<ThreadComment> = {}): ThreadComment => ({
@@ -201,6 +226,8 @@ type Scenario = {
   optedIn?: boolean;
   /** GitHub's answer to GraphQL, when not 200. */
   graphqlStatus?: number;
+  /** The config's block_on, if it sets one. */
+  blockOn?: string;
   /** A conversation comment posted the moment this run first sets a status, as when another run's event lands meanwhile. */
   commentWhileWriting?: unknown;
 };
@@ -210,7 +237,7 @@ const statusWorld = (scenario: Scenario) => {
   const fake = fakeGitHub({
     [`GET ${REPO}/pulls/12`]: () => reply(200, { state: "open", head: { sha: head }, base: { ref: "main" }, labels: labels.map((name) => ({ name })), created_at: "2026-10-10T00:00:00Z", user: author }),
     [`GET ${REPO}/contents/.github/agent-review.json`]: () =>
-      optedIn ? reply(200, { content: Buffer.from(JSON.stringify({ reviewers: { codex: { model: "m" } }, status_writer: "actions" })).toString("base64") }) : reply(404, {}),
+      optedIn ? reply(200, { content: Buffer.from(JSON.stringify({ reviewers: { codex: { model: "m" } }, status_writer: "actions", ...(scenario.blockOn === undefined ? {} : { block_on: scenario.blockOn }) })).toString("base64") }) : reply(404, {}),
     [`GET ${REPO}`]: () => reply(200, { default_branch: "main", owner: { login: "johnrees" } }),
     [`GET ${REPO}/issues/12`]: () => reply(200, { performed_via_github_app: null }),
     [`GET ${REPO}/pulls/12/commits`]: (_, url) => {
@@ -304,6 +331,25 @@ test("an unchanged patch rebased over base changes to other files carries its ap
   // A commit git cannot fetch carries nothing.
   const unreachable = statusWorld({ head: repo.head2, mergeBase: repo.mb2, remote: "file:///nowhere", reviews: [approval] });
   expect((await deriveStatuses(unreachable.io, 12))?.statuses[0]).toMatchObject({ state: "pending" });
+});
+
+test("the workflow judges the marker's priorities at block_on P2, carries forward only a review that passes it, and fails a marker without priorities", async () => {
+  const at = "2026-10-11T00:00:00Z";
+  const state = async (value: ReviewMarker) =>
+    (await deriveStatuses(statusWorld({ head: A, mergeBase: B, blockOn: "P2", reviews: [reviewOf(value, at)] }).io, 12))?.statuses[0];
+  expect(await state(marker({ verdict: "changes_requested", priorities: ["P3"] }))).toMatchObject({ state: "success", description: "changes requested; 0 finding(s) at P2 or above; checks passed (codex review)" });
+  expect(await state(marker({ priorities: ["P2"] }))).toMatchObject({ state: "failure", description: "approved; 1 finding(s) at P2 or above; checks passed (codex review)" });
+  expect(await state(marker())).toMatchObject({ state: "failure", description: "approved; the review records no finding priorities, which block_on P2 needs: review again; checks passed (codex review)" });
+
+  const repo = history();
+  const { patchId } = await pullDiff(repo.io, repo.mb1, repo.head1);
+  const remote = `file://${repo.dir}`;
+  repo.git(["update-ref", "refs/pull/12/head", repo.head2]);
+  const carry = async (value: Partial<ReviewMarker>) =>
+    (await deriveStatuses(statusWorld({ head: repo.head2, mergeBase: repo.mb2, remote, blockOn: "P2", reviews: [reviewOf(marker({ head: repo.head1, merge_base: repo.mb1, patch_id: patchId, ...value }), at)] }).io, 12))?.statuses[0];
+  expect(await carry({ verdict: "changes_requested", priorities: ["P3"] })).toMatchObject({ state: "success", description: `passed at ${repo.head1.slice(0, 8)}, carried forward: same patch, base changes miss its files; checks passed` });
+  expect(await carry({ priorities: ["P1"] })).toMatchObject({ state: "pending" });
+  expect(await carry({})).toMatchObject({ state: "pending" });
 });
 
 test("a person's waiver passes agent-review; an App's does not", async () => {
