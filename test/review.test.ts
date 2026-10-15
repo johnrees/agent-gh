@@ -9,12 +9,13 @@ import {
   authorFamily,
   diffLines,
   effortFor,
-  graphqlMergeIds,
+  graphqlMerges,
   labelMatches,
   mergeCommand,
   outputTail,
   parseMarker,
   parseReviewConfig,
+  prRepoFlag,
   readyTarget,
   reviewerFor,
   reviewed,
@@ -288,6 +289,7 @@ const world = ({
       if (args[0] === "rev-parse" && args.includes("@{upstream}")) return upstream ? "origin/feature" : undefined;
       if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return upstream ? "feature" : "HEAD";
       if (args[0] === "rev-parse" && args.includes("--git-common-dir")) return "/work/widget/.git";
+      if (args[0] === "rev-parse" && args.includes("--verify")) return args.at(-1) === "origin/main^{commit}" ? OLD : undefined;
       if (args[0] === "fetch") return args.at(-1) === "+refs/heads/main:refs/remotes/origin/main" ? "" : undefined;
       if (args[0] === "clone" || args[0] === "-C") {
         gitCalls.push(args.join(" "));
@@ -589,14 +591,19 @@ test("gh pr ready runs only after the gate passes, with the gate's token; other 
 });
 
 test("gh pr merge names its pull request as gh does, skipping flag values, and --admin is always seen", () => {
-  expect(mergeCommand(["pr", "merge"])).toEqual({ target: { branch: undefined }, admin: false });
-  expect(mergeCommand(["pr", "merge", "12", "--squash", "-d"])).toEqual({ target: { number: 12 }, admin: false });
-  expect(mergeCommand(["pr", "merge", "-b", "body text", "-t", "subject", "--match-head-commit", HEAD, "#12"])).toEqual({ target: { number: 12 }, admin: false });
-  expect(mergeCommand(["pr", "merge", "-sb", "12", "13"])).toEqual({ target: { number: 13 }, admin: false });
-  expect(mergeCommand(["pr", "merge", "--body=12", "feature"])).toEqual({ target: { branch: "feature" }, admin: false });
-  expect(mergeCommand(["-R", "o/r", "pr", "merge", "https://github.com/o/r/pull/4", "--admin"])).toEqual({ target: { number: 4, repo: "o/r" }, admin: true });
+  expect(mergeCommand(["pr", "merge"])).toEqual({ target: { branch: undefined }, admin: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "12", "--squash", "-d"])).toEqual({ target: { number: 12 }, admin: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "-b", "body text", "-t", "subject", "--match-head-commit", HEAD, "#12"])).toEqual({ target: { number: 12 }, admin: false, headCommit: HEAD });
+  expect(mergeCommand(["pr", "merge", "-sb", "12", "13"])).toEqual({ target: { number: 13 }, admin: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "--body=12", "feature"])).toEqual({ target: { branch: "feature" }, admin: false, headCommit: undefined });
+  expect(mergeCommand(["-R", "o/r", "pr", "merge", "https://github.com/o/r/pull/4", "--admin"])).toEqual({ target: { number: 4, repo: "o/r" }, admin: true, headCommit: undefined });
   expect(mergeCommand(["pr", "merge", "12", "--admin=false", "--admin"])?.admin).toBe(true);
   expect(mergeCommand(["pr", "merge", "12", "--admin", "--admin=false"])?.admin).toBe(false);
+  for (const spelling of ["--admin=1", "--admin=t", "--admin=True", "--admin=yes"]) expect(mergeCommand(["pr", "merge", "12", spelling])?.admin).toBe(true);
+  expect(mergeCommand(["pr", "merge", "12", "--admin", "--admin=F"])?.admin).toBe(false);
+  expect(mergeCommand(["pr", "merge", "12", "--match-head-commit", HEAD])?.headCommit).toBe(HEAD);
+  expect(prRepoFlag(["pr", "merge", "-sR", "acme/blocked", "12"])).toBe("acme/blocked");
+  expect(prRepoFlag(["pr", "merge", "-sRacme/blocked", "12"])).toBe("acme/blocked");
   expect(mergeCommand(["pr", "merge", "12", "--disable-auto"])).toBeUndefined();
   expect(mergeCommand(["pr", "merge", "12", "--disable-auto", "--admin"])?.admin).toBe(true);
   expect(mergeCommand(["pr", "view", "12"])).toBeUndefined();
@@ -632,14 +639,37 @@ test("an agent's gh pr merge runs only once every check the base branch requires
   expect(await dispatchGh(["pr", "merge", "12", "--squash"], here, mergeDeps(world({ rules: REQUIRED, ...PASSED }).io, calls))).toBe(0);
   // A base branch that requires nothing holds nothing back.
   expect(await dispatchGh(["pr", "merge"], here, mergeDeps(world().io, calls))).toBe(0);
-  expect(calls).toEqual(["gh pr merge 12 --squash", "gh pr merge"]);
+  // The merge requires the head whose checks passed, so a push in between is not merged in its place.
+  expect(calls).toEqual([`gh pr merge 12 --squash --match-head-commit ${HEAD}`, `gh pr merge --match-head-commit ${HEAD}`]);
+  calls.length = 0;
+  expect(await dispatchGh(["pr", "merge", "12", "--match-head-commit", HEAD, "--", "x"], here, mergeDeps(world({ rules: REQUIRED, ...PASSED }).io, calls))).toBe(0);
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--match-head-commit", OLD], here, mergeDeps(world({ rules: REQUIRED, ...PASSED }).io, calls)))).toBe(
+    "--match-head-commit bbbbbbbb is not the head whose checks passed (aaaaaaaa)",
+  );
+  expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD} -- x`]);
+});
+
+test("gh pr merge checks the repository a clustered -R names, as gh merges there", async () => {
+  const calls: string[] = [];
+  const checked: string[] = [];
+  const io = world({ rules: REQUIRED, ...PASSED }).io;
+  const deps: GhDispatch = {
+    ...mergeDeps(io, calls),
+    io: (repo) => {
+      checked.push(slug(repo));
+      return io;
+    },
+  };
+  await dispatchGh(["pr", "merge", "-sR", "johnrees/widget", "12"], parseRepo("johnrees/elsewhere"), deps);
+  expect(checked).toEqual(["johnrees/widget"]);
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "-R", "not a repo", "12"], parseRepo("johnrees/elsewhere"), deps))).toContain("cannot tell which repository");
 });
 
 test("an agent's gh pr merge --admin is always refused, and an unnamed repository fails closed", async () => {
   const calls: string[] = [];
   const passed = world({ rules: REQUIRED, ...PASSED });
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--admin"], parseRepo("johnrees/widget"), mergeDeps(passed.io, calls)))).toContain("an agent never merges with `--admin`");
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], undefined, mergeDeps(passed.io, calls)))).toBe("cannot tell which repository `gh pr merge` acts on; pass -R OWNER/REPO");
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], undefined, mergeDeps(passed.io, calls)))).toBe("cannot tell which repository the pull request is in; pass -R OWNER/REPO");
   expect(await gateRefusal(dispatchGh(["pr", "merge", "elsewhere"], parseRepo("johnrees/widget"), mergeDeps(world({ branchPulls: [] }).io, calls)))).toBe(
     "cannot find the pull request `gh pr merge` names; name it by number",
   );
@@ -672,16 +702,26 @@ test("a gh api call that merges is found in every spelling, and one the guard ca
   expect(plan(["api", "-X", "PUT", "repos/o/r/pulls/12/%6Derge"])).toMatchObject({ kind: "refuse" });
   expect(plan(["api", "-X", "PUT", "repos/o/r/pulls/12/x/../merge"])).toMatchObject({ kind: "refuse" });
   expect(plan(["api", "graphql", "-f", "query=q"])).toEqual({ kind: "graphql" });
+  // A repository's or an encoded label's name is not the operation.
+  expect(plan(["api", "repos/acme/merge-tools/issues", "-f", "title=Bug"])).toEqual({ kind: "none" });
+  expect(plan(["api", "repos/acme/merges/issues", "-f", "title=Bug"])).toEqual({ kind: "none" });
+  expect(plan(["api", "-X", "DELETE", "repos/o/r/labels/needs%20review"])).toEqual({ kind: "none" });
+  expect(plan(["api", "-X", "PUT", "repositories/1/pulls/12/merge"])).toMatchObject({ kind: "refuse" });
 });
 
-test("a GraphQL merge mutation's pull request ids are read from the query or its variables", () => {
-  expect(graphqlMergeIds('mutation { mergePullRequest(input: {pullRequestId: "PR_1"}) { clientMutationId } }', {})).toEqual(["PR_1"]);
-  expect(graphqlMergeIds("mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }", { id: "PR_2" })).toEqual(["PR_2"]);
-  expect(graphqlMergeIds("query { viewer { login } }", {})).toEqual([]);
-  expect(graphqlMergeIds("mutation($input: MergePullRequestInput!) { mergePullRequest(input: $input) { clientMutationId } }", { input: { pullRequestId: "PR_3" } })).toHaveProperty("refuse");
-  expect(graphqlMergeIds("mutation($id: ID!) { mergePullRequest(input: {pullRequestId: $id}) { clientMutationId } }", {})).toHaveProperty("refuse");
-  expect(graphqlMergeIds('mutation { a: mergePullRequest(input: {pullRequestId: "PR_1"}) { x } b: mergePullRequest(input: $i) { x } }', {})).toHaveProperty("refuse");
-  expect(graphqlMergeIds('mutation { mergeBranch(input: {repositoryId: "R", base: "main", head: "x"}) { x } }', {})).toHaveProperty("refuse");
+test("each GraphQL merge mutation's pull request and expected head are read from its own arguments", () => {
+  const H = "e".repeat(40);
+  expect(graphqlMerges(`mutation { mergePullRequest(input: {pullRequestId: "PR_1", expectedHeadOid: "${H}"}) { clientMutationId } }`, {})).toEqual([{ id: "PR_1", expectedHeadOid: H }]);
+  expect(graphqlMerges("mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }", { id: "PR_2" })).toEqual([{ id: "PR_2", expectedHeadOid: undefined }]);
+  expect(graphqlMerges("mutation($input: MergePullRequestInput!) { mergePullRequest(input: $input) { clientMutationId } }", { input: { pullRequestId: "PR_3", expectedHeadOid: H } })).toEqual([{ id: "PR_3", expectedHeadOid: H }]);
+  expect(graphqlMerges('mutation { enqueuePullRequest(input: {pullRequestId: "P(R)"}) { x } }', {})).toEqual([{ id: "P(R)", expectedHeadOid: undefined }]);
+  expect(graphqlMerges("query { viewer { login } }", {})).toEqual([]);
+  expect(graphqlMerges("mutation($id: ID!) { mergePullRequest(input: {pullRequestId: $id}) { clientMutationId } }", {})).toHaveProperty("refuse");
+  // Another mutation's pull request id never stands in for the merge's own.
+  expect(graphqlMerges('mutation($input: MergePullRequestInput!) { addPullRequestReview(input: {pullRequestId: "PR_A"}) { x } mergePullRequest(input: $input) { x } }', { input: {} })).toHaveProperty("refuse");
+  expect(graphqlMerges('mutation { a: mergePullRequest(input: {pullRequestId: "PR_1"}) { x } b: mergePullRequest(input: $i) { x } }', {})).toHaveProperty("refuse");
+  expect(graphqlMerges("mutation { mergePullRequest # hidden\n (input: {}) { x } }", {})).toHaveProperty("refuse");
+  expect(graphqlMerges('mutation { mergeBranch(input: {repositoryId: "R", base: "main", head: "x"}) { x } }', {})).toHaveProperty("refuse");
 });
 
 test("an agent's gh api merge runs only when gh pr merge would", async () => {
@@ -691,7 +731,7 @@ test("an agent's gh api merge runs only when gh pr merge would", async () => {
   expect(await gateRefusal(dispatchGh(["api", "-X", "PUT", "repos/{owner}/{repo}/pulls/12/merge"], here, mergeDeps(unmet.io, calls)))).toContain(
     "has not passed every check main requires (`build` missing, `agent-review` missing)",
   );
-  const mutation = 'mutation { mergePullRequest(input: {pullRequestId: "PR_12"}) { clientMutationId } }';
+  const mutation = `mutation { mergePullRequest(input: {pullRequestId: "PR_12", expectedHeadOid: "${HEAD}"}) { clientMutationId } }`;
   expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=${mutation}`], here, mergeDeps(unmet.io, calls)))).toContain("has not passed every check main requires");
   expect(await gateRefusal(dispatchGh(["api", "graphql", "--input", "body.json"], undefined, mergeDeps(unmet.io, calls, { "body.json": JSON.stringify({ query: mutation }) })))).toContain(
     "has not passed every check main requires",
@@ -711,11 +751,23 @@ test("an agent's gh api merge runs only when gh pr merge would", async () => {
   expect(await dispatchGh(["api", "graphql", "-F", "query=@q.graphql"], here, mergeDeps(passed.io, calls, { "q.graphql": mutation }))).toBe(0);
   expect(await dispatchGh(["api", "graphql", "-f", "query=query { viewer { login } }"], here, mergeDeps(unmet.io, calls))).toBe(0);
   expect(await dispatchGh(["api", "repos/johnrees/widget/pulls/12/merge"], here, mergeDeps(unmet.io, calls))).toBe(0);
+  // A GraphQL merge must name the head whose checks passed; one without it, or with another, is refused.
+  const unbound = 'mutation { mergePullRequest(input: {pullRequestId: "PR_12"}) { clientMutationId } }';
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=${unbound}`], here, mergeDeps(passed.io, calls)))).toBe(
+    `a GraphQL merge of #12 must give expectedHeadOid: "${HEAD}", the head whose checks passed, so a later push is not merged in its place`,
+  );
+  // gh nests -F input[pullRequestId]=... into the input variable.
+  const nested = "mutation($input: MergePullRequestInput!) { mergePullRequest(input: $input) { clientMutationId } }";
+  expect(await dispatchGh(["api", "graphql", "-f", `query=${nested}`, "-F", "input[pullRequestId]=PR_12", "-F", `input[expectedHeadOid]=${HEAD}`], here, mergeDeps(passed.io, calls))).toBe(0);
+  expect(await gateRefusal(dispatchGh(["api", "-X", "PUT", "repos/johnrees/widget/pulls/12/merge", "-f", `sha=${OLD}`], here, mergeDeps(passed.io, calls)))).toBe(
+    "the merge's sha bbbbbbbb is not the head whose checks passed (aaaaaaaa)",
+  );
   expect(calls).toEqual([
-    "gh api -X PUT repos/johnrees/widget/pulls/12/merge",
+    `gh api -X PUT repos/johnrees/widget/pulls/12/merge -f sha=${HEAD}`,
     "gh api graphql -F query=@q.graphql",
     "ungated gh api graphql -f query=query { viewer { login } }",
     "ungated gh api repos/johnrees/widget/pulls/12/merge",
+    `gh api graphql -f query=${nested} -F input[pullRequestId]=PR_12 -F input[expectedHeadOid]=${HEAD}`,
   ]);
 });
 
@@ -759,7 +811,9 @@ test("a sweep prints the reviewer's text against the pull request's base and rec
   const w = world({ answer: "No defects found." });
   await reviewSweep(w.io, {});
   const [{ command, stdin }] = w.commands as [{ command: readonly string[]; stdin: string; cwd: string }];
-  expect(command.slice(0, 5)).toEqual(["codex", "exec", "review", "--base", "origin/main"]);
+  // The clone does not have the caller's origin/main, so the base goes in as the commit it names there.
+  expect(w.gitCalls).toContain(`-C ${w.commands[0]?.cwd} update-ref refs/heads/agent-gh-sweep-base ${OLD}`);
+  expect(command.slice(0, 5)).toEqual(["codex", "exec", "review", "--base", "agent-gh-sweep-base"]);
   expect(command).toContain('model_reasoning_effort="xhigh"');
   expect(stdin).toBe("");
   expect(w.output()).toBe("No defects found.\n");

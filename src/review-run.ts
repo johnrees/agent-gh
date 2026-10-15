@@ -21,10 +21,11 @@ import {
   effortFor,
   type Finding,
   fullPrompt,
-  graphqlMergeIds,
+  graphqlMerges,
   inlineComment,
   mergeCommand,
   outputTail,
+  prRepoFlag,
   parseReview,
   parseReviewConfig,
   type PullRequest,
@@ -225,9 +226,11 @@ const branchPath = (branch: string) => branch.split("/").map(encodeURIComponent)
  * bypass the base branch's rules, so every check the branch requires (its
  * rulesets' and classic protection's) must have passed on the pull request's
  * head. `--admin` is always refused, and so is a pull request the guard
- * cannot find. A branch that requires no checks is not held.
+ * cannot find. A branch that requires no checks is not held. Returns the
+ * head it checked, which the merge must then require, so a commit pushed
+ * meanwhile is not merged in its place.
  */
-export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolean): Promise<void> => {
+export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolean): Promise<string> => {
   const stage = MERGE_STAGE;
   if (admin) throw new Failure(stage, "an agent never merges with `--admin`, which skips the base branch's requirements; merge without it once the required checks pass, or ask John");
   const number = await pullNumber(io, stage, target);
@@ -237,7 +240,7 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
   const rules = await pages(io, stage, `${repoPath(io)}/rules/branches/${base}`);
   const branch = (await call(io, stage, "GET", `${repoPath(io)}/branches/${base}`)).value;
   const required = requiredChecks(rules, branch);
-  if (required.length === 0) return;
+  if (required.length === 0) return pr.head;
   const statuses = record((await call(io, stage, "GET", `${repoPath(io)}/commits/${pr.head}/status?per_page=100`)).value).statuses;
   const unmet: string[] = [];
   for (const check of required) {
@@ -247,7 +250,7 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
     const state = checkState(check, statuses, runs);
     if (state !== "passed") unmet.push(`\`${check.context}\` ${state}`);
   }
-  if (unmet.length === 0) return;
+  if (unmet.length === 0) return pr.head;
   throw new Failure(
     stage,
     `pull request #${number}'s head ${pr.head.slice(0, 8)} has not passed every check ${pr.base} requires (${unmet.join(", ")}); wait for them to pass, fix what fails, or ask John to merge it`,
@@ -292,18 +295,31 @@ export const dispatchGh = async (args: readonly string[], repo: Repo | undefined
     const api = apiCall(args);
     return api === undefined ? deps.run(args) : dispatchApi(args, api, repo, deps);
   }
-  // gh acts on a pull request URL's repository, whatever the clone or flags say.
-  const targetRepo = "repo" in target && target.repo !== undefined ? parseRepo(target.repo) : repo;
+  // gh acts on a pull request URL's repository, whatever the clone or flags say; else on -R's, in any spelling gh reads.
+  const flag = prRepoFlag(args);
+  const targetRepo = "repo" in target && target.repo !== undefined ? parseRepo(target.repo) : flag !== undefined ? parseRepo(flag) : repo;
   if (targetRepo === undefined) {
-    if (merge === undefined) return deps.run(args);
-    throw new Failure(MERGE_STAGE, "cannot tell which repository `gh pr merge` acts on; pass -R OWNER/REPO");
+    if (merge === undefined && flag === undefined) return deps.run(args);
+    throw new Failure(merge === undefined ? "checking the review" : MERGE_STAGE, "cannot tell which repository the pull request is in; pass -R OWNER/REPO");
   }
   return deps.withToken(targetRepo, async (env) => {
     const io = deps.io(targetRepo, env);
-    if (merge !== undefined) await gateMerge(io, merge.target, merge.admin);
-    else await gateReady(io, target);
-    return deps.runWith(args, env);
+    if (merge === undefined) {
+      await gateReady(io, target);
+      return deps.runWith(args, env);
+    }
+    const head = await gateMerge(io, merge.target, merge.admin);
+    if (merge.headCommit !== undefined && merge.headCommit !== head) {
+      throw new Failure(MERGE_STAGE, `--match-head-commit ${merge.headCommit.slice(0, 8)} is not the head whose checks passed (${head.slice(0, 8)})`);
+    }
+    return deps.runWith(merge.headCommit === undefined ? withFlags(args, ["--match-head-commit", head]) : args, env);
   });
+};
+
+/** gh's arguments with `extra` flags added before any `--`, where gh still reads them as flags. */
+const withFlags = (args: readonly string[], extra: readonly string[]): string[] => {
+  const end = args.indexOf("--");
+  return end < 0 ? [...args, ...extra] : [...args.slice(0, end), ...extra, ...args.slice(end)];
 };
 
 /**
@@ -318,23 +334,47 @@ const dispatchApi = async (args: readonly string[], api: ApiCall, repo: Repo | u
   if (plan.kind === "rest") {
     const target = plan.repo === undefined ? repo : parseRepo(plan.repo);
     if (target === undefined) throw new Failure(MERGE_STAGE, "cannot tell which repository `gh api` merges in; name it in the endpoint");
+    // The merge must require the head whose checks passed: GitHub refuses it (409) if the head has moved.
+    const given = await restSha(api, deps.readFile);
     return deps.withToken(target, async (env) => {
-      await gateMerge(deps.io(target, env), { number: plan.number }, false);
-      return deps.runWith(args, env);
+      const head = await gateMerge(deps.io(target, env), { number: plan.number }, false);
+      if (given !== undefined && given !== head) throw new Failure(MERGE_STAGE, `the merge's sha ${given.slice(0, 8)} is not the head whose checks passed (${head.slice(0, 8)})`);
+      return deps.runWith(given === undefined ? withFlags(args, ["-f", `sha=${head}`]) : args, env);
     });
   }
   const request = await graphqlRequest(api, deps.readFile);
-  const ids = graphqlMergeIds(request.query, request.variables);
-  if ("refuse" in ids) throw new Failure(MERGE_STAGE, ids.refuse);
-  if (ids.length === 0) return deps.run(args);
+  const merges = graphqlMerges(request.query, request.variables);
+  if ("refuse" in merges) throw new Failure(MERGE_STAGE, merges.refuse);
+  if (merges.length === 0) return deps.run(args);
   return deps.withToken(repo, async (env) => {
-    for (const id of ids) {
+    for (const merge of merges) {
       // The node lookup is GraphQL, which names no repository; the io's own is unused.
-      const pr = await pullForNode(deps.io(repo ?? { owner: "-", name: "-" }, env), id);
-      await gateMerge(deps.io(pr.repo, env), { number: pr.number }, false);
+      const pr = await pullForNode(deps.io(repo ?? { owner: "-", name: "-" }, env), merge.id);
+      const head = await gateMerge(deps.io(pr.repo, env), { number: pr.number }, false);
+      if (merge.expectedHeadOid !== head) {
+        throw new Failure(MERGE_STAGE, `a GraphQL merge of #${pr.number} must give expectedHeadOid: "${head}", the head whose checks passed, so a later push is not merged in its place`);
+      }
     }
     return deps.runWith(args, env);
   });
+};
+
+/** The `sha` a REST merge requires of the head, from its fields or `--input` body; refused when the body cannot be read. */
+const restSha = async (api: ApiCall, readFile: (path: string) => Promise<string | undefined>): Promise<string | undefined> => {
+  if (api.input !== undefined) {
+    const content = api.input === "-" ? undefined : await readFile(api.input);
+    let sha: unknown;
+    try {
+      sha = content === undefined ? undefined : record(JSON.parse(content)).sha;
+    } catch {
+      sha = undefined;
+    }
+    if (typeof sha !== "string") throw new Failure(MERGE_STAGE, "a `gh api` merge with `--input` must give the head's `sha` in a body agent-gh can read");
+    return sha;
+  }
+  const field = api.fields.findLast((candidate) => candidate.name === "sha");
+  if (field !== undefined && !field.raw && field.value.startsWith("@")) throw new Failure(MERGE_STAGE, "give a `gh api` merge's sha with `-f sha=<sha>`");
+  return field?.value;
 };
 
 const UNREADABLE = "cannot read the GraphQL query `gh api graphql` sends; pass it with `-f query=...` or `--input <file>`";
@@ -366,10 +406,23 @@ export const graphqlRequest = async (
     // -F reads `@file` (`@-` is stdin); -f sends its value as it is.
     const value = !field.raw && field.value.startsWith("@") ? await file(field.value.slice(1)) : field.value;
     if (field.name === "query") query = value;
-    else if (field.name !== "operationName") variables[field.name] = value;
+    else if (field.name !== "operationName") setVariable(variables, field.name, value);
   }
   if (query === undefined) throw new Failure(MERGE_STAGE, UNREADABLE);
   return { query, variables };
+};
+
+/** Sets a gh field's variable, nesting `input[pullRequestId]` as gh does; `name[]` arrays are kept apart, so they never name a pull request. */
+const setVariable = (variables: Record<string, unknown>, name: string, value: string) => {
+  const path = /^([^[\]]+)((?:\[[^[\]]+\])*)$/.exec(name);
+  if (path === null) return;
+  const keys = [path[1] as string, ...[...(path[2] as string).matchAll(/\[([^[\]]+)\]/g)].map((match) => match[1] as string)];
+  let into = variables;
+  for (const key of keys.slice(0, -1)) {
+    const next = into[key];
+    into = (into[key] = typeof next === "object" && next !== null ? next : {}) as Record<string, unknown>;
+  }
+  into[keys.at(-1) as string] = value;
 };
 
 /** The pull request a GraphQL node id names, and its repository; refused when it names none. */
@@ -668,6 +721,8 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   io.out(`${JSON.stringify(review, null, 2)}\n`);
 };
 
+const SWEEP_BASE = "agent-gh-sweep-base";
+
 export type SweepOptions = { readonly base?: string; readonly effort?: Effort };
 
 /**
@@ -696,9 +751,13 @@ export const reviewSweep = async (io: ReviewIo, options: SweepOptions): Promise<
   const out = join(io.tempDir(), "sweep.md");
   io.print(`agent-gh: ${reviewer.model} (${reviewer.family}) at ${effort} is sweeping the changes since ${base}`);
   // `codex exec review` takes no prompt beside --base; claude reads the instructions on stdin.
-  const result = await inClone(io, head, (cwd) =>
-    io.runReviewer(sweepCommand(reviewer, effort, base, out), reviewer.family === "codex" ? "" : sweepPrompt(base), cwd),
-  );
+  // The clone has the caller's objects but not its refs: the base goes in as a commit, under a name of its own.
+  const baseSha = await io.git(["rev-parse", "--verify", "-q", `${base}^{commit}`]);
+  if (baseSha === undefined) throw new Failure(stage, `${base} is not a commit here`);
+  const result = await inClone(io, head, async (cwd) => {
+    if ((await io.git(["-C", cwd, "update-ref", `refs/heads/${SWEEP_BASE}`, baseSha])) === undefined) throw new Failure(stage, `could not give the clone ${base}`);
+    return io.runReviewer(sweepCommand(reviewer, effort, SWEEP_BASE, out), reviewer.family === "codex" ? "" : sweepPrompt(SWEEP_BASE), cwd);
+  });
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
   io.out(`${reviewer.family === "codex" ? await io.readFile(out) : result.stdout}`.trimEnd() + "\n");
 };

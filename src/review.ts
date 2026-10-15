@@ -217,12 +217,14 @@ export type ReadyTarget = { readonly number: number; readonly repo?: string } | 
 type ValueFlags = { readonly long: readonly string[]; readonly short: string };
 
 /**
- * gh's arguments split as gh's flag parser splits them: positional words, and
- * flags without their values. `--` ends the flags.
+ * gh's arguments split as gh's flag parser splits them: positional words,
+ * flags without their values, and the value of each flag that takes one
+ * (keyed by its long name or short letter). `--` ends the flags.
  */
-const ghArgs = (args: readonly string[], valued: ValueFlags): { readonly words: string[]; readonly flags: string[] } => {
+const ghArgs = (args: readonly string[], valued: ValueFlags) => {
   const words: string[] = [];
   const flags: string[] = [];
+  const values: [string, string][] = [];
   for (let index = 0; index < args.length; index++) {
     const arg = args[index] as string;
     if (arg === "--") {
@@ -231,23 +233,36 @@ const ghArgs = (args: readonly string[], valued: ValueFlags): { readonly words: 
     }
     if (arg.startsWith("--")) {
       flags.push(arg);
-      if (!arg.includes("=") && valued.long.includes(arg.slice(2))) index++;
+      const [name, attached] = arg.includes("=") ? [arg.slice(2, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg.slice(2), undefined];
+      if (valued.long.includes(name)) values.push([name, attached ?? (args[++index] ?? "")]);
     } else if (arg.startsWith("-") && arg.length > 1) {
       flags.push(arg);
       // A cluster of short flags (`-sd`); the first that takes a value takes the rest of the word, or the next one.
       for (let at = 1; at < arg.length; at++) {
-        if (!valued.short.includes(arg[at] as string)) continue;
-        if (at === arg.length - 1) index++;
+        const short = arg[at] as string;
+        if (!valued.short.includes(short)) continue;
+        const rest = arg.slice(at + 1).replace(/^=/, "");
+        values.push([short, rest !== "" ? rest : (args[++index] ?? "")]);
         break;
       }
     } else words.push(arg);
   }
-  return { words, flags };
+  const last = (...names: string[]) => values.findLast(([name]) => names.includes(name))?.[1];
+  return { words, flags, values, last };
 };
 
-/** A boolean flag's value: gh takes the last of `--name`, `--name=true`, and `--name=false`. */
-const lastBoolean = (flags: readonly string[], name: string): boolean =>
-  flags.reduce((on, flag) => (flag === `--${name}` || flag === `--${name}=true` ? true : flag === `--${name}=false` ? false : on), false);
+/**
+ * A boolean flag's value: gh takes the last of `--name` and `--name=<bool>`,
+ * reading the value as Go's strconv.ParseBool does. A spelling gh would
+ * refuse counts as `unknown`, so the caller decides which way fails closed.
+ */
+const lastBoolean = (flags: readonly string[], name: string, unknown: boolean): boolean =>
+  flags.reduce((on, flag) => {
+    if (flag === `--${name}`) return true;
+    if (!flag.startsWith(`--${name}=`)) return on;
+    const value = flag.slice(name.length + 3);
+    return ["1", "t", "T", "TRUE", "true", "True"].includes(value) ? true : ["0", "f", "F", "FALSE", "false", "False"].includes(value) ? false : unknown;
+  }, false);
 
 /** The pull request a selector names, as gh reads it: a number, a pull request URL (with its repository, which gh acts on), or a branch. */
 const selector = (target: string | undefined): ReadyTarget => {
@@ -258,6 +273,9 @@ const selector = (target: string | undefined): ReadyTarget => {
   return { branch: target };
 };
 
+const READY_FLAGS: ValueFlags = { long: ["repo"], short: "R" };
+const MERGE_FLAGS: ValueFlags = { long: ["repo", "body", "body-file", "subject", "author-email", "match-head-commit"], short: "RbFtA" };
+
 /**
  * The pull request `gh pr ready` names, or the current branch's when none is
  * given. gh accepts `-R`/`--repo` before or after the subcommand. Undefined
@@ -265,24 +283,28 @@ const selector = (target: string | undefined): ReadyTarget => {
  * and for any other command.
  */
 export const readyTarget = (args: readonly string[]): ReadyTarget | undefined => {
-  const { words, flags } = ghArgs(args, { long: ["repo"], short: "R" });
+  const { words, flags } = ghArgs(args, READY_FLAGS);
   if (words[0] !== "pr" || words[1] !== "ready") return undefined;
   // gh's last --undo wins, so `--undo --undo=false` marks the pull request ready.
-  if (lastBoolean(flags, "undo")) return undefined;
+  if (lastBoolean(flags, "undo", false)) return undefined;
   return selector(words[2]);
 };
 
+/** The repository `gh pr ready` or `gh pr merge` names with `-R`/`--repo`, in any spelling gh accepts (`-sR o/r` too). */
+export const prRepoFlag = (args: readonly string[]): string | undefined => ghArgs(args, MERGE_FLAGS).last("R", "repo");
+
 /**
- * `gh pr merge`: the pull request it names, and whether it asks for `--admin`
- * (which merges past the base branch's requirements). Undefined for
+ * `gh pr merge`: the pull request it names, whether it asks for `--admin`
+ * (which merges past the base branch's requirements; any spelling gh would
+ * not read as false counts), and its `--match-head-commit`. Undefined for
  * `--disable-auto`, which only turns auto-merge off, and for any other command.
  */
-export const mergeCommand = (args: readonly string[]): { readonly target: ReadyTarget; readonly admin: boolean } | undefined => {
-  const { words, flags } = ghArgs(args, { long: ["repo", "body", "body-file", "subject", "author-email", "match-head-commit"], short: "RbFtA" });
+export const mergeCommand = (args: readonly string[]): { readonly target: ReadyTarget; readonly admin: boolean; readonly headCommit: string | undefined } | undefined => {
+  const { words, flags, last } = ghArgs(args, MERGE_FLAGS);
   if (words[0] !== "pr" || words[1] !== "merge") return undefined;
-  const admin = lastBoolean(flags, "admin");
-  if (!admin && lastBoolean(flags, "disable-auto")) return undefined;
-  return { target: selector(words[2]), admin };
+  const admin = lastBoolean(flags, "admin", true);
+  if (!admin && lastBoolean(flags, "disable-auto", false)) return undefined;
+  return { target: selector(words[2]), admin, headCommit: last("match-head-commit") };
 };
 
 /**
@@ -298,32 +320,11 @@ export type ApiCall = {
   readonly input: string | undefined;
 };
 
-const API_VALUE_LONG = ["method", "header", "raw-field", "field", "input", "jq", "template", "cache", "hostname", "preview"];
-const API_VALUE_SHORT = "XHfFqtp";
+const API_FLAGS: ValueFlags = { long: ["method", "header", "raw-field", "field", "input", "jq", "template", "cache", "hostname", "preview"], short: "XHfFqtp" };
 
 /** `gh api`'s endpoint, method, fields, and input; undefined for any other command. */
 export const apiCall = (args: readonly string[]): ApiCall | undefined => {
-  const words: string[] = [];
-  const values: [string, string][] = [];
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index] as string;
-    if (arg === "--") {
-      words.push(...args.slice(index + 1));
-      break;
-    }
-    if (arg.startsWith("--")) {
-      const [name, attached] = arg.includes("=") ? [arg.slice(2, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg.slice(2), undefined];
-      if (API_VALUE_LONG.includes(name)) values.push([name, attached ?? (args[++index] ?? "")]);
-    } else if (arg.startsWith("-") && arg.length > 1) {
-      for (let at = 1; at < arg.length; at++) {
-        const short = arg[at] as string;
-        if (!API_VALUE_SHORT.includes(short)) continue;
-        const rest = arg.slice(at + 1).replace(/^=/, "");
-        values.push([short, rest !== "" ? rest : (args[++index] ?? "")]);
-        break;
-      }
-    } else words.push(arg);
-  }
+  const { words, values, last } = ghArgs(args, API_FLAGS);
   if (words[0] !== "api") return undefined;
   const fields = values
     .filter(([name]) => ["f", "raw-field", "F", "field"].includes(name))
@@ -331,8 +332,8 @@ export const apiCall = (args: readonly string[]): ApiCall | undefined => {
       const at = pair.indexOf("=");
       return { name: at < 0 ? pair : pair.slice(0, at), value: at < 0 ? "" : pair.slice(at + 1), raw: name === "f" || name === "raw-field" };
     });
-  const input = values.findLast(([name]) => name === "input")?.[1];
-  const method = values.findLast(([name]) => name === "X" || name === "method")?.[1];
+  const input = last("input");
+  const method = last("X", "method");
   return { endpoint: words[1], method: (method ?? (fields.length > 0 || input !== undefined ? "POST" : "GET")).toUpperCase(), fields, input };
 };
 
@@ -354,42 +355,80 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
   const path = call.endpoint.replace(/^https?:\/\/api\.github\.com\//i, "").replace(/^\//, "").split(/[?#]/)[0] as string;
   if (/^graphql\/?$/i.test(path)) return { kind: "graphql" };
   if (call.method === "GET" || call.method === "HEAD") return { kind: "none" };
-  const segments = path.toLowerCase().split("/");
-  if (!segments.some((segment) => /merges?|%/.test(segment) || segment === "..")) return { kind: "none" };
+  const unreadable = { kind: "refuse", reason: `cannot tell whether \`gh api ${call.method} ${call.endpoint}\` merges a pull request; use \`gh pr merge\`` } as const;
+  const segments = path.split("/");
+  // A dot segment can move the request to another endpoint than it names.
+  if (segments.some((segment) => segment === "." || segment === "..")) return unreadable;
+  // The operation is what follows the repository (`repos/{owner}/{repo}` or `repositories/{id}`); its names are not.
+  const skip = /^repos$/i.test(segments[0] ?? "") ? 3 : /^repositories$/i.test(segments[0] ?? "") ? 2 : 0;
+  let operation: string[];
+  try {
+    operation = segments.slice(skip).map((segment) => decodeURIComponent(segment).toLowerCase());
+  } catch {
+    return unreadable;
+  }
+  if (!operation.some((segment) => segment === "merge" || segment === "merges")) return { kind: "none" };
   const pr = /^repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)\/merge\/?$/i.exec(path);
   if (pr === null) {
-    if (/^repos\/[^/]+\/[^/]+\/merges\/?$/i.test(path)) return { kind: "refuse", reason: "`gh api` merging a branch through the merges endpoint skips the pull request's checks; open a pull request" };
-    return { kind: "refuse", reason: `cannot tell whether \`gh api ${call.method} ${call.endpoint}\` merges a pull request; use \`gh pr merge\`` };
+    if (skip > 0 && operation.length === 1 && operation[0] === "merges") return { kind: "refuse", reason: "`gh api` merging a branch through the merges endpoint skips the pull request's checks; open a pull request" };
+    return unreadable;
   }
   const [owner, name] = [pr[1] as string, pr[2] as string];
   const placeholders = owner === "{owner}" && name === "{repo}";
-  if (!placeholders && (/[{}%]/.test(owner + name) || owner === ".." || name === "..")) {
-    return { kind: "refuse", reason: `cannot tell which repository \`gh api ${call.endpoint}\` merges in; use \`gh pr merge\`` };
-  }
+  if (!placeholders && /[{}%]/.test(owner + name)) return { kind: "refuse", reason: `cannot tell which repository \`gh api ${call.endpoint}\` merges in; use \`gh pr merge\`` };
   return { kind: "rest", repo: placeholders ? undefined : `${owner}/${name}`, number: Number(pr[3]) };
 };
 
-/** GraphQL mutations that merge a pull request, or queue it to be merged. */
-const MERGE_MUTATIONS = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b/g;
+/** GraphQL mutations that merge a pull request, or queue it to be merged; each takes `expectedHeadOid`. */
+const MERGE_MUTATIONS = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\s*\(/g;
+
+/** The text between the parenthesis at `open` and its match, skipping strings; undefined when it never closes. */
+const parenthesised = (text: string, open: number): string | undefined => {
+  let depth = 0;
+  for (let at = open; at < text.length; at++) {
+    const char = text[at];
+    if (char === '"') {
+      for (at++; at < text.length && text[at] !== '"'; at++) if (text[at] === "\\") at++;
+    } else if (char === "(") depth++;
+    else if (char === ")" && --depth === 0) return text.slice(open + 1, at);
+  }
+  return undefined;
+};
+
+/** A string-valued input field, as a literal or a variable, inside one mutation's arguments; or from its `input: $var` object. */
+const inputField = (args: string, field: string, variables: Readonly<Record<string, unknown>>): string | undefined => {
+  const direct = new RegExp(`\\b${field}\\s*:\\s*(?:"((?:[^"\\\\]|\\\\.)*)"|\\$(\\w+))`).exec(args);
+  if (direct !== null) {
+    const value = direct[1] ?? variables[direct[2] as string];
+    return typeof value === "string" && value !== "" ? value : undefined;
+  }
+  const whole = /\binput\s*:\s*\$(\w+)/.exec(args);
+  const value = whole === null ? undefined : (variables[whole[1] as string] as Record<string, unknown> | undefined)?.[field];
+  return typeof value === "string" && value !== "" ? value : undefined;
+};
+
+/** A pull request a GraphQL merge mutation names, and the head it requires (`expectedHeadOid`), if any. */
+export type GraphqlMerge = { readonly id: string; readonly expectedHeadOid: string | undefined };
 
 /**
- * The pull request node ids a GraphQL document's merge mutations name, from
- * literal `pullRequestId: "..."` arguments or variables. Empty when it merges
- * nothing; a refusal when it merges a branch, or names fewer ids than it
- * has merge mutations, or an id this cannot read.
+ * Each merge mutation in a GraphQL document, read from its own arguments:
+ * the pull request id and the head it requires. Empty when it merges
+ * nothing; a refusal when it merges a branch, or a mutation's pull request
+ * id cannot be read.
  */
-export const graphqlMergeIds = (query: string, variables: Readonly<Record<string, unknown>>): readonly string[] | { readonly refuse: string } => {
+export const graphqlMerges = (query: string, variables: Readonly<Record<string, unknown>>): readonly GraphqlMerge[] | { readonly refuse: string } => {
   if (/\bmergeBranch\b/.test(query)) return { refuse: "the GraphQL mergeBranch mutation merges past a pull request's checks; open a pull request" };
-  const mutations = query.match(MERGE_MUTATIONS)?.length ?? 0;
-  if (mutations === 0) return [];
-  const ids: string[] = [];
-  for (const match of query.matchAll(/\bpullRequestId\s*:\s*(?:"((?:[^"\\]|\\.)*)"|\$(\w+))/g)) {
-    const id = match[1] ?? variables[match[2] as string];
-    if (typeof id !== "string" || id === "") return { refuse: "cannot read the pull request id a GraphQL merge mutation names; use `gh pr merge`" };
-    ids.push(id);
+  const unreadable = { refuse: "cannot read the pull request id a GraphQL merge mutation names; use `gh pr merge`" };
+  const merges: GraphqlMerge[] = [];
+  for (const match of query.matchAll(MERGE_MUTATIONS)) {
+    const args = parenthesised(query, (match.index as number) + match[0].length - 1);
+    const id = args === undefined ? undefined : inputField(args, "pullRequestId", variables);
+    if (args === undefined || id === undefined) return unreadable;
+    merges.push({ id, expectedHeadOid: inputField(args, "expectedHeadOid", variables) });
   }
-  if (ids.length < mutations) return { refuse: "cannot read the pull request id a GraphQL merge mutation names; use `gh pr merge`" };
-  return ids;
+  // A mention the pattern above did not take as a call (a comment, a stray name) is not trusted either.
+  if ((query.match(/\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b/g)?.length ?? 0) !== merges.length) return unreadable;
+  return merges;
 };
 
 export type Finding = {
