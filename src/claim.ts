@@ -246,11 +246,17 @@ export const ago = (iso: string | null, nowMs: number): string => {
 /** A claim command's parsed arguments; `-R`/`--repo` is read separately, as gh reads it. */
 export type ClaimArgs =
   | { readonly command: "claim"; readonly issue: number; readonly refs: boolean; readonly noPr: boolean }
+  | { readonly command: "claim-next"; readonly refs: boolean; readonly noPr: boolean }
+  | { readonly command: "next"; readonly json: boolean; readonly waves: boolean }
   | { readonly command: "release"; readonly issue: number }
   | { readonly command: "claims"; readonly json: boolean }
   | { readonly command: "sync"; readonly issues: readonly number[] };
 
-/** `claim N [--refs|--no-pr]`, `release N`, `claims [--json]`, `claims sync [--issue N]...`, each with an optional `-R repo`; undefined when they do not parse. */
+/**
+ * `claim N|--next [--refs|--no-pr]`, `release N`, `claims [--json]`,
+ * `claims sync [--issue N]...`, `next [--json] [--waves]`, each with an
+ * optional `-R repo`; undefined when they do not parse.
+ */
 export const parseClaimArgs = (command: string, args: readonly string[]): ClaimArgs | undefined => {
   const words: string[] = [];
   for (let index = 0; index < args.length; index++) {
@@ -262,7 +268,12 @@ export const parseClaimArgs = (command: string, args: readonly string[]): ClaimA
   const number = (value: string | undefined) => (value !== undefined && /^[1-9]\d{0,9}$/.test(value) ? Number(value) : undefined);
   if (command === "claim") {
     const issues = words.filter((word) => !word.startsWith("-"));
-    const flags = words.filter((word) => word.startsWith("-"));
+    const next = words.includes("--next");
+    const flags = words.filter((word) => word.startsWith("-") && word !== "--next");
+    if (next) {
+      if (issues.length > 0 || words.filter((word) => word === "--next").length > 1 || flags.some((flag) => flag !== "--refs" && flag !== "--no-pr") || flags.length > 1) return undefined;
+      return { command: "claim-next", refs: flags.includes("--refs"), noPr: flags.includes("--no-pr") };
+    }
     const issue = number(issues[0]);
     if (issue === undefined || issues.length !== 1 || flags.some((flag) => flag !== "--refs" && flag !== "--no-pr") || new Set(flags).size !== flags.length) return undefined;
     if (flags.length === 2) return undefined;
@@ -271,6 +282,10 @@ export const parseClaimArgs = (command: string, args: readonly string[]): ClaimA
   if (command === "release") {
     const issue = number(words[0]);
     return issue === undefined || words.length !== 1 ? undefined : { command, issue };
+  }
+  if (command === "next") {
+    if (words.some((word) => word !== "--json" && word !== "--waves") || new Set(words).size !== words.length) return undefined;
+    return { command, json: words.includes("--json"), waves: words.includes("--waves") };
   }
   if (command !== "claims") return undefined;
   if (words[0] === "sync") {

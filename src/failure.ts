@@ -51,7 +51,8 @@ export type Stage =
   | "deriving the statuses"
   | "claiming"
   | "releasing"
-  | "listing claims";
+  | "listing claims"
+  | "finding the next issue";
 
 export const describe = (failure: Failure): string =>
   `agent-gh: ${failure.stage} failed: ${failure.detail}.\n${failure.network ? NETWORK_NEXT_STEP : NEXT_STEP}`;

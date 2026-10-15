@@ -15,7 +15,8 @@ import {
   taken,
   titleSlug,
 } from "../src/claim.ts";
-import { claim, type ClaimIo, claimsLines, eventIssues, listClaims, release, syncLabels } from "../src/claim-run.ts";
+import { claim, type ClaimIo, claimsLines, eventIssues, listClaims, release, syncLabels, UNKNOWN } from "../src/claim-run.ts";
+import { apiReader, claimNext } from "../src/next-run.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
 
 const REPO = { owner: "johnrees", name: "widget" };
@@ -548,4 +549,20 @@ test("a claim refuses a clone that pushes somewhere else than it fetches from", 
   await expect(claim(b.io, { issue: 7, refs: false, noPr: false })).rejects.toThrow("whose origin fetches from and pushes to johnrees/widget");
   expect(git.run(["for-each-ref", "refs/heads"], mirror).stdout).toBe("");
   expect(sent(w.fake, "POST", `${PATH}/pulls`)).toEqual([]);
+});
+
+test("claim --next stops when its draft pull request stands unconfirmed, and claims no other issue", async () => {
+  const ready = [{ name: "ready" }];
+  const w = world({ issues: [{ ...OPEN, labels: ready }, { number: 8, state: "open", title: "Another widget", labels: ready }] });
+  for (const number of [7, 8]) w.routes[`GET ${PATH}/issues/${number}/dependencies/blocked_by`] = () => reply(200, []);
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  // GitHub opens the pull request but never lists it, so the claim cannot tell whether it won.
+  w.state.onPost = () => {
+    w.state.lagUntilPulls = 99;
+  };
+  expect(await claimNext(a.io, apiReader(a.io), { refs: false, noPr: false })).toBe(UNKNOWN);
+  expect(a.printed.filter((line) => line.startsWith("agent-gh: claiming"))).toEqual(["agent-gh: claiming #7 Fix the widget"]);
+  expect(a.printed.join("\n")).toContain("GitHub does not list this claim's #31 yet");
+  expect(w.state.pulls.map((item) => [item.number, item.state])).toEqual([[31, "open"]]);
 });

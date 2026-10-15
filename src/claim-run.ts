@@ -184,6 +184,9 @@ const readBack = async (io: ClaimIo, stage: Stage, number: number, ours: (item: 
 const lostTo = (after: Taken | "closed") =>
   after === "closed" ? "was closed while this claim was posted" : `went to ${after.holder === undefined ? "nobody" : describeClaim(after.holder)} first`;
 
+/** The exit code of a claim posted but never seen listed: it stands, and whether it won is unknown (1 is a refusal or a lost race). */
+export const UNKNOWN = 2;
+
 export type ClaimOptions = { readonly issue: number; readonly refs: boolean; readonly noPr: boolean };
 
 /** Refuses a closed issue, a pull request, or a taken issue, naming the holder; the issue otherwise. */
@@ -211,7 +214,9 @@ const claimable = async (io: ClaimIo, stage: Stage, number: number): Promise<{ r
  * `agent-gh claim <N>`: refuses a closed or taken issue, else opens a draft
  * pull request (or, with `noPr`, posts a claim comment), waits, reads the
  * claims back, and keeps the issue only if this claim holds it; a claim that
- * lost the race undoes itself and names the winner. Returns the exit code.
+ * lost the race undoes itself and names the winner. Returns the exit code:
+ * 0 held, 1 refused or lost (nothing left behind), UNKNOWN when it stands
+ * unconfirmed.
  */
 export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number> => {
   const stage: Stage = "claiming";
@@ -303,7 +308,7 @@ export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number>
   const after = await readBack(io, stage, number, (item) => item.pr === pr);
   if (after === undefined) {
     io.print(`agent-gh: GitHub does not list this claim's #${pr} yet, so whether it won is unknown; it stays open: run \`agent-gh claims\`, then keep it or \`agent-gh release ${number}\``);
-    return 1;
+    return UNKNOWN;
   }
   if (after === "closed" || after.holder?.pr !== pr) {
     await call(io, stage, "PATCH", `${repoPath(io)}/pulls/${pr}`, { state: "closed" });
@@ -324,7 +329,7 @@ const claimByComment = async (io: ClaimIo, marker: ClaimMarker, label: string): 
   const after = await readBack(io, stage, marker.issue, (item) => item.comment === id);
   if (after === undefined) {
     io.print(`agent-gh: GitHub does not list this claim's comment yet, so whether it won is unknown; it stands: run \`agent-gh claims\`, then keep it or \`agent-gh release ${marker.issue}\``);
-    return 1;
+    return UNKNOWN;
   }
   if (after === "closed" || after.holder?.comment !== id) {
     await call(io, stage, "POST", `${repoPath(io)}/issues/${marker.issue}/comments`, { body: releaseCommentBody({ v: 1, id: marker.id }) });
