@@ -43,16 +43,43 @@ export type CheckState = "passed" | "failed" | "pending" | "missing";
 const PASSING = ["success", "neutral", "skipped"];
 
 /**
+ * The check runs a required check is judged by. An Actions workflow's runs
+ * count only from its newest workflow run: the check suite with the highest
+ * id (`workflows` maps a suite's id to its workflow's id), since suites are
+ * created with their workflow run while a run's own id dates only its job.
+ * So a draft's failed run gives way to the ready pull request's run of that
+ * workflow, while two workflows with the same job name are judged
+ * separately. Other runs (another App's, or a suite of no known workflow)
+ * are never superseded.
+ */
+const current = (runs: Record<string, unknown>[], workflows: ReadonlyMap<number, number>): Record<string, unknown>[] => {
+  const suiteOf = (run: Record<string, unknown>) => record(run.check_suite).id as number;
+  const workflowOf = (run: Record<string, unknown>) => (Number.isSafeInteger(record(run.check_suite).id) ? workflows.get(suiteOf(run)) : undefined);
+  const newest = new Map<number, number>();
+  for (const run of runs) {
+    const workflow = workflowOf(run);
+    if (workflow !== undefined) newest.set(workflow, Math.max(newest.get(workflow) ?? 0, suiteOf(run)));
+  }
+  return runs.filter((run) => {
+    const workflow = workflowOf(run);
+    return workflow === undefined || suiteOf(run) === newest.get(workflow);
+  });
+};
+
+/**
  * Whether a commit passed a required check, from its statuses, latest first,
  * and the check runs named `check.context` (the latest of each suite). Every
- * matching run must pass. A check tied to an App counts only that App's
+ * current run (see `current`) must pass. A check tied to an App counts only that App's
  * check runs and statuses: for one, `statuses` must give each status's
  * `app_id` (the App whose bot set it), and a status without it never counts.
  */
-export const checkState = (check: RequiredCheck, statuses: unknown, runs: unknown): CheckState => {
-  const matching = list(runs)
-    .map(record)
-    .filter((run) => run.name === check.context && (check.app === undefined || record(run.app).id === check.app));
+export const checkState = (check: RequiredCheck, statuses: unknown, runs: unknown, workflows: ReadonlyMap<number, number> = new Map()): CheckState => {
+  const matching = current(
+    list(runs)
+      .map(record)
+      .filter((run) => run.name === check.context && (check.app === undefined || record(run.app).id === check.app)),
+    workflows,
+  );
   const status = list(statuses).map(record).find((entry) => entry.context === check.context && (check.app === undefined || entry.app_id === check.app));
   if (matching.length === 0 && status === undefined) return "missing";
   if (matching.some((run) => run.status === "completed" && !PASSING.includes(run.conclusion as string))) return "failed";

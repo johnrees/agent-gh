@@ -17,6 +17,27 @@ test("the required checks are every ruleset's and classic protection's, once eac
 
 const run = (name: string, conclusion: string | null, app = 15368, status = "completed") => ({ name, status, conclusion, app: { id: app } });
 
+test("a newer run of the same workflow supersedes an older one; other workflows still count", () => {
+  const build = { context: "build", app: 15368 };
+  const at = (conclusion: string | null, id: number, suite: number, status = "completed", app = 15368) => ({ ...run("build", conclusion, app, status), id, check_suite: { id: suite } });
+  const ci = new Map([[10, 1], [20, 1], [30, 2]]); // suites 10 and 20 ran workflow 1, suite 30 workflow 2
+  // penmon #387: the draft's run failed, the ready run of the same workflow passed.
+  expect(checkState(build, [], [at("failure", 1, 10), at("success", 2, 20)], ci)).toBe("passed");
+  expect(checkState(build, [], [at("success", 1, 10), at("failure", 2, 20)], ci)).toBe("failed");
+  // An older workflow run whose job was created late (a higher run id) is still older.
+  expect(checkState(build, [], [at("success", 3, 10), at("failure", 2, 20)], ci)).toBe("failed");
+  // Every current run of the newest workflow run must pass.
+  expect(checkState(build, [], [at("failure", 1, 10), at("success", 2, 20), at("failure", 3, 20)], ci)).toBe("failed");
+  // A newer queued run (no start time yet) is still the current one.
+  expect(checkState(build, [], [at("success", 1, 10), at(null, 2, 20, "queued")], ci)).toBe("pending");
+  // Another workflow's job of the same name is judged on its own.
+  expect(checkState(build, [], [at("failure", 1, 30), at("success", 2, 20)], ci)).toBe("failed");
+  // Suites with no known workflow never supersede each other.
+  expect(checkState(build, [], [at("failure", 1, 10), at("success", 2, 20)])).toBe("failed");
+  // Another App's newer run is not the required App's.
+  expect(checkState(build, [], [at("failure", 1, 10), at("success", 2, 20, "completed", 99)], ci)).toBe("failed");
+});
+
 test("a required check passes only when every matching run or status passed", () => {
   const build = { context: "build", app: 15368 };
   expect(checkState(build, [], [run("build", "success")])).toBe("passed");
