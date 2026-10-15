@@ -401,11 +401,17 @@ test("a full review runs the checks itself in a clone of the head, then the auth
   await reviewFull(io, {});
   expect(commands).toHaveLength(1);
   const [{ command, stdin, cwd }] = commands as [{ command: readonly string[]; stdin: string; cwd: string }];
-  // agent-gh runs the checks before the reviewer, in the same throwaway clone; the reviewer only reads.
-  expect(steps).toEqual(["git clone", "git checkout", "check make check", "check make lint", "git reset", "git clean", "reviewer"]);
-  expect(checks).toEqual([{ command: "make check", cwd, timeoutMs: 1_800_000 }, { command: "make lint", cwd, timeoutMs: 1_800_000 }]);
-  expect(gitCalls[0]).toBe(`clone -q --shared --no-checkout /work/widget/.git ${cwd}`);
-  expect(gitCalls[1]).toBe(`-C ${cwd} checkout -q --detach ${HEAD}`);
+  // agent-gh runs the checks before the reviewer in a throwaway clone; the reviewer only reads, in a fresh one.
+  expect(steps).toEqual(["git clone", "git checkout", "check make check", "check make lint", "git clone", "git checkout", "reviewer"]);
+  const checked = checks[0]?.cwd as string;
+  expect(checked).not.toBe(cwd);
+  expect(checks).toEqual([{ command: "make check", cwd: checked, timeoutMs: 1_800_000 }, { command: "make lint", cwd: checked, timeoutMs: 1_800_000 }]);
+  expect(gitCalls).toEqual([
+    `clone -q --shared --no-checkout /work/widget/.git ${checked}`,
+    `-C ${checked} checkout -q --detach ${HEAD}`,
+    `clone -q --shared --no-checkout /work/widget/.git ${cwd}`,
+    `-C ${cwd} checkout -q --detach ${HEAD}`,
+  ]);
   expect(command.slice(0, 8)).toEqual(["codex", "exec", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"', "-s", "read-only"]);
   expect(command).not.toContain("workspace-write");
   // The merge base is the pull request's, from GitHub, not origin's.
@@ -476,7 +482,7 @@ test("a check that runs out of time stops the rest; the checks count as timed ou
     answer: { verdict: "approve", spec: "Fine.", findings: [] },
   });
   await reviewFull(w.io, {});
-  expect(w.checks).toEqual([{ command: "make check", cwd: w.commands[0]?.cwd as string, timeoutMs: 300_000 }]);
+  expect(w.checks.map(({ command, timeoutMs }) => ({ command, timeoutMs }))).toEqual([{ command: "make check", timeoutMs: 300_000 }]);
   expect(w.commands[0]?.stdin).toContain("checks timed out (`make check` ran over 5 min).\nThe last lines of their output:\n```\n$ make check\ncompiling\n```\nReport a failure");
   expect(parseMarker(posted(w.fake, `${REPO}/pulls/12/reviews`)[0]?.body as string)?.checks).toBe("timed out");
   expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)[0]?.description).toBe("approved; checks timed out (`make check` ran over 5 min): 0 finding(s) by gpt-6-astra at xhigh");
@@ -780,8 +786,13 @@ test("an agent's gh api merge runs only when gh pr merge would", async () => {
   expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=${unbound}`], here, mergeDeps(passed.io, calls)))).toBe(
     `a GraphQL merge of #12 must give expectedHeadOid: "${HEAD}", the head whose checks passed, so a later push is not merged in its place`,
   );
-  // gh nests -F input[pullRequestId]=... into the input variable.
   const nested = "mutation($input: MergePullRequestInput!) { mergePullRequest(input: $input) { clientMutationId } }";
+  // A field naming a prototype could plant an inherited expectedHeadOid that gh never sends.
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=${nested}`, "-F", "input[pullRequestId]=PR_12", "-f", `__proto__[expectedHeadOid]=${HEAD}`], here, mergeDeps(passed.io, calls)))).toBe(
+    "cannot read the GraphQL field `__proto__[expectedHeadOid]`",
+  );
+  expect(graphqlMerges(nested, { input: Object.create({ expectedHeadOid: HEAD, pullRequestId: "PR_12" }) })).toHaveProperty("refuse");
+  // gh nests -F input[pullRequestId]=... into the input variable.
   expect(await dispatchGh(["api", "graphql", "-f", `query=${nested}`, "-F", "input[pullRequestId]=PR_12", "-F", `input[expectedHeadOid]=${HEAD}`], here, mergeDeps(passed.io, calls))).toBe(0);
   expect(await gateRefusal(dispatchGh(["api", "-X", "PUT", "repos/johnrees/widget/pulls/12/merge", "-f", `sha=${OLD}`], here, mergeDeps(passed.io, calls)))).toBe(
     "the merge's sha bbbbbbbb is not the head whose checks passed (aaaaaaaa)",

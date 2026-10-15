@@ -424,7 +424,7 @@ const inputField = (query: string, mask: string, field: string, variables: Reado
   const read = (value: unknown) => (typeof value === "string" && value !== "" ? value : null);
   const direct = found[0];
   if (direct !== undefined) {
-    if (direct[1] !== undefined) return read(variables[direct[1]]);
+    if (direct[1] !== undefined) return read(own(variables, direct[1]));
     const start = (direct.index as number) + direct[0].length;
     try {
       return read(JSON.parse(`"${query.slice(start, mask.indexOf('"', start))}"`));
@@ -435,11 +435,14 @@ const inputField = (query: string, mask: string, field: string, variables: Reado
   const whole = [...mask.matchAll(/\binput\s*:\s*\$(\w+)/g)];
   if (whole.length > 1) return null;
   if (whole[0] === undefined) return undefined;
-  const object = variables[whole[0][1] as string];
+  const object = own(variables, whole[0][1] as string);
   if (typeof object !== "object" || object === null) return null;
-  const value = (object as Record<string, unknown>)[field];
+  const value = own(object as Record<string, unknown>, field);
   return value === undefined ? undefined : read(value);
 };
+
+/** A variable's own value, never one inherited from a prototype. */
+const own = (object: Readonly<Record<string, unknown>>, key: string): unknown => (Object.hasOwn(object, key) ? object[key] : undefined);
 
 /** A pull request a GraphQL merge mutation names, and the head it requires (`expectedHeadOid`), if any. */
 export type GraphqlMerge = { readonly id: string; readonly expectedHeadOid: string | undefined };

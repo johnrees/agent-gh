@@ -415,7 +415,7 @@ export const graphqlRequest = async (
     return { query: body.query, variables: record(body.variables) };
   }
   let query: string | undefined;
-  const variables: Record<string, unknown> = {};
+  const variables: Record<string, unknown> = Object.create(null);
   for (const field of api.fields) {
     // -F reads `@file` (`@-` is stdin); -f sends its value as it is.
     const value = !field.raw && field.value.startsWith("@") ? await file(field.value.slice(1)) : field.value;
@@ -426,15 +426,20 @@ export const graphqlRequest = async (
   return { query, variables };
 };
 
-/** Sets a gh field's variable, nesting `input[pullRequestId]` as gh does; `name[]` arrays are kept apart, so they never name a pull request. */
+/**
+ * Sets a gh field's variable, nesting `input[pullRequestId]` as gh does, in
+ * objects with no prototype; `name[]` arrays are kept apart, so they never
+ * name a pull request. A key that names a prototype is refused.
+ */
 const setVariable = (variables: Record<string, unknown>, name: string, value: string) => {
   const path = /^([^[\]]+)((?:\[[^[\]]+\])*)$/.exec(name);
   if (path === null) return;
   const keys = [path[1] as string, ...[...(path[2] as string).matchAll(/\[([^[\]]+)\]/g)].map((match) => match[1] as string)];
+  if (keys.some((key) => ["__proto__", "constructor", "prototype"].includes(key))) throw new Failure(MERGE_STAGE, `cannot read the GraphQL field \`${name}\``);
   let into = variables;
   for (const key of keys.slice(0, -1)) {
-    const next = into[key];
-    into = (into[key] = typeof next === "object" && next !== null ? next : {}) as Record<string, unknown>;
+    const next = Object.hasOwn(into, key) ? into[key] : undefined;
+    into = (into[key] = typeof next === "object" && next !== null ? next : Object.create(null)) as Record<string, unknown>;
   }
   into[keys.at(-1) as string] = value;
 };
@@ -712,17 +717,11 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const dir = io.tempDir();
   const files = { schema: join(dir, "schema.json"), out: join(dir, "review.json") };
   await Bun.write(files.schema, JSON.stringify(REVIEW_SCHEMA));
-  const { result, checks } = await inClone(io, head, async (cwd) => {
-    const checks = await runChecks(io, config, cwd);
-    io.print(`agent-gh: ${checksSummary(checks)}; ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against ${tick.ref}`);
-    // The reviewer reads the commit as reviewed, not what the checks built or changed.
-    if (checks.state !== "not run") {
-      await io.git(["-C", cwd, "reset", "-q", "--hard", head]);
-      await io.git(["-C", cwd, "clean", "-qffdx"]);
-    }
-    const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks });
-    return { result: await io.runReviewer(fullCommand(reviewer, effort, files), prompt, cwd), checks };
-  });
+  const checks: ChecksResult = config.checks.length === 0 ? { state: "not run" } : await inClone(io, head, (cwd) => runChecks(io, config, cwd));
+  io.print(`agent-gh: ${checksSummary(checks)}; ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against ${tick.ref}`);
+  // A fresh clone: the reviewer reads the commit as pushed, never what the checks built or changed.
+  const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks });
+  const result = await inClone(io, head, (cwd) => io.runReviewer(fullCommand(reviewer, effort, files), prompt, cwd));
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
   const review = await answer(io, reviewer, result.stdout, files.out);
   const marker: ReviewMarker = { v: 1, head, merge_base: mergeBase, patch_id: patchId, verdict: review.verdict, checks: checks.state, reviewer: reviewer.family };
