@@ -101,12 +101,21 @@ export const machineDoctor = async (
   add(shimmed ? "ok" : "FAIL", "gh shim", shimmed ? `${gh} is first on PATH` : shimAdvice(gh));
   if (!configHooks(deps)) {
     add("note", "commit hook", `${gitVersion(deps)} has no config-based hooks: only repositories with agent-gh's commit-msg hook credit agent sessions; install a newer git (on macOS, Homebrew's), then ${RERUN}`);
+    add("note", "push hook", `${gitVersion(deps)} has no config-based hooks: only repositories with agent-gh's pre-push hook hold agent sessions' pushes; install a newer git, then ${RERUN}`);
   } else {
-    const credited = commitHook(deps.agentGh).every((setting) => holds(deps, setting));
+    // commitHook holds both global hooks; each is checked by its own keys.
+    const set = (prefix: string) => commitHook(deps.agentGh).filter((setting) => setting.key.startsWith(prefix)).every((setting) => holds(deps, setting));
+    const credited = set("hook.agent-gh.");
     add(
       credited ? "ok" : "FAIL",
       "commit hook",
       credited ? "a global commit-msg hook credits an agent session's commits in every repository" : `not set; ${RERUN}`,
+    );
+    const held = set("hook.agent-gh-push.");
+    add(
+      held ? "ok" : "FAIL",
+      "push hook",
+      held ? "a global pre-push hook holds an agent session's pushes to a branch whose rules require checks" : `not set; ${RERUN}`,
     );
   }
   const hook = claudeHookState(deps.home, deps.agentGh);

@@ -108,6 +108,9 @@ test("a config with a typo is refused with the field to fix, and defaults fill w
   expect(parseReviewConfig(JSON.stringify({ ...EXAMPLE, block_on: "changes_requested", checks_output_lines: 0 }))).toMatchObject({ blockOn: "changes_requested", checksOutputLines: 0 });
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, block_on: "nothing" })))).toBe('.github/agent-review.json: block_on must be "changes_requested"');
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, checks_output_lines: -1 })))).toContain("checks_output_lines must be a whole number");
+  expect(minimal.statusWriter).toBe("agent");
+  expect(parseReviewConfig(JSON.stringify({ ...EXAMPLE, status_writer: "actions" })).statusWriter).toBe("actions");
+  expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, status_writer: "ci" })))).toBe('.github/agent-review.json: status_writer must be "agent" or "actions"');
 });
 
 test("the status follows the verdict: the block_on verdict fails it", () => {
@@ -196,6 +199,8 @@ test("the reviewer does not inherit the caller's harness", () => {
 const HEAD = "a".repeat(40);
 const OLD = "b".repeat(40);
 const REPO = "/repos/johnrees/widget";
+/** When pull request #12 was opened. */
+const CREATED = "2026-10-10T00:00:00Z";
 const stops: (() => void)[] = [];
 afterEach(() => {
   for (const stop of stops.splice(0)) stop();
@@ -206,7 +211,14 @@ type World = {
   labels?: string[];
   /** The labels every later read of the pull request sees, as when John adds one during a review. */
   labelsLater?: string[];
-  status?: { context: string; state: string; description?: string }[];
+  status?: { context: string; state: string; description?: string; id?: number; creator?: { login: string } }[];
+  /** The statuses each later read of the combined status sees, in turn, as when the workflow sets one. */
+  statusLater?: { context: string; state: string; description?: string; id?: number }[][];
+  /** The pull request's conversation comments, and issue #7's. */
+  comments?: unknown[];
+  issueComments?: unknown[];
+  /** The 👍 reactions on a comment, by its id. */
+  reactions?: Record<number, unknown[]>;
   events?: unknown[];
   optedIn?: boolean;
   config?: unknown;
@@ -250,22 +262,33 @@ const world = ({
   head = HEAD, labels = [], labelsLater, status = [], events = [], optedIn = true, config = EXAMPLE, answer, closes = "johnrees/widget", upstream = true,
   commitPulls = [{ number: 12, state: "open", head: { sha: HEAD } }], branchPulls = [{ number: 12, state: "open" }], family = "claude",
   coAuthors = [[bot("claude")], [bot("claude")]], checkResults = [], reviewReplies = [], rules = [], branch = { protected: false }, checkRuns = [],
+  statusLater = [], comments = [], issueComments = [{ id: 70, body: "Last word.", user: { login: "someone" }, created_at: "2026-10-01T00:00:00Z" }], reactions = {},
 }: World = {}) => {
   let pullReads = 0;
+  const statusReads = [...statusLater];
   const reviewStatuses = [...reviewReplies];
   const fake = fakeGitHub({
     [`GET ${REPO}/pulls/12`]: () => {
       const names = pullReads++ === 0 ? labels : (labelsLater ?? labels);
-      return reply(200, { state: "open", title: "Do it", body: "Closes #7.", head: { sha: head }, base: { ref: "main" }, labels: names.map((name) => ({ name })) });
+      return reply(200, {
+        state: "open", title: "Do it", body: "Closes #7.", head: { sha: head }, base: { ref: "main" }, labels: names.map((name) => ({ name })),
+        created_at: CREATED, user: { login: "johnrees", type: "User" },
+      });
     },
     [`GET ${REPO}/pulls`]: () => reply(200, branchPulls),
     [`GET ${REPO}/commits/${HEAD}/pulls`]: () => reply(200, commitPulls),
-    [`GET ${REPO}`]: () => reply(200, { default_branch: "main" }),
+    [`GET ${REPO}`]: () => reply(200, { default_branch: "main", owner: { login: "johnrees" } }),
+    [`GET ${REPO}/issues/12/comments`]: (_, url) => reply(200, page(comments, url)),
+    [`GET ${REPO}/commits/${head}/statuses`]: (_, url) => reply(200, page(status, url)),
+    "GET /apps/github-actions": () => reply(200, { id: 15368, slug: "github-actions" }),
     [`GET ${REPO}/contents/.github/agent-review.json`]: () =>
       optedIn ? reply(200, { content: Buffer.from(JSON.stringify(config)).toString("base64") }) : reply(404, {}),
     // The pull request's own merge base; origin's (below) would be a fork's.
     [`GET ${REPO}/compare/main...${HEAD}`]: () => reply(200, { merge_base_commit: { sha: OLD } }),
-    [`GET ${REPO}/commits/${head}/status`]: (_, url) => reply(200, { state: "success", total_count: status.length, statuses: page(status, url) }),
+    [`GET ${REPO}/commits/${head}/status`]: (_, url) => {
+      const now = statusReads.length > 1 ? (statusReads.shift() as typeof status) : (statusReads[0] ?? status);
+      return reply(200, { state: "success", total_count: now.length, statuses: page(now, url) });
+    },
     [`GET ${REPO}/commits/${head}/check-runs`]: (_, url) => {
       const runs = checkRuns.filter((run) => (run as { name: string }).name === url.searchParams.get("check_name"));
       return reply(200, { total_count: runs.length, check_runs: page(runs, url) });
@@ -291,7 +314,8 @@ const world = ({
           })
         : reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { nodes: [{ number: 7, repository: { nameWithOwner: closes } }] } } } } }),
     [`GET ${REPO}/issues/7`]: () => reply(200, { title: "The ticket", body: "Do it well.", labels: [{ name: "model:fable-astra" }], comments: 1 }),
-    [`GET ${REPO}/issues/7/comments`]: () => reply(200, [{ body: "Last word." }]),
+    [`GET ${REPO}/issues/7/comments`]: (_, url) => reply(200, page(issueComments, url)),
+    ...Object.fromEntries(Object.entries(reactions).map(([id, list]) => [`GET ${REPO}/issues/comments/${id}/reactions`, (_: string, url: URL) => reply(200, page(list, url))])),
     ["GET /repos/johnrees/tracker/issues/7"]: () => reply(200, { title: "Elsewhere", body: "Tracked elsewhere.", labels: [{ name: "model:opus-sol" }], comments: 0 }),
     [`POST ${REPO}/pulls/12/reviews`]: () => reply(reviewStatuses.shift() ?? 200, {}),
     [`POST ${REPO}/statuses/${HEAD}`]: () => reply(201, {}),
@@ -299,10 +323,11 @@ const world = ({
   stops.push(fake.stop);
   const commands: { command: readonly string[]; stdin: string; cwd: string }[] = [];
   const gitCalls: string[] = [];
-  const checks: { command: string; cwd: string; timeoutMs: number }[] = [];
+  const checks: { command: string; cwd: string; timeoutMs: number; env: Readonly<Record<string, string>> }[] = [];
   const steps: string[] = [];
   const printed: string[] = [];
   let output = "";
+  const slept: number[] = [];
   const io: ReviewIo = {
     api: fake.api,
     token: "ghu_test",
@@ -327,8 +352,8 @@ const world = ({
       if (args[0] === "cat-file") return args.at(-1) === `${OLD}^{commit}` ? "" : undefined;
       return undefined;
     },
-    runCheck: async (command, cwd, timeoutMs) => {
-      checks.push({ command, cwd, timeoutMs });
+    runCheck: async (command, cwd, timeoutMs, env) => {
+      checks.push({ command, cwd, timeoutMs, env });
       steps.push(`check ${command}`);
       const result = checkResults.shift() ?? { code: 0, output: `${command}: ok\n` };
       return { timedOut: false, ...result };
@@ -347,8 +372,11 @@ const world = ({
     out: (text) => {
       output += text;
     },
+    sleep: async (ms) => {
+      slept.push(ms);
+    },
   };
-  return { fake, io, commands, gitCalls, checks, steps, printed, output: () => output };
+  return { fake, io, commands, gitCalls, checks, steps, printed, slept, output: () => output };
 };
 
 const posted = (fake: ReturnType<typeof world>["fake"], path: string) =>
@@ -389,6 +417,25 @@ test("a commit pushed after the review blocks gh pr ready again", async () => {
   expect(await gateRefusal(gateReady(moved.io, { number: 12 }))).toContain("head bbbbbbbb has no agent-review status");
 });
 
+test("gh pr ready is refused while the owner's comment waits for an agent's answer, naming it, until an agent answers or he gives it a 👍", async () => {
+  const reviewed = [{ context: "agent-review", state: "success" }];
+  const john = { id: 21, user: { login: "johnrees" }, performed_via_github_app: null, created_at: "2026-10-11T00:00:00Z", html_url: "https://github.com/johnrees/widget/pull/12#issuecomment-21", body: "Why?" };
+  const onIssue = { ...john, id: 71, html_url: "https://github.com/johnrees/widget/issues/7#issuecomment-71" };
+  expect(await gateRefusal(gateReady(world({ status: reviewed, comments: [john], issueComments: [onIssue] }).io, { number: 12 }))).toBe(
+    "pull request #12 has 2 comment(s) waiting for an agent's answer: johnrees's comment on #12 (https://github.com/johnrees/widget/pull/12#issuecomment-21), johnrees's comment on #7 (https://github.com/johnrees/widget/issues/7#issuecomment-71); answer each on its thread, or John gives his own comment a 👍 when it needs no answer",
+  );
+  const answer = { ...john, id: 22, performed_via_github_app: { id: 5085898 }, created_at: "2026-10-11T01:00:00Z" };
+  await gateReady(world({ status: reviewed, comments: [john, answer] }).io, { number: 12 });
+  const thumbed = { ...john, reactions: { "+1": 2 } };
+  await gateReady(world({ status: reviewed, comments: [thumbed], reactions: { 21: [{ user: { login: "someone" } }, { user: { login: "johnrees" } }] } }).io, { number: 12 });
+  expect(await gateRefusal(gateReady(world({ status: reviewed, comments: [thumbed], reactions: { 21: [{ user: { login: "someone" } }] } }).io, { number: 12 }))).toContain("1 comment(s) waiting");
+  // Comments wait whether the review passed or was waived; a missing review is named first.
+  expect(await gateRefusal(gateReady(world({ status: [{ context: "agent-review", state: "pending", description: "needs a review" }], comments: [john] }).io, { number: 12 }))).toBe(
+    "pull request #12's head aaaaaaaa has agent-review pending (needs a review); run `agent-gh review full` on it (it reviews the pushed head), or ask John to add the `review-waived` label",
+  );
+  expect(await gateRefusal(gateReady(world({ labels: ["review-waived"], events: [labeled("johnrees", null)], comments: [john] }).io, { number: 12 }))).toContain("1 comment(s) waiting");
+});
+
 test("a repository without the config is not gated", async () => {
   const { fake, io } = world({ optedIn: false });
   await gateReady(io, { number: 12 });
@@ -417,17 +464,21 @@ test("a full review runs the checks itself in a clone of the head, then the auth
   expect(commands).toHaveLength(1);
   const [{ command, stdin, cwd }] = commands as [{ command: readonly string[]; stdin: string; cwd: string }];
   // agent-gh runs the checks before the reviewer in a throwaway clone; the reviewer only reads, in a fresh one.
-  expect(steps).toEqual(["git clone", "git checkout", "check make check", "check make lint", "git clone", "git checkout", "reviewer"]);
+  const clone = ["git clone", "git checkout", "git remote", "git update-ref"];
+  expect(steps).toEqual([...clone, "check make check", "check make lint", ...clone, "reviewer"]);
   const checked = checks[0]?.cwd as string;
   expect(checked).not.toBe(cwd);
-  expect(checks).toEqual([{ command: "make check", cwd: checked, timeoutMs: 1_800_000 }, { command: "make lint", cwd: checked, timeoutMs: 1_800_000 }]);
-  expect(gitCalls).toEqual([
-    `clone -q --shared --no-checkout /work/widget/.git ${checked}`,
-    `-C ${checked} checkout -q --detach ${HEAD}`,
-    `clone -q --shared --no-checkout /work/widget/.git ${cwd}`,
-    `-C ${cwd} checkout -q --detach ${HEAD}`,
-  ]);
-  expect(command.slice(0, 8)).toEqual(["codex", "exec", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"', "-s", "read-only"]);
+  // Each check is told the pull request's merge base, which the clone's origin/main names, as GitHub has it.
+  const told = { AGENT_GH_BASE: OLD, AGENT_GH_BASE_REF: "origin/main" };
+  expect(checks).toEqual([{ command: "make check", cwd: checked, timeoutMs: 1_800_000, env: told }, { command: "make lint", cwd: checked, timeoutMs: 1_800_000, env: told }]);
+  const cloned = (dir: string) => [
+    `clone -q --shared --no-checkout /work/widget/.git ${dir}`,
+    `-C ${dir} checkout -q --detach ${HEAD}`,
+    `-C ${dir} remote set-url origin https://github.com/johnrees/widget.git`,
+    `-C ${dir} update-ref refs/remotes/origin/main ${OLD}`,
+  ];
+  expect(gitCalls).toEqual([...cloned(checked), ...cloned(cwd)]);
+  expect(command.slice(0, 8)).toEqual(["codex", "exec", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"', "-c", 'sandbox_mode="read-only"']);
   expect(command).not.toContain("workspace-write");
   // The merge base is the pull request's, from GitHub, not origin's.
   expect(stdin).toContain(`git diff ${OLD}...${HEAD}`);
@@ -506,7 +557,7 @@ test("a check that runs out of time stops the rest; the checks count as timed ou
 test("a repository with no checks reviews with checks not run", async () => {
   const w = world({ config: { ...EXAMPLE, checks: undefined }, answer: { verdict: "approve", spec: "Done.", findings: [] } });
   await reviewFull(w.io, {});
-  expect(w.steps).toEqual(["git clone", "git checkout", "reviewer"]);
+  expect(w.steps).toEqual(["git clone", "git checkout", "git remote", "git update-ref", "reviewer"]);
   expect(w.commands[0]?.stdin).toContain("The repository configures no checks, so none ran.");
   expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)[0]).toMatchObject({ state: "success", description: "approved; checks not run: 0 finding(s) by gpt-6-astra at xhigh" });
 });
@@ -538,6 +589,35 @@ test("the reviewer is from another family than the head commits' co-author, else
     expect(mixed.commands[0]?.command[0]).toBe("claude");
     expect(mixed.printed).toContain("agent-gh: the head commits credit no single family App as co-author, so this is taken as this session's (codex) work");
   }
+});
+
+test("where the workflow writes the status, a full review posts its review and marker, sets no status, and waits for and prints the workflow's", async () => {
+  const answer = { verdict: "approve", spec: "Done.", findings: [] };
+  const actions = { ...EXAMPLE, status_writer: "actions" };
+  const before = { context: "agent-review", state: "pending", description: "needs a review", id: 1 };
+  const w = world({
+    config: actions, answer,
+    statusLater: [[before], [before], [{ ...before, id: 2 }], [{ context: "agent-review", state: "success", description: "approved; checks passed (codex review)", id: 3 }]],
+  });
+  await reviewFull(w.io, {});
+  expect(posted(w.fake, `${REPO}/pulls/12/reviews`)).toHaveLength(1);
+  expect(parseMarker(posted(w.fake, `${REPO}/pulls/12/reviews`)[0]?.body as string)?.verdict).toBe("approve");
+  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)).toEqual([]);
+  // The pending one the workflow left from before, even rewritten, is not the answer.
+  expect(w.slept).toEqual([5_000, 5_000]);
+  expect(w.printed.at(-1)).toBe("agent-gh: the agent-review workflow set agent-review on aaaaaaaa: success (approved; checks passed (codex review))");
+  expect(JSON.parse(w.output())).toEqual(answer);
+
+  const silent = world({ config: actions, answer });
+  await reviewFull(silent.io, {});
+  expect(silent.slept).toHaveLength(12);
+  expect(silent.printed.at(-1)).toBe("agent-gh: no agent-review status on aaaaaaaa after 60s; check that the repository runs the agent-review workflow, and the pull request's checks");
+
+  const waived = world({ config: actions, labels: ["review-waived"], events: [labeled("johnrees", null)] });
+  await reviewFull(waived.io, {});
+  expect(waived.commands).toEqual([]);
+  expect(posted(waived.fake, `${REPO}/statuses/${HEAD}`)).toEqual([]);
+  expect(waived.printed).toContain("agent-gh: the review of #12 was waived by johnrees; the agent-review workflow records it");
 });
 
 test("a waiver John adds while the review runs is never overwritten by the verdict", async () => {
@@ -621,12 +701,16 @@ test("gh pr ready runs only after the gate passes, with the gate's token; other 
 });
 
 test("gh pr merge names its pull request as gh does, skipping flag values, and --admin is always seen", () => {
-  expect(mergeCommand(["pr", "merge"])).toEqual({ target: { branch: undefined }, admin: false, headCommit: undefined });
-  expect(mergeCommand(["pr", "merge", "12", "--squash", "-d"])).toEqual({ target: { number: 12 }, admin: false, headCommit: undefined });
-  expect(mergeCommand(["pr", "merge", "-b", "body text", "-t", "subject", "--match-head-commit", HEAD, "#12"])).toEqual({ target: { number: 12 }, admin: false, headCommit: HEAD });
-  expect(mergeCommand(["pr", "merge", "-sb", "12", "13"])).toEqual({ target: { number: 13 }, admin: false, headCommit: undefined });
-  expect(mergeCommand(["pr", "merge", "--body=12", "feature"])).toEqual({ target: { branch: "feature" }, admin: false, headCommit: undefined });
-  expect(mergeCommand(["-R", "o/r", "pr", "merge", "https://github.com/o/r/pull/4", "--admin"])).toEqual({ target: { number: 4, repo: "o/r" }, admin: true, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge"])).toEqual({ target: { branch: undefined }, admin: false, auto: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "12", "--squash", "-d"])).toEqual({ target: { number: 12 }, admin: false, auto: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "-b", "body text", "-t", "subject", "--match-head-commit", HEAD, "#12"])).toEqual({ target: { number: 12 }, admin: false, auto: false, headCommit: HEAD });
+  expect(mergeCommand(["pr", "merge", "-sb", "12", "13"])).toEqual({ target: { number: 13 }, admin: false, auto: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "--body=12", "feature"])).toEqual({ target: { branch: "feature" }, admin: false, auto: false, headCommit: undefined });
+  expect(mergeCommand(["-R", "o/r", "pr", "merge", "https://github.com/o/r/pull/4", "--admin"])).toEqual({ target: { number: 4, repo: "o/r" }, admin: true, auto: false, headCommit: undefined });
+  expect(mergeCommand(["pr", "merge", "12", "--auto", "--squash"])?.auto).toBe(true);
+  // A spelling gh would not read as true is not auto-merge, so the checks are required.
+  expect(mergeCommand(["pr", "merge", "12", "--auto=maybe"])?.auto).toBe(false);
+  expect(mergeCommand(["pr", "merge", "12", "--auto", "--auto=false"])?.auto).toBe(false);
   expect(mergeCommand(["pr", "merge", "12", "--admin=false", "--admin"])?.admin).toBe(true);
   expect(mergeCommand(["pr", "merge", "12", "--admin", "--admin=false"])?.admin).toBe(false);
   for (const spelling of ["--admin=1", "--admin=t", "--admin=True", "--admin=yes"]) expect(mergeCommand(["pr", "merge", "12", spelling])?.admin).toBe(true);
@@ -661,7 +745,7 @@ test("an agent's gh pr merge runs only once every check the base branch requires
   const calls: string[] = [];
   const unmet = world({ rules: REQUIRED, status: [{ context: "agent-review", state: "failure" }], checkRuns: [{ name: "build", status: "in_progress", conclusion: null, app: { id: 15368 } }] });
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--squash"], here, mergeDeps(unmet.io, calls)))).toBe(
-    "pull request #12's head aaaaaaaa has not passed every check main requires (`build` pending, `agent-review` failed); wait for them to pass, fix what fails, or ask John to merge it",
+    "pull request #12's head aaaaaaaa has not passed every check main requires (`build` pending, `agent-review` failed); wait for them to pass, fix what fails, or merge with `--auto`, which GitHub completes once they pass",
   );
   const classic = world({ branch: { protection: { required_status_checks: { enforcement_level: "non_admins", contexts: ["lint"], checks: [] } } } });
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(classic.io, calls)))).toContain("(`lint` missing)");
@@ -677,6 +761,41 @@ test("an agent's gh pr merge runs only once every check the base branch requires
     "--match-head-commit bbbbbbbb is not the head whose checks passed (aaaaaaaa)",
   );
   expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD} -- x`]);
+});
+
+test("an agent may turn on auto-merge while checks are pending or failing, bound to the head it saw, and never with --admin", async () => {
+  // GitHub holds auto-merge until the required checks pass, even for a bypass actor (checked live).
+  const here = parseRepo("johnrees/widget");
+  const calls: string[] = [];
+  const failing = world({ rules: REQUIRED, status: [{ context: "agent-review", state: "failure" }], checkRuns: [{ name: "build", status: "completed", conclusion: "failure", app: { id: 15368 } }] });
+  expect(await dispatchGh(["pr", "merge", "12", "--auto", "--squash"], here, mergeDeps(failing.io, calls))).toBe(0);
+  expect(calls).toEqual([`gh pr merge 12 --auto --squash --match-head-commit ${HEAD}`]);
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto", "--admin"], here, mergeDeps(failing.io, calls)))).toContain("an agent never merges with `--admin`");
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto", "--match-head-commit", OLD], here, mergeDeps(failing.io, calls)))).toContain("--match-head-commit bbbbbbbb is not the head");
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(failing.io, calls)))).toContain("or merge with `--auto`");
+  // GraphQL: enablePullRequestAutoMerge passes on the same terms, with the head bound; a direct merge does not.
+  const auto = (oid: string) => `mutation { enablePullRequestAutoMerge(input: {pullRequestId: "PR_12"${oid}}) { clientMutationId } }`;
+  expect(await dispatchGh(["api", "graphql", "-f", `query=${auto(`, expectedHeadOid: "${HEAD}"`)}`], here, mergeDeps(failing.io, calls))).toBe(0);
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=${auto("")}`], here, mergeDeps(failing.io, calls)))).toContain(`must give expectedHeadOid: "${HEAD}"`);
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=mutation { mergePullRequest(input: {pullRequestId: "PR_12", expectedHeadOid: "${HEAD}"}) { x } }`], here, mergeDeps(failing.io, calls)))).toContain("has not passed every check");
+  expect(calls).toHaveLength(2);
+});
+
+test("a required check tied to GitHub Actions is met by a status its bot set (the agent-review workflow's), never by one an agent set", async () => {
+  const here = parseRepo("johnrees/widget");
+  const calls: string[] = [];
+  const pinned = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "agent-review", integration_id: 15368 }] } }];
+  const byActions = { context: "agent-review", state: "success", creator: { login: "github-actions[bot]" } };
+  const byAgent = { context: "agent-review", state: "success", creator: { login: "johnrees" } };
+  expect(await dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: pinned, status: [byActions] }).io, calls))).toBe(0);
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: pinned, status: [byAgent] }).io, calls)))).toContain("(`agent-review` missing)");
+  // The latest of the App's own statuses decides, whatever an agent set after it.
+  const failed = { ...byActions, state: "failure" };
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: pinned, status: [byAgent, failed, byActions] }).io, calls)))).toContain("(`agent-review` failed)");
+  // The live case: the workflow's failure is named as failed, not missing; its pending as pending.
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: pinned, status: [failed] }).io, calls)))).toContain("(`agent-review` failed)");
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: pinned, status: [{ ...byActions, state: "pending" }] }).io, calls)))).toContain("(`agent-review` pending)");
+  expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD}`]);
 });
 
 test("the merge guard reads every page of statuses and check runs", async () => {
@@ -750,10 +869,10 @@ test("a gh api call that merges is found in every spelling, and one the guard ca
 
 test("each GraphQL merge mutation's pull request and expected head are read from its own arguments", () => {
   const H = "e".repeat(40);
-  expect(graphqlMerges(`mutation { mergePullRequest(input: {pullRequestId: "PR_1", expectedHeadOid: "${H}"}) { clientMutationId } }`, {})).toEqual([{ id: "PR_1", expectedHeadOid: H }]);
-  expect(graphqlMerges("mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }", { id: "PR_2" })).toEqual([{ id: "PR_2", expectedHeadOid: undefined }]);
-  expect(graphqlMerges("mutation($input: MergePullRequestInput!) { mergePullRequest(input: $input) { clientMutationId } }", { input: { pullRequestId: "PR_3", expectedHeadOid: H } })).toEqual([{ id: "PR_3", expectedHeadOid: H }]);
-  expect(graphqlMerges('mutation { enqueuePullRequest(input: {pullRequestId: "P(R)"}) { x } }', {})).toEqual([{ id: "P(R)", expectedHeadOid: undefined }]);
+  expect(graphqlMerges(`mutation { mergePullRequest(input: {pullRequestId: "PR_1", expectedHeadOid: "${H}"}) { clientMutationId } }`, {})).toEqual([{ id: "PR_1", expectedHeadOid: H, auto: false }]);
+  expect(graphqlMerges("mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }", { id: "PR_2" })).toEqual([{ id: "PR_2", expectedHeadOid: undefined, auto: true }]);
+  expect(graphqlMerges("mutation($input: MergePullRequestInput!) { mergePullRequest(input: $input) { clientMutationId } }", { input: { pullRequestId: "PR_3", expectedHeadOid: H } })).toEqual([{ id: "PR_3", expectedHeadOid: H, auto: false }]);
+  expect(graphqlMerges('mutation { enqueuePullRequest(input: {pullRequestId: "P(R)"}) { x } }', {})).toEqual([{ id: "P(R)", expectedHeadOid: undefined, auto: false }]);
   expect(graphqlMerges("query { viewer { login } }", {})).toEqual([]);
   expect(graphqlMerges("mutation($id: ID!) { mergePullRequest(input: {pullRequestId: $id}) { clientMutationId } }", {})).toHaveProperty("refuse");
   // Another mutation's pull request id never stands in for the merge's own.
@@ -763,10 +882,10 @@ test("each GraphQL merge mutation's pull request and expected head are read from
   expect(graphqlMerges('mutation { mergeBranch(input: {repositoryId: "R", base: "main", head: "x"}) { x } }', {})).toHaveProperty("refuse");
   // Comments and strings are not read as fields: GitHub ignores them, so the guard does too.
   // GraphQL ends a comment at a bare carriage return too.
-  expect(graphqlMerges('# note\rmutation { mergePullRequest(input: {pullRequestId: "PR_R"}) { x } }', {})).toEqual([{ id: "PR_R", expectedHeadOid: undefined }]);
-  expect(graphqlMerges(`mutation { mergePullRequest(input: {\n# pullRequestId: "PR_SAFE", expectedHeadOid: "${H}"\npullRequestId: "PR_BLOCKED"}) { x } }`, {})).toEqual([{ id: "PR_BLOCKED", expectedHeadOid: undefined }]);
-  expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "pullRequestId: $safe", pullRequestId: "PR_B"}) { x } }', { safe: "PR_SAFE" })).toEqual([{ id: "PR_B", expectedHeadOid: undefined }]);
-  expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "a ) b", pullRequestId: "PR_C"}) { x } }', {})).toEqual([{ id: "PR_C", expectedHeadOid: undefined }]);
+  expect(graphqlMerges('# note\rmutation { mergePullRequest(input: {pullRequestId: "PR_R"}) { x } }', {})).toEqual([{ id: "PR_R", expectedHeadOid: undefined, auto: false }]);
+  expect(graphqlMerges(`mutation { mergePullRequest(input: {\n# pullRequestId: "PR_SAFE", expectedHeadOid: "${H}"\npullRequestId: "PR_BLOCKED"}) { x } }`, {})).toEqual([{ id: "PR_BLOCKED", expectedHeadOid: undefined, auto: false }]);
+  expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "pullRequestId: $safe", pullRequestId: "PR_B"}) { x } }', { safe: "PR_SAFE" })).toEqual([{ id: "PR_B", expectedHeadOid: undefined, auto: false }]);
+  expect(graphqlMerges('mutation { mergePullRequest(input: {commitHeadline: "a ) b", pullRequestId: "PR_C"}) { x } }', {})).toEqual([{ id: "PR_C", expectedHeadOid: undefined, auto: false }]);
   expect(graphqlMerges('mutation { mergePullRequest(input: {pullRequestId: "PR_1", pullRequestId: "PR_2"}) { x } }', {})).toHaveProperty("refuse");
   expect(graphqlMerges('mutation { mergePullRequest(input: {pullRequestId: "PR_1", commitBody: """x"""}) { x } }', {})).toHaveProperty("refuse");
 });
@@ -937,8 +1056,11 @@ test("a sweep prints the reviewer's text against the pull request's base and rec
 
 test("the reviewer is read-only, whatever checks the repository configures", () => {
   const files = { schema: "s.json", out: "o.json" };
-  expect(fullCommand({ family: "codex", model: "gpt-6-astra" }, "high", files).slice(6, 8)).toEqual(["-s", "read-only"]);
-  expect(sweepCommand({ family: "codex", model: "gpt-6-astra" }, "high", "origin/main", "o.md")).toContain("read-only");
+  expect(fullCommand({ family: "codex", model: "gpt-6-astra" }, "high", files).slice(6, 8)).toEqual(["-c", 'sandbox_mode="read-only"']);
+  // The whole argv, in flags `codex exec review --help` (v0.162) lists: it refuses `-s`, so the sandbox is set through config.
+  expect(sweepCommand({ family: "codex", model: "gpt-6-astra" }, "high", "origin/main", "o.md")).toEqual([
+    "codex", "exec", "review", "--base", "origin/main", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="high"', "-c", 'sandbox_mode="read-only"', "--ephemeral", "-o", "o.md",
+  ]);
   const claude = fullCommand({ family: "claude", model: "claude-opus-5-5" }, "high", files);
   expect(claude[claude.indexOf("--allowedTools") + 1]).toBe("Bash(git diff:*),Bash(git log:*),Bash(git show:*)");
 });
@@ -973,7 +1095,8 @@ const realRepo = () => {
   const io = {
     family: "codex",
     git: async (args: readonly string[], input?: string) => git(args, input),
-    runCheck: (command: string, cwd: string, timeoutMs: number) => spawnCheck(command, cwd, env, timeoutMs),
+    repo: { owner: "johnrees", name: "widget" },
+    runCheck: (command: string, cwd: string, timeoutMs: number, extra: Record<string, string>) => spawnCheck(command, cwd, env, timeoutMs, extra),
     tempDir: () => mkdtempSync(join(home, "tmp-")),
     print: (line: string) => printed.push(line),
   } as unknown as ReviewIo;
@@ -1004,6 +1127,27 @@ test("checks run in a self-contained clone: they write there even when the calle
   expect(repo.git(["count-objects", "-v"])).toBe(before);
   expect(repo.git(["status", "--porcelain"])).toBe("");
   expect(repo.git(["rev-parse", "HEAD"])).toBe(head);
+});
+
+test("in the clone, origin is GitHub and origin/<base> is the pull request's merge base, however stale the caller's base branch is", async () => {
+  const repo = realRepo();
+  const stale = repo.commit("a.txt", "a\n", "the caller's main");
+  const mergeBase = repo.commit("b.txt", "b\n", "main on GitHub, which the pull request branched from");
+  repo.git(["checkout", "-q", "-b", "feature"]);
+  const head = repo.commit("c.txt", "c\n", "the change");
+  // The caller's local main never moved past `stale`.
+  repo.git(["branch", "-f", "main", stale]);
+  const config = parseReviewConfig(JSON.stringify({
+    reviewers: { claude: { model: "m" } },
+    checks: ['test "$(git rev-parse "$AGENT_GH_BASE_REF")" = "$AGENT_GH_BASE" && git remote get-url origin && git diff --name-only origin/main'],
+  }));
+  const base = { ref: "main", sha: mergeBase };
+  const result = await inClone(repo.io, head, (dir) => runChecks(repo.io, config, dir, base), base);
+  expect(result).toMatchObject({ state: "passed" });
+  expect(result.state === "passed" && result.tail.split("\n").slice(1)).toEqual(["https://github.com/johnrees/widget.git", "c.txt"]);
+  // The caller's own repository is left as it was.
+  expect(repo.git(["rev-parse", "main"])).toBe(stale);
+  expect(repo.git(["remote"])).toBe("");
 });
 
 test("the author family is read from the head commits' co-author trailers", async () => {

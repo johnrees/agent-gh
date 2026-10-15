@@ -35,6 +35,7 @@ const HOST_CONFIG_HOOKS = (() => {
   return probe.exitCode === 0 && probe.stdout.toString().split("\n").includes("p");
 })();
 const COMMIT_HOOK_OK = "ok   commit hook: a global commit-msg hook credits an agent session's commits in every repository";
+const PUSH_HOOK_OK = "ok   push hook: a global pre-push hook holds an agent session's pushes to a branch whose rules require checks";
 
 /** Replaces a machine's git with one that, like git before config-based hooks, has no `git hook list`. */
 const olderGit = (bin: string) => {
@@ -369,13 +370,13 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
     (await machineDoctor({ ...deps, ...overrides, version, latest: async () => latest ?? undefined, ssh: () => ssh })).map(formatLine);
 
   const healthy = await doctor();
-  expect(healthy.filter((line) => !line.startsWith("note commit hook"))).toEqual([
+  expect(healthy.filter((line) => !line.startsWith("note commit hook") && !line.startsWith("note push hook"))).toEqual([
     "ok   agent-gh: v0.1.0, the latest release",
     `ok   gitleaks: ${join(bin, "gitleaks")}`,
     "ok   login claude: usable",
     "ok   login read: usable",
     `ok   gh shim: ${join(deps.shims, "gh")} is first on PATH`,
-    ...(HOST_CONFIG_HOOKS ? [COMMIT_HOOK_OK] : []),
+    ...(HOST_CONFIG_HOOKS ? [COMMIT_HOOK_OK, PUSH_HOOK_OK] : []),
     "ok   git credentials: an agent session uses its family App where installed, and anyone else the read App",
     "ok   ssh: no key here logs in to GitHub",
     "ok   gh login: no personal login",
@@ -459,9 +460,18 @@ test.skipIf(!HOST_CONFIG_HOOKS)("install-shims sets a global commit-msg hook: an
   expect(inRepo(["commit", "-q", "--allow-empty", "-m", "twice"], agent).exitCode).toBe(0);
   expect(message().split("\n").filter((line) => line.startsWith("Co-authored-by:"))).toHaveLength(1);
   expect(git(["config", "--global", "--get", "hook.agent-gh.event"]).stdout).toBe("commit-msg\n");
+  const doctor = async () => (await machineDoctor({ ...deps, version: "dev", latest: async () => undefined, ssh: () => "refused" })).map(formatLine);
+  // The two hooks are checked apart: a missing pre-push hook is named as itself.
+  git(["config", "--global", "--unset", "hook.agent-gh-push.event"]);
+  let lines = await doctor();
+  expect(lines).toContain(COMMIT_HOOK_OK);
+  expect(lines).toContain("FAIL push hook: not set; rerun the install line");
+  git(["config", "--global", "hook.agent-gh-push.event", "pre-push"]);
+  expect(await doctor()).toContain(PUSH_HOOK_OK);
   git(["config", "--global", "--unset", "hook.agent-gh.command"]);
-  const lines = (await machineDoctor({ ...deps, version: "dev", latest: async () => undefined, ssh: () => "refused" })).map(formatLine);
+  lines = await doctor();
   expect(lines).toContain("FAIL commit hook: not set; rerun the install line");
+  expect(lines).toContain(PUSH_HOOK_OK);
 });
 
 test("with a git before config-based hooks, install-shims sets no global hook and doctor says the repository hook is needed", async () => {
@@ -472,6 +482,7 @@ test("with a git before config-based hooks, install-shims sets no global hook an
   expect(git(["config", "--global", "--get", "hook.agent-gh.command"]).code).not.toBe(0);
   const lines = (await machineDoctor({ ...deps, version: "dev", latest: async () => undefined, ssh: () => "refused" })).map(formatLine);
   expect(lines.find((line) => line.includes("commit hook"))).toStartWith("note commit hook: git version");
+  expect(lines.find((line) => line.includes("push hook"))).toStartWith("note push hook: git version");
   expect(lines.some((line) => line.startsWith("FAIL"))).toBe(false);
 });
 

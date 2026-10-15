@@ -39,7 +39,16 @@ export type ReviewConfig = {
    * refuse unknown keys, fail closed instead of passing a `changes_requested`.
    */
   readonly blockOn: BlockOn;
+  /**
+   * Who sets the agent-review status: `agent`, `review full` itself (the
+   * default), or `actions`, the repository's agent-review workflow, which
+   * derives it from the review's marker; `review full` then only waits for it.
+   */
+  readonly statusWriter: StatusWriter;
 };
+
+export const STATUS_WRITERS = ["agent", "actions"] as const;
+export type StatusWriter = (typeof STATUS_WRITERS)[number];
 
 export const BLOCK_ON = ["changes_requested"] as const;
 export type BlockOn = (typeof BLOCK_ON)[number];
@@ -96,6 +105,12 @@ const blockOn = (value: unknown): BlockOn => {
   return value as BlockOn;
 };
 
+const statusWriter = (value: unknown): StatusWriter => {
+  if (value === undefined) return "agent";
+  if (!STATUS_WRITERS.includes(value as StatusWriter)) throw new Failure(STAGE, `${CONFIG_PATH}: status_writer must be ${STATUS_WRITERS.map((v) => `"${v}"`).join(" or ")}`);
+  return value as StatusWriter;
+};
+
 /** Parses and checks the config; every refusal names the field to fix. */
 export const parseReviewConfig = (text: string): ReviewConfig => {
   let raw: unknown;
@@ -105,7 +120,7 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
     throw new Failure(STAGE, `${CONFIG_PATH} is not valid JSON`);
   }
   const top = object(raw, "the file");
-  known(top, ["reviewers", "effort", "checklist", "waiver_label", "pin", "checks", "checks_output_lines", "post_checks_output", "checks_timeout_minutes", "block_on"], "the file");
+  known(top, ["reviewers", "effort", "checklist", "waiver_label", "pin", "checks", "checks_output_lines", "post_checks_output", "checks_timeout_minutes", "block_on", "status_writer"], "the file");
   const checksRaw = top.checks ?? [];
   if (!Array.isArray(checksRaw)) throw new Failure(STAGE, `${CONFIG_PATH}: checks must be a list of commands`);
   const reviewersRaw = object(top.reviewers, "reviewers");
@@ -144,6 +159,7 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
     postChecksOutput: flag(top.post_checks_output, "post_checks_output"),
     checksTimeoutMinutes: whole(top.checks_timeout_minutes, "checks_timeout_minutes", 30, 1, 1440),
     blockOn: blockOn(top.block_on),
+    statusWriter: statusWriter(top.status_writer),
   };
 };
 
@@ -191,16 +207,16 @@ export const waivedBy = (events: readonly unknown[], waiverLabel: string): strin
   return typeof actor?.login === "string" ? actor.login : undefined;
 };
 
-export type CommitStatus = { readonly state: string; readonly description: string };
+export type CommitStatus = { readonly state: string; readonly description: string; readonly id: number | undefined };
 
-/** The agent-review status in a commit's combined status (GitHub lists the latest per context), if any. */
-export const agentReviewStatus = (combined: Record<string, unknown>): CommitStatus | undefined => {
+/** The agent-review status (or another `context`) in a commit's combined status (GitHub lists the latest per context), if any. */
+export const agentReviewStatus = (combined: Record<string, unknown>, context: string = STATUS_CONTEXT): CommitStatus | undefined => {
   if (!Array.isArray(combined.statuses)) return undefined;
   const found = combined.statuses.find(
-    (status) => typeof status === "object" && status !== null && (status as Record<string, unknown>).context === STATUS_CONTEXT,
+    (status) => typeof status === "object" && status !== null && (status as Record<string, unknown>).context === context,
   ) as Record<string, unknown> | undefined;
   if (found === undefined || typeof found.state !== "string") return undefined;
-  return { state: found.state, description: typeof found.description === "string" ? found.description : "" };
+  return { state: found.state, description: typeof found.description === "string" ? found.description : "", id: Number.isSafeInteger(found.id) ? (found.id as number) : undefined };
 };
 
 /** True when the commit's combined status has a successful agent-review status. */
@@ -296,15 +312,19 @@ export const prRepoFlag = (args: readonly string[]): string | undefined => ghArg
 /**
  * `gh pr merge`: the pull request it names, whether it asks for `--admin`
  * (which merges past the base branch's requirements; any spelling gh would
- * not read as false counts), and its `--match-head-commit`. Undefined for
- * `--disable-auto`, which only turns auto-merge off, and for any other command.
+ * not read as false counts), whether it asks for `--auto` (a spelling gh
+ * would not read as true counts as not), and its `--match-head-commit`.
+ * Undefined for `--disable-auto`, which only turns auto-merge off, and for
+ * any other command.
  */
-export const mergeCommand = (args: readonly string[]): { readonly target: ReadyTarget; readonly admin: boolean; readonly headCommit: string | undefined } | undefined => {
+export const mergeCommand = (
+  args: readonly string[],
+): { readonly target: ReadyTarget; readonly admin: boolean; readonly auto: boolean; readonly headCommit: string | undefined } | undefined => {
   const { words, flags, last } = ghArgs(args, MERGE_FLAGS);
   if (words[0] !== "pr" || words[1] !== "merge") return undefined;
   const admin = lastBoolean(flags, "admin", true);
   if (!admin && lastBoolean(flags, "disable-auto", false)) return undefined;
-  return { target: selector(words[2]), admin, headCommit: last("match-head-commit") };
+  return { target: selector(words[2]), admin, auto: lastBoolean(flags, "auto", false), headCommit: last("match-head-commit") };
 };
 
 /**
@@ -476,8 +496,8 @@ const inputField = (query: string, mask: string, field: string, variables: Reado
 /** A variable's own value, never one inherited from a prototype. */
 const own = (object: Readonly<Record<string, unknown>>, key: string): unknown => (Object.hasOwn(object, key) ? object[key] : undefined);
 
-/** A pull request a GraphQL merge mutation names, and the head it requires (`expectedHeadOid`), if any. */
-export type GraphqlMerge = { readonly id: string; readonly expectedHeadOid: string | undefined };
+/** A pull request a GraphQL merge mutation names, the head it requires (`expectedHeadOid`), if any, and whether it only enables auto-merge. */
+export type GraphqlMerge = { readonly id: string; readonly expectedHeadOid: string | undefined; readonly auto: boolean };
 
 const MERGE_NAMES = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b/g;
 
@@ -550,7 +570,7 @@ export const graphqlMerges = (query: string, variables: Readonly<Record<string, 
     const id = inputField(text, args, "pullRequestId", variables);
     const expectedHeadOid = inputField(text, args, "expectedHeadOid", variables);
     if (typeof id !== "string" || expectedHeadOid === null) return unreadable;
-    merges.push({ id, expectedHeadOid });
+    merges.push({ id, expectedHeadOid, auto: match[1] === "enablePullRequestAutoMerge" });
   }
   return merges;
 };
