@@ -17,16 +17,21 @@ test("the required checks are every ruleset's and classic protection's, once eac
 
 const run = (name: string, conclusion: string | null, app = 15368, status = "completed") => ({ name, status, conclusion, app: { id: app } });
 
-test("only the newest run of a required check counts, as GitHub judges it", () => {
+test("a newer run of the same workflow supersedes an older one; other workflows still count", () => {
   const build = { context: "build", app: 15368 };
-  const at = (conclusion: string | null, started_at: string, id: number, status = "completed") => ({ ...run("build", conclusion, 15368, status), started_at, id });
-  // penmon #387: the draft's run failed, the ready run passed.
-  expect(checkState(build, [], [at("failure", "2026-10-15T14:20:56Z", 1), at("success", "2026-10-15T14:23:57Z", 2)])).toBe("passed");
-  expect(checkState(build, [], [at("success", "2026-10-15T14:20:56Z", 1), at("failure", "2026-10-15T14:23:57Z", 2)])).toBe("failed");
-  expect(checkState(build, [], [at("success", "2026-10-15T14:20:56Z", 1), at(null, "2026-10-15T14:23:57Z", 2, "in_progress")])).toBe("pending");
-  // Same start: the later id wins; another App's newer run is not the required App's.
-  expect(checkState(build, [], [at("failure", "2026-10-15T14:20:56Z", 1), at("success", "2026-10-15T14:20:56Z", 2)])).toBe("passed");
-  expect(checkState(build, [], [at("failure", "2026-10-15T14:20:56Z", 1), { ...at("success", "2026-10-15T14:23:57Z", 2), app: { id: 99 } }])).toBe("failed");
+  const at = (conclusion: string | null, id: number, suite: number, status = "completed", app = 15368) => ({ ...run("build", conclusion, app, status), id, check_suite: { id: suite } });
+  const ci = new Map([[10, 1], [20, 1], [30, 2]]); // suites 10 and 20 ran workflow 1, suite 30 workflow 2
+  // penmon #387: the draft's run failed, the ready run of the same workflow passed.
+  expect(checkState(build, [], [at("failure", 1, 10), at("success", 2, 20)], ci)).toBe("passed");
+  expect(checkState(build, [], [at("success", 1, 10), at("failure", 2, 20)], ci)).toBe("failed");
+  // A newer queued run (no start time yet) is still the current one.
+  expect(checkState(build, [], [at("success", 1, 10), at(null, 2, 20, "queued")], ci)).toBe("pending");
+  // Another workflow's job of the same name is judged on its own.
+  expect(checkState(build, [], [at("failure", 1, 30), at("success", 2, 20)], ci)).toBe("failed");
+  // Suites with no known workflow never supersede each other.
+  expect(checkState(build, [], [at("failure", 1, 10), at("success", 2, 20)])).toBe("failed");
+  // Another App's newer run is not the required App's.
+  expect(checkState(build, [], [at("failure", 1, 10), at("success", 2, 20, "completed", 99)], ci)).toBe("failed");
 });
 
 test("a required check passes only when every matching run or status passed", () => {

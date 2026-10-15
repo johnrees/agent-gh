@@ -341,10 +341,13 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
   if (required.length === 0) return pr.head;
   const statuses = await counted(io, stage, `${repoPath(io)}/commits/${pr.head}/status?`, "statuses");
   const bySomeApp = required.some((check) => check.app !== undefined) ? await appStatuses(io, stage, pr.head) : [];
+  let workflows: Map<number, number> | undefined;
   const unmet: string[] = [];
   for (const check of required) {
     const runs = await counted(io, stage, `${repoPath(io)}/commits/${pr.head}/check-runs?check_name=${encodeURIComponent(check.context)}&filter=latest&`, "check_runs");
-    const state = checkState(check, check.app === undefined ? statuses : bySomeApp, runs);
+    // Several suites' runs: which Actions workflow each suite ran, so a newer run of a workflow supersedes an older one.
+    if (runs.length > 1 && workflows === undefined) workflows = await suiteWorkflows(io, stage, pr.head);
+    const state = checkState(check, check.app === undefined ? statuses : bySomeApp, runs, workflows);
     if (state !== "passed") unmet.push(`\`${check.context}\` ${state}`);
   }
   if (unmet.length === 0) return pr.head;
@@ -352,6 +355,15 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
     stage,
     `pull request #${number}'s head ${pr.head.slice(0, 8)} has not passed every check ${pr.base} requires (${unmet.join(", ")}); wait for them to pass, fix what fails, or merge with \`--auto\`, which GitHub completes once they pass`,
   );
+};
+
+/** Each Actions workflow run's check suite id, mapped to its workflow's id, for the commit. */
+const suiteWorkflows = async (io: ReviewIo, stage: Stage, sha: string): Promise<Map<number, number>> => {
+  const map = new Map<number, number>();
+  for (const run of (await counted(io, stage, `${repoPath(io)}/actions/runs?head_sha=${sha}&`, "workflow_runs")).map(record)) {
+    if (Number.isSafeInteger(run.check_suite_id) && Number.isSafeInteger(run.workflow_id)) map.set(run.check_suite_id as number, run.workflow_id as number);
+  }
+  return map;
 };
 
 /**

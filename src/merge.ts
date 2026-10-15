@@ -42,32 +42,49 @@ export type CheckState = "passed" | "failed" | "pending" | "missing";
 
 const PASSING = ["success", "neutral", "skipped"];
 
-const started = (run: Record<string, unknown>) => (typeof run.started_at === "string" ? run.started_at : "");
-const runId = (run: Record<string, unknown>) => (Number.isSafeInteger(run.id) ? (run.id as number) : 0);
+const runId = (run: Record<string, unknown>) => (Number.isSafeInteger(run.id) ? (run.id as number) : undefined);
 
-/** The runs that started last (by `started_at`, then `id`): the ones GitHub judges a required check by. */
-const newest = (runs: Record<string, unknown>[]): Record<string, unknown>[] => {
-  const last = runs.reduce<Record<string, unknown> | undefined>(
-    (best, run) => (best === undefined || started(run) > started(best) || (started(run) === started(best) && runId(run) > runId(best)) ? run : best),
-    undefined,
-  );
-  return last === undefined ? [] : runs.filter((run) => started(run) === started(last) && runId(run) === runId(last));
+/**
+ * The check runs a required check is judged by. A run is superseded only by
+ * a newer one (a higher `id`, set when the run is created, so a queued run
+ * with no start time is still new) of the same stream: the same Actions
+ * workflow (`workflows` maps a check suite's id to its workflow's id), or
+ * the same check suite for another App. So a draft's failed run gives way to
+ * the ready pull request's run of that workflow, while two workflows with
+ * the same job name are judged separately. A run without an id or suite is
+ * never superseded.
+ */
+const current = (runs: Record<string, unknown>[], workflows: ReadonlyMap<number, number>): Record<string, unknown>[] => {
+  const kept: Record<string, unknown>[] = [];
+  const streams = new Map<string, Record<string, unknown>>();
+  for (const run of runs) {
+    const id = runId(run);
+    const suite = record(run.check_suite).id;
+    if (id === undefined || !Number.isSafeInteger(suite)) {
+      kept.push(run);
+      continue;
+    }
+    const workflow = workflows.get(suite as number);
+    const stream = `${String(record(run.app).id)} ${workflow === undefined ? `suite ${suite}` : `workflow ${workflow}`}`;
+    const best = streams.get(stream);
+    if (best === undefined || id > (runId(best) as number)) streams.set(stream, run);
+  }
+  return [...kept, ...streams.values()];
 };
 
 /**
  * Whether a commit passed a required check, from its statuses, latest first,
- * and the check runs named `check.context` (the latest of each suite). Only
- * the newest matching run counts, as GitHub's own rules judge it: a draft's
- * failed run in one workflow run is superseded by the ready one's pass in
- * the next. Runs started together (or undated) must all pass. A check tied to an App counts only that App's
+ * and the check runs named `check.context` (the latest of each suite). Every
+ * current run (see `current`) must pass. A check tied to an App counts only that App's
  * check runs and statuses: for one, `statuses` must give each status's
  * `app_id` (the App whose bot set it), and a status without it never counts.
  */
-export const checkState = (check: RequiredCheck, statuses: unknown, runs: unknown): CheckState => {
-  const matching = newest(
+export const checkState = (check: RequiredCheck, statuses: unknown, runs: unknown, workflows: ReadonlyMap<number, number> = new Map()): CheckState => {
+  const matching = current(
     list(runs)
       .map(record)
       .filter((run) => run.name === check.context && (check.app === undefined || record(run.app).id === check.app)),
+    workflows,
   );
   const status = list(statuses).map(record).find((entry) => entry.context === check.context && (check.app === undefined || entry.app_id === check.app));
   if (matching.length === 0 && status === undefined) return "missing";

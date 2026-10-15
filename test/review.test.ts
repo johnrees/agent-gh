@@ -261,6 +261,7 @@ type World = {
   rules?: unknown[];
   branch?: unknown;
   checkRuns?: unknown[];
+  workflowRuns?: unknown[];
   /** The pull request's reviews, and its comments on lines. */
   reviews?: unknown[];
   lineComments?: unknown[];
@@ -285,7 +286,7 @@ const PATCH_ID = "c".repeat(40);
 const world = ({
   head = HEAD, labels = [], labelsLater, status = [], events = [], optedIn = true, config = EXAMPLE, answer, closes = "johnrees/widget", upstream = true,
   commitPulls = [{ number: 12, state: "open", head: { sha: HEAD } }], branchPulls = [{ number: 12, state: "open" }], family = "claude",
-  coAuthors = [[bot("claude")], [bot("claude")]], checkResults = [], reviewReplies = [], rules = [], branch = { protected: false }, checkRuns = [],
+  coAuthors = [[bot("claude")], [bot("claude")]], checkResults = [], reviewReplies = [], rules = [], branch = { protected: false }, checkRuns = [], workflowRuns = [],
   statusLater = [], comments = [], issueComments = [{ id: 70, body: "Last word.", user: { login: "someone" }, created_at: "2026-10-01T00:00:00Z" }], reactions = {},
   reviews = [], lineComments = [], ancestors = [],
 }: World = {}) => {
@@ -320,6 +321,7 @@ const world = ({
       const runs = checkRuns.filter((run) => (run as { name: string }).name === url.searchParams.get("check_name"));
       return reply(200, { total_count: runs.length, check_runs: page(runs, url) });
     },
+    [`GET ${REPO}/actions/runs`]: (_, url) => reply(200, { total_count: workflowRuns.length, workflow_runs: page(workflowRuns, url) }),
     [`GET ${REPO}/rules/branches/main`]: () => reply(200, rules),
     [`GET ${REPO}/branches/main`]: () => reply(200, branch),
     [`GET ${REPO}/rules/branches/release`]: () => reply(200, rules),
@@ -905,6 +907,20 @@ test("the merge guard reads every page of statuses and check runs", async () => 
   const late = world({ rules: REQUIRED, status: [...Array.from({ length: 120 }, (_, n) => ({ context: `other-${n}`, state: "success" })), { context: "agent-review", state: "success" }], checkRuns: [...passing, { name: "build", status: "completed", conclusion: "failure", app: { id: 15368 } }] });
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(late.io, calls)))).toContain("(`build` failed)");
   expect(calls).toEqual([]);
+});
+
+test("the merge guard judges a check by its workflow's newest run (penmon #387)", async () => {
+  const calls: string[] = [];
+  const here = parseRepo("johnrees/widget");
+  const build = (conclusion: string, id: number, suite: number) => ({ name: "build", status: "completed", conclusion, app: { id: 15368 }, id, check_suite: { id: suite } });
+  const status = [{ context: "agent-review", state: "success" }];
+  const draftThenReady = [build("failure", 1, 10), build("success", 2, 20)];
+  const sameWorkflow = [{ check_suite_id: 10, workflow_id: 1 }, { check_suite_id: 20, workflow_id: 1 }];
+  expect(await dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: REQUIRED, status, checkRuns: draftThenReady, workflowRuns: sameWorkflow }).io, calls))).toBe(0);
+  // The same runs from two workflows: the failure still counts.
+  const twoWorkflows = [{ check_suite_id: 10, workflow_id: 1 }, { check_suite_id: 20, workflow_id: 2 }];
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: REQUIRED, status, checkRuns: draftThenReady, workflowRuns: twoWorkflows }).io, calls)))).toContain("(`build` failed)");
+  expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD}`]);
 });
 
 test("gh pr merge checks the repository a clustered -R names, as gh merges there", async () => {
