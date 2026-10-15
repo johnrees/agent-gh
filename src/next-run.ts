@@ -4,7 +4,7 @@
  * soltui's next-issues.ts does), then orders them with next.ts.
  */
 import { taken } from "./claim.ts";
-import { claim, type ClaimIo } from "./claim-run.ts";
+import { claim, type ClaimIo, UNKNOWN } from "./claim-run.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { request } from "./github.ts";
 import { type Blocker, frontier, type Node, parseQueue, type WaveIssue, type Waves, waves } from "./next.ts";
@@ -172,7 +172,7 @@ export const wavesLines = (result: NextResult, print: (line: string) => void): s
     } else lines.push(`Wave ${index + 1}:`, ...issues.map(line));
   });
   if (result.stuck.length > 0) lines.push("Stuck (a cycle, or an open issue elsewhere):", ...result.stuck.map(line));
-  for (const cycle of result.cycles) lines.push(`Cycle: ${[...cycle, cycle[0]].map((number) => `#${number}`).join(" → ")}`);
+  for (const cycle of result.cycles) lines.push(`Cycle: ${cycle.map((number) => `#${number}`).join(", ")} block one another`);
   return lines.length === 0 ? ["No issue in the graph."] : lines;
 };
 
@@ -195,7 +195,9 @@ export const claimNext = async (io: ClaimIo, read: Read, options: { readonly ref
       return 1;
     }
     io.print(`agent-gh: claiming #${pick.issue} ${pick.title}`);
-    if ((await claim(io, { issue: pick.issue, ...options })) === 0) return 0;
+    const code = await claim(io, { issue: pick.issue, ...options });
+    // Only a refusal or a lost race leaves no claim behind; an unconfirmed one stands, so nothing more is claimed.
+    if (code === 0 || code === UNKNOWN) return code;
     tried.add(pick.issue);
   }
   io.print(`agent-gh: gave up after ${ATTEMPTS} claims went to others; run \`agent-gh next --waves\` to see the frontier`);

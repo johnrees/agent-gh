@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { type Claim, claimMarker, parseClaimArgs } from "../src/claim.ts";
-import type { ClaimIo } from "../src/claim-run.ts";
+import { type ClaimIo, UNKNOWN } from "../src/claim-run.ts";
 import { type Blocker, frontier, type Node, parseQueue, waves } from "../src/next.ts";
 import { apiReader, claimNext, nextIssues, nextJson, nextLines, type Read, wavesJson, wavesLines } from "../src/next-run.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
@@ -174,7 +174,8 @@ afterEach(() => {
   for (const stop of stops.splice(0)) stop();
 });
 
-test("claim --next takes the first workable issue; after a lost race it tries the next", async () => {
+/** A fake GitHub with ready issues #7 and #8 and no blockers; `lag` hides posted comments from every read, as a list that never catches up. */
+const claimWorld = ({ lag = false } = {}) => {
   const PATH = "/repos/johnrees/widget";
   const comments: Record<number, unknown[]> = { 7: [], 8: [] };
   let id = 500;
@@ -188,7 +189,7 @@ test("claim --next takes the first workable issue; after a lost race it tries th
   for (const number of [7, 8]) {
     routes[`GET ${PATH}/issues/${number}`] = () => reply(200, issue(number));
     routes[`GET ${PATH}/issues/${number}/dependencies/blocked_by`] = () => reply(200, []);
-    routes[`GET ${PATH}/issues/${number}/comments`] = () => reply(200, comments[number]);
+    routes[`GET ${PATH}/issues/${number}/comments`] = () => reply(200, lag ? [] : comments[number]);
     routes[`POST ${PATH}/issues/${number}/labels`] = () => reply(200, []);
     routes[`POST ${PATH}/issues/${number}/comments`] = (body) => {
       // On #7 a faster session's claim lands first.
@@ -205,8 +206,25 @@ test("claim --next takes the first workable issue; after a lost race it tries th
     api: fake.api, token: "t", repo: REPO, family: "claude", session: "slow",
     git: async () => ({ code: 1, stdout: "" }), print: (line) => printed.push(line), out: () => {}, sleep: async () => {}, nowMs: () => 0, recheckMs: 0,
   };
+  return { io, printed, comments };
+};
+
+test("claim --next takes the first workable issue; after a lost race it tries the next", async () => {
+  const { io, printed } = claimWorld();
   expect(await claimNext(io, apiReader(io), { refs: false, noPr: true })).toBe(0);
   expect(printed.filter((line) => line.startsWith("agent-gh: claiming"))).toEqual(["agent-gh: claiming #7 T7", "agent-gh: claiming #8 T8"]);
   expect(printed.some((line) => line.includes("#7 went to a claim comment by a codex session (fast) (c1) first"))).toBe(true);
   expect(printed.at(-1)).toContain("claimed #8 with a comment");
+});
+
+test("claim --next stops when a claim stands unconfirmed, rather than claiming another issue too", async () => {
+  const { io, printed, comments } = claimWorld({ lag: true });
+  expect(await claimNext(io, apiReader(io), { refs: false, noPr: true })).toBe(UNKNOWN);
+  expect(printed.filter((line) => line.startsWith("agent-gh: claiming"))).toEqual(["agent-gh: claiming #7 T7"]);
+  expect(comments[8]).toEqual([]);
+});
+
+test("a cycle is shown as the issues that block one another, not as a path", () => {
+  const result = graph([node(1, [blocker(4)]), node(3, [blocker(1)]), node(2, [blocker(3)]), node(4, [blocker(2)])]);
+  expect(wavesLines({ ...result, config: { issue: undefined, label: "ready" }, queued: true }, () => {}).at(-1)).toBe("Cycle: #1, #2, #3, #4 block one another");
 });
