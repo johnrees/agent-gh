@@ -21,7 +21,7 @@ It installs the checked release and gitleaks in `~/.local/bin`, logs in each App
 Shell startup files are not enough on their own: a harness may start its tools from a snapshot of the environment it was launched in, and a version manager (mise, asdf, Homebrew's shellenv, Nix) can put its own gh back ahead of the shim after the startup files run. So `install-shims` also, for each harness that has run on the machine (its directory exists):
 
 - **Claude Code**: adds a SessionStart hook to `~/.claude/settings.json`, `agent-gh session-env`, which writes the PATH block to `CLAUDE_ENV_FILE`; Claude Code sources it before every command.
-- **Instructions**: adds a managed block to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.pi/agent/AGENTS.md`: run plain `gh`; if it says it is not logged in, run `agent-gh <gh arguments>`, or read with `GH_TOKEN=$(agent-gh read-token) gh ...`; never ask for `gh auth login`; where a repository opts in to reviews, run `agent-gh review full` before marking a pull request ready; and answer each finding and notify with `agent-gh reply`.
+- **Instructions**: adds a managed block to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.pi/agent/AGENTS.md`: run plain `gh`; if it says it is not logged in, run `agent-gh <gh arguments>`, or read with `GH_TOKEN=$(agent-gh read-token) gh ...`; never ask for `gh auth login`; where a repository opts in to reviews, run `agent-gh review full` before marking a pull request ready; answer each finding and notify with `agent-gh reply`; and run `agent-gh claim <N>` before starting work on an issue.
 
 `doctor --machine` checks both, and when another gh comes first it names the version manager responsible.
 
@@ -157,7 +157,7 @@ An agent claims an issue when it starts work, so parallel sessions see what is t
 
 **`claims --json`** is the stable interface for repository scripts (a next-issue picker, a frontier): `{"v":1,"repo","label","claims":[…],"mismatches":[…]}`. Each claim has `issue`, `title`, `kind` (`pr` or `comment`), `pr` (or null), `url`, `author`, `family` and `session` (null for a pull request without a marker, such as a person's), `branch`, `holds` (whether it is the issue's first claim), `created_at`, `last_push_at` (the head commit's committer date), `last_comment_at` (on the issue or the pull request), and `labeled`. Every issue with a claim is taken. It finds pull request claims everywhere, and comment claims on the issues that carry the label; the per-issue rule above sees every comment claim.
 
-**The label.** A claim also labels the issue (`claimed`, or `"claims": {"label": "…"}` in `.github/agent-review.json` on the default branch), creating the label when it is missing, so a person or a script can filter with `-label:claimed`. It only mirrors the claims: anyone can add or remove a label, so neither the rule nor `claims` trusts it, and `claims` reports where the two disagree. `release` removes it once nothing claims the issue, and `agent-gh claims sync [--issue N]...` removes it from every labelled issue nothing claims. To have it removed when a claim's pull request closes or merges, a repository adds:
+**The label.** A claim also labels the issue (`claimed`, or `"claims": {"label": "…"}` in `.github/agent-review.json` on the default branch), creating the label when it is missing, so a person or a script can filter with `-label:claimed`. Releases before v0.9.0 refuse a config with the `claims` key, so a repository moves its agent-review workflow's pin to v0.9.0 or later before adding it. It only mirrors the claims: anyone can add or remove a label, so neither the rule nor `claims` trusts it, and `claims` reports where the two disagree. `release` removes it once nothing claims the issue, and `agent-gh claims sync [--issue N]...` removes it from every labelled issue nothing claims. To have it removed when a claim's pull request closes or merges, a repository adds:
 
 ```yaml
 # .github/workflows/agent-claims.yml
@@ -168,9 +168,9 @@ on:
 permissions: {}
 jobs:
   agent-claims:
-    uses: johnrees/agent-gh/.github/workflows/agent-claims.yml@v0.8.0
+    uses: johnrees/agent-gh/.github/workflows/agent-claims.yml@v0.9.0
     with:
-      version: v0.8.0
+      version: v0.9.0
     # contents (the label's name), pull-requests (the open pull requests), issues (the issues, comments, and the label).
     permissions:
       contents: read
