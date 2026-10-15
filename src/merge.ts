@@ -61,3 +61,22 @@ export const checkState = (check: RequiredCheck, statuses: unknown, runs: unknow
   if (status !== undefined && status.state !== "success") return "pending";
   return "passed";
 };
+
+/**
+ * The branches a push moves, from the lines git gives a pre-push hook
+ * (`<local ref> <local sha> <remote ref> <remote sha>`), deletions
+ * included; tags and other refs carry no required checks. Undefined when a
+ * line is not in that form, so the guard fails closed.
+ */
+export const pushedBranches = (stdin: string): string[] | undefined => {
+  const branches: string[] = [];
+  for (const line of stdin.split("\n")) {
+    if (line.trim() === "") continue;
+    const parts = line.split(" ");
+    if (parts.length !== 4 || !/^[0-9a-f]{40,64}$/.test(parts[1] as string) || !/^[0-9a-f]{40,64}$/.test(parts[3] as string)) return undefined;
+    const remote = parts[2] as string;
+    if (remote.startsWith("refs/heads/")) branches.push(remote.slice("refs/heads/".length));
+    else if (!remote.startsWith("refs/")) return undefined;
+  }
+  return [...new Set(branches)];
+};

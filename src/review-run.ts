@@ -5,8 +5,8 @@ import { Failure, type Stage } from "./failure.ts";
 import { familyNames } from "./family.ts";
 import { type Api, request } from "./github.ts";
 import { HARNESSES, type Env } from "./harness.ts";
-import { parseRepo, type Repo, slug } from "./repo.ts";
-import { checkState, requiredChecks } from "./merge.ts";
+import { parseRemoteUrl, parseRepo, type Repo, slug } from "./repo.ts";
+import { checkState, pushedBranches, requiredChecks } from "./merge.ts";
 import {
   agentReviewStatus,
   type ApiCall,
@@ -22,6 +22,7 @@ import {
   type Finding,
   fullPrompt,
   graphqlMerges,
+  graphqlRefWrites,
   inlineComment,
   mergeCommand,
   outputTail,
@@ -255,6 +256,60 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
   );
 };
 
+const PUSH_STAGE = "checking the push";
+
+/**
+ * Why an agent may not move `branch` itself, if it may not: it is the
+ * repository's default branch, or a ruleset or classic protection requires
+ * status checks on it. Agents act as John, who may bypass both, so the
+ * branch moves only through a pull request.
+ */
+export const branchHeld = async (io: ReviewIo, stage: Stage, branch: string): Promise<string | undefined> => {
+  const defaultBranch = text(record((await call(io, stage, "GET", repoPath(io))).value).default_branch);
+  if (defaultBranch === "") throw new Failure(stage, `${slug(io.repo)}: invalid response`);
+  if (branch === defaultBranch) return `\`${branch}\` is ${slug(io.repo)}'s default branch`;
+  const path = branchPath(branch);
+  const rules = await pages(io, stage, `${repoPath(io)}/rules/branches/${path}`);
+  // A branch that does not exist yet has no classic protection of its own; its rulesets still apply.
+  const classic = await call(io, stage, "GET", `${repoPath(io)}/branches/${path}`, undefined, [404]);
+  if (requiredChecks(rules, classic.status === 404 ? {} : classic.value).length > 0) return `\`${branch}\` requires status checks in ${slug(io.repo)}`;
+  return undefined;
+};
+
+/** The pre-push guard: refuses a push that moves a branch `branchHeld` holds. */
+export const gatePush = async (io: ReviewIo, branches: readonly string[]): Promise<void> => {
+  for (const branch of branches) {
+    const held = await branchHeld(io, PUSH_STAGE, branch);
+    if (held !== undefined) throw new Failure(PUSH_STAGE, `${held}; agents never move it themselves (John may bypass its rules, and agents act as John): push another branch and open a pull request`);
+  }
+};
+
+/**
+ * `agent-gh guard pre-push` in an agent session: git's remote URL argument
+ * and the hook's stdin. A push that moves a held branch on GitHub is
+ * refused, and so is one whose repository or rules cannot be determined. A
+ * remote on a local path is not GitHub, and is not held.
+ */
+export const guardPush = async (
+  url: string | undefined,
+  stdin: string,
+  deps: Pick<GhDispatch, "withToken" | "io">,
+): Promise<void> => {
+  const branches = pushedBranches(stdin);
+  if (branches === undefined) throw new Failure(PUSH_STAGE, "git's pre-push lines are not in the form agent-gh reads");
+  if (branches.length === 0) return;
+  if (url === undefined) throw new Failure(PUSH_STAGE, "the pre-push hook passed no remote URL; run `agent-gh guard pre-push \"$@\"` from it");
+  const repo = parseRemoteUrl(url);
+  if (repo === undefined) {
+    if (url.startsWith("/") || url.startsWith(".") || url.startsWith("file://")) return;
+    throw new Failure(PUSH_STAGE, "cannot tell which GitHub repository this push goes to; use a https://github.com/ or git@github.com: remote");
+  }
+  await deps.withToken(repo, async (env) => {
+    await gatePush(deps.io(repo, env), branches);
+    return 0;
+  });
+};
+
 /** Every item of a paginated response that reports its `total_count`, refusing one too long, or too short, to trust. */
 const counted = async (io: ReviewIo, stage: Stage, path: string, field: string): Promise<unknown[]> => {
   const items: unknown[] = [];
@@ -345,6 +400,22 @@ const dispatchApi = async (args: readonly string[], api: ApiCall, repo: Repo | u
   const plan = apiMerge(api);
   if (plan.kind === "none") return deps.run(args);
   if (plan.kind === "refuse") throw new Failure(MERGE_STAGE, plan.reason);
+  if (plan.kind === "ref" || plan.kind === "ref-field") {
+    const target = plan.repo === undefined ? repo : parseRepo(plan.repo);
+    if (target === undefined) throw new Failure(PUSH_STAGE, "cannot tell which repository `gh api` writes to; name it in the endpoint");
+    const named = plan.kind === "ref" ? plan.branch : await bodyField(api, plan.field, deps.readFile);
+    // A new ref that is not a branch carries no required checks.
+    if (plan.kind === "ref-field" && plan.field === "ref" && !named?.startsWith("refs/heads/")) {
+      if (named === undefined) throw new Failure(PUSH_STAGE, "cannot read the ref `gh api` creates");
+      return deps.run(args);
+    }
+    return deps.withToken(target, async (env) => {
+      const io = deps.io(target, env);
+      const branch = named === undefined ? text(record((await call(io, PUSH_STAGE, "GET", repoPath(io))).value).default_branch) : named.replace(/^refs\/heads\//, "");
+      await gatePush(io, [branch]);
+      return deps.runWith(args, env);
+    });
+  }
   if (plan.kind === "rest") {
     const target = plan.repo === undefined ? repo : parseRepo(plan.repo);
     if (target === undefined) throw new Failure(MERGE_STAGE, "cannot tell which repository `gh api` merges in; name it in the endpoint");
@@ -359,8 +430,16 @@ const dispatchApi = async (args: readonly string[], api: ApiCall, repo: Repo | u
   const request = await graphqlRequest(api, deps.readFile);
   const merges = graphqlMerges(request.query, request.variables);
   if ("refuse" in merges) throw new Failure(MERGE_STAGE, merges.refuse);
-  if (merges.length === 0) return deps.run(args);
+  const writes = graphqlRefWrites(request.query, request.variables);
+  if ("refuse" in writes) throw new Failure(PUSH_STAGE, writes.refuse);
+  if (merges.length === 0 && writes.length === 0) return deps.run(args);
   return deps.withToken(repo, async (env) => {
+    for (const write of writes) {
+      // The node lookup is GraphQL, which names no repository; the io's own is unused.
+      const target = "node" in write ? await refForNode(deps.io(repo ?? { owner: "-", name: "-" }, env), write.node) : { repo: parseRepo(write.repo), branch: write.branch };
+      if (target.repo === undefined) throw new Failure(PUSH_STAGE, "cannot tell which repository a GraphQL ref write moves a branch in");
+      if (target.branch !== undefined) await gatePush(deps.io(target.repo, env), [target.branch]);
+    }
     for (const merge of merges) {
       // The node lookup is GraphQL, which names no repository; the io's own is unused.
       const pr = await pullForNode(deps.io(repo ?? { owner: "-", name: "-" }, env), merge.id);
@@ -443,6 +522,36 @@ const setVariable = (variables: Record<string, unknown>, name: string, value: st
   }
   into[keys.at(-1) as string] = value;
 };
+
+/** The branch (undefined for a tag or other ref) and repository a GraphQL ref node id names; refused when it names no ref. */
+const refForNode = async (io: ReviewIo, id: string): Promise<{ readonly repo: Repo | undefined; readonly branch: string | undefined }> => {
+  const query = "query($id:ID!){node(id:$id){... on Ref{name prefix repository{nameWithOwner}}}}";
+  const node = record(record(record((await call(io, PUSH_STAGE, "POST", "/graphql", { query, variables: { id } })).value).data).node);
+  const repo = parseRepo(text(record(node.repository).nameWithOwner));
+  if (text(node.name) === "" || repo === undefined) throw new Failure(PUSH_STAGE, "a GraphQL ref write names a node that is not a ref agent-gh can find");
+  return { repo, branch: node.prefix === "refs/heads/" ? text(node.name) : undefined };
+};
+
+/** A string field of a REST write's body: from its fields, else its `--input` JSON; undefined when absent, refused when unreadable. */
+const bodyField = async (api: ApiCall, name: string, readFile: (path: string) => Promise<string | undefined>): Promise<string | undefined> => {
+  if (api.input !== undefined) {
+    const content = api.input === "-" ? undefined : await readFile(api.input);
+    let value: unknown;
+    try {
+      if (content === undefined) throw new Error();
+      value = own(record(JSON.parse(content)), name);
+    } catch {
+      throw new Failure(PUSH_STAGE, `cannot read the body \`gh api --input\` sends; agents give a branch write's \`${name}\` with -f`);
+    }
+    if (value !== undefined && typeof value !== "string") throw new Failure(PUSH_STAGE, `cannot read the \`${name}\` \`gh api\` sends`);
+    return value;
+  }
+  const field = api.fields.findLast((candidate) => candidate.name === name);
+  if (field !== undefined && !field.raw && field.value.startsWith("@")) throw new Failure(PUSH_STAGE, `give \`${name}\` with -f ${name}=<value>`);
+  return field?.value;
+};
+
+const own = (object: Record<string, unknown>, key: string): unknown => (Object.hasOwn(object, key) ? object[key] : undefined);
 
 /** The pull request a GraphQL node id names, and its repository; refused when it names none. */
 const pullForNode = async (io: ReviewIo, id: string): Promise<{ readonly repo: Repo; readonly number: number }> => {

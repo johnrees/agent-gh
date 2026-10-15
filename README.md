@@ -38,7 +38,7 @@ The harness is found from a variable it sets for its tools, and the family from 
 
 ## Repository hooks
 
-Where git runs hooks from config (`git hook list` exists), `install-shims` sets `hook.agent-gh.command` and `hook.agent-gh.event=commit-msg` globally, so every repository on the machine credits agent sessions with no setup of its own; `git config hook.agent-gh.enabled false` turns it off in one repository. It runs before a repository's own hook, and the trailers are replaced or skipped when already there, so both together credit a commit once. Older gits, Apple's among them, need the repository hook below; `doctor --machine` says which applies. This repository has one in `.githooks` (`git config core.hooksPath .githooks`).
+Where git runs hooks from config (`git hook list` exists), `install-shims` sets `hook.agent-gh.command` and `hook.agent-gh.event=commit-msg` globally, so every repository on the machine credits agent sessions with no setup of its own; `git config hook.agent-gh.enabled false` turns it off in one repository. It also sets `hook.agent-gh-push` for `pre-push`: an agent session's push to the repository's default branch, or to a branch a ruleset or classic protection requires status checks on, is refused, since agents act as John and John may bypass those rules. A push whose GitHub repository or rules cannot be told is refused too; a remote on a local path is not held, and a person's pushes never are. It runs before a repository's own hook, and the trailers are replaced or skipped when already there, so both together credit a commit once. Older gits, Apple's among them, need the repository hook below; `doctor --machine` says which applies. This repository has one in `.githooks` (`git config core.hooksPath .githooks`).
 
 ```sh
 # .githooks/commit-msg (with git config core.hooksPath .githooks)
@@ -46,7 +46,13 @@ command -v agent-gh > /dev/null || exit 0
 exec agent-gh guard commit-msg "$1"
 ```
 
-A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify` skips it anywhere. An empty message still aborts the commit. `agent-gh guard pre-push` passes and is kept only for older hooks.
+```sh
+# .githooks/pre-push
+command -v agent-gh > /dev/null || exit 0
+exec agent-gh guard pre-push "$@"
+```
+
+A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify` skips it anywhere. An empty message still aborts the commit. An older pre-push hook that runs `agent-gh guard pre-push` without git's arguments refuses an agent's push to a GitHub branch; pass it `"$@"`.
 
 ## Apps
 

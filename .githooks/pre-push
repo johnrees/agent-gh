@@ -1,0 +1,4 @@
+#!/bin/sh
+# Holds an agent session's pushes to protected branches; a no-op for people and machines without agent-gh.
+command -v agent-gh > /dev/null || exit 0
+exec agent-gh guard pre-push "$@"

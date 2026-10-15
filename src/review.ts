@@ -348,7 +348,14 @@ export type ApiMerge =
   | { readonly kind: "none" }
   | { readonly kind: "rest"; readonly repo: string | undefined; readonly number: number }
   | { readonly kind: "graphql" }
-  | { readonly kind: "refuse"; readonly reason: string };
+  | { readonly kind: "refuse"; readonly reason: string }
+  /**
+   * A write that moves a branch: the branch the path names, else the field
+   * that names it (`ref` for a new ref, `branch` for a contents write, whose
+   * absence means the default branch).
+   */
+  | { readonly kind: "ref"; readonly repo: string | undefined; readonly branch: string }
+  | { readonly kind: "ref-field"; readonly repo: string | undefined; readonly field: "ref" | "branch" };
 
 export const apiMerge = (call: ApiCall): ApiMerge => {
   if (call.endpoint === undefined) return { kind: "none" };
@@ -361,12 +368,15 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
   if (segments.some((segment) => segment === "." || segment === "..")) return unreadable;
   // The operation is what follows the repository (`repos/{owner}/{repo}` or `repositories/{id}`); its names are not.
   const skip = /^repos$/i.test(segments[0] ?? "") ? 3 : /^repositories$/i.test(segments[0] ?? "") ? 2 : 0;
-  let operation: string[];
+  let names: string[];
   try {
-    operation = segments.slice(skip).map((segment) => decodeURIComponent(segment).toLowerCase());
+    names = segments.slice(skip).map((segment) => decodeURIComponent(segment));
   } catch {
     return unreadable;
   }
+  const operation = names.map((name) => name.toLowerCase());
+  const refWrite = refPlan(path, skip, names, operation, call.method);
+  if (refWrite !== undefined) return refWrite;
   if (!operation.some((segment) => segment === "merge" || segment === "merges")) return { kind: "none" };
   const pr = /^repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)\/merge\/?$/i.exec(path);
   if (pr === null) {
@@ -377,6 +387,24 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
   const placeholders = owner === "{owner}" && name === "{repo}";
   if (!placeholders && /[{}%]/.test(owner + name)) return { kind: "refuse", reason: `cannot tell which repository \`gh api ${call.endpoint}\` merges in; use \`gh pr merge\`` };
   return { kind: "rest", repo: placeholders ? undefined : `${owner}/${name}`, number: Number(pr[3]) };
+};
+
+/** A REST write that moves a branch (git refs, or a contents write that commits), if `path` is one. */
+const refPlan = (path: string, skip: number, names: readonly string[], operation: readonly string[], method: string): ApiMerge | undefined => {
+  const refs = operation[0] === "git" && (operation[1] === "refs" || operation[1] === "ref");
+  const contents = operation[0] === "contents" && (method === "PUT" || method === "DELETE");
+  if (!refs && !contents) return undefined;
+  if (skip !== 3) return { kind: "refuse", reason: `cannot tell which repository \`gh api ${path}\` writes to; name it as repos/OWNER/REPO` };
+  const repoPart = /^repos\/([^/]+)\/([^/]+)\//i.exec(path);
+  const [owner, name] = [repoPart?.[1] ?? "", repoPart?.[2] ?? ""];
+  const placeholders = owner === "{owner}" && name === "{repo}";
+  if (!placeholders && /[{}%]/.test(owner + name)) return { kind: "refuse", reason: `cannot tell which repository \`gh api ${path}\` writes to` };
+  const repo = placeholders ? undefined : `${owner}/${name}`;
+  if (contents) return { kind: "ref-field", repo, field: "branch" };
+  if (operation.length === 2) return method === "POST" ? { kind: "ref-field", repo, field: "ref" } : { kind: "none" };
+  // Only branches carry required checks; tags and other refs are not held.
+  if (operation[2] !== "heads" || operation.length < 4) return { kind: "none" };
+  return { kind: "ref", repo, branch: names.slice(3).join("/").replace(/\/$/, "") };
 };
 
 /**
@@ -455,6 +483,55 @@ const MERGE_NAMES = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullR
  * requires. Empty when it merges nothing; a refusal when it merges a branch,
  * or this cannot read a merge's pull request id with certainty.
  */
+/** A branch a GraphQL write would move: by ref or branch node id, or by repository and name. */
+export type GraphqlRefWrite = { readonly node: string } | { readonly repo: string; readonly branch: string };
+
+const REF_WRITES = /\b(updateRefs|createRef|updateRef|deleteRef|createCommitOnBranch)\b/g;
+
+/**
+ * The branches a GraphQL document's ref-moving mutations aim at, read from
+ * each one's own arguments outside comments and strings: `updateRef` and
+ * `deleteRef` by `refId`, `createCommitOnBranch` by its branch's id or
+ * repository and name. `updateRefs` and `createRef` are refused (use git
+ * push, which the pre-push guard holds), as is any this cannot read.
+ */
+export const graphqlRefWrites = (query: string, variables: Readonly<Record<string, unknown>>): readonly GraphqlRefWrite[] | { readonly refuse: string } => {
+  const unreadable = { refuse: "cannot read which branch a GraphQL ref write moves; push with git instead" };
+  const mask = masked(query);
+  if (mask === undefined) return /\b(updateRefs|createRef|updateRef|deleteRef|createCommitOnBranch)\b/.test(query) ? unreadable : [];
+  const writes: GraphqlRefWrite[] = [];
+  for (const match of mask.matchAll(REF_WRITES)) {
+    const name = match[1] as string;
+    if (name === "updateRefs" || name === "createRef") return { refuse: `agents do not use the GraphQL ${name} mutation; push with git, which checks the branch` };
+    const open = /^\s*\(/.exec(mask.slice((match.index as number) + match[0].length));
+    const range = open === null ? undefined : parenthesised(mask, (match.index as number) + match[0].length + open[0].length - 1);
+    if (range === undefined) return unreadable;
+    const [text, args] = [query.slice(range.from, range.to), mask.slice(range.from, range.to)];
+    if (name !== "createCommitOnBranch") {
+      const id = inputField(text, args, "refId", variables);
+      if (typeof id !== "string") return unreadable;
+      writes.push({ node: id });
+      continue;
+    }
+    // createCommitOnBranch's branch: {id} or {repositoryNameWithOwner, branchName}, inline or in `input: $var`.
+    const whole = /\binput\s*:\s*\$(\w+)/.exec(args);
+    const input = whole === null ? undefined : own(variables, whole[1] as string);
+    const branch = typeof input === "object" && input !== null ? own(input as Record<string, unknown>, "branch") : undefined;
+    const scope = typeof branch === "object" && branch !== null ? (branch as Record<string, unknown>) : undefined;
+    if (whole !== null && scope === undefined) return unreadable;
+    const field = (key: string): string | undefined | null => {
+      if (scope === undefined) return inputField(text, args, key, variables);
+      const value = own(scope, key);
+      return value === undefined ? undefined : typeof value === "string" && value !== "" ? value : null;
+    };
+    const [id, repo, branchName] = [field("id"), field("repositoryNameWithOwner"), field("branchName")];
+    if (typeof id === "string" && repo === undefined && branchName === undefined) writes.push({ node: id });
+    else if (id === undefined && typeof repo === "string" && typeof branchName === "string") writes.push({ repo, branch: branchName });
+    else return unreadable;
+  }
+  return writes;
+};
+
 export const graphqlMerges = (query: string, variables: Readonly<Record<string, unknown>>): readonly GraphqlMerge[] | { readonly refuse: string } => {
   const unreadable = { refuse: "cannot read the pull request id a GraphQL merge mutation names; use `gh pr merge`" };
   const mask = masked(query);

@@ -29,6 +29,7 @@ import {
   fullCommand,
   gateReady,
   type GhDispatch,
+  guardPush,
   inClone,
   pullDiff,
   type ReviewIo,
@@ -41,7 +42,8 @@ import {
   sweepCommand,
 } from "../src/review-run.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
-import { parseRepo, repoFlag, slug } from "../src/repo.ts";
+import { parseRepo, type Repo, repoFlag, slug } from "../src/repo.ts";
+import { pushedBranches } from "../src/merge.ts";
 
 /** The issue's example config: Codex and Claude reviewers, effort from the ticket's labels. */
 const EXAMPLE = {
@@ -270,10 +272,23 @@ const world = ({
     },
     [`GET ${REPO}/rules/branches/main`]: () => reply(200, rules),
     [`GET ${REPO}/branches/main`]: () => reply(200, branch),
+    [`GET ${REPO}/rules/branches/release`]: () => reply(200, rules),
+    [`GET ${REPO}/branches/release`]: () => reply(404, {}),
+    [`GET ${REPO}/rules/branches/feature`]: () => reply(200, []),
+    [`GET ${REPO}/branches/feature`]: () => reply(404, {}),
     [`GET ${REPO}/issues/12/events`]: () => reply(200, events),
     "POST /graphql": (body) =>
       body.includes("node(id")
-        ? reply(200, { data: { node: JSON.parse(body).variables.id === "PR_12" ? { number: 12, repository: { nameWithOwner: "johnrees/widget" } } : {} } })
+        ? reply(200, {
+            data: {
+              node:
+                JSON.parse(body).variables.id === "PR_12"
+                  ? { number: 12, repository: { nameWithOwner: "johnrees/widget" } }
+                  : JSON.parse(body).variables.id === "REF_MAIN"
+                    ? { name: "main", prefix: "refs/heads/", repository: { nameWithOwner: "johnrees/widget" } }
+                    : {},
+            },
+          })
         : reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { nodes: [{ number: 7, repository: { nameWithOwner: closes } }] } } } } }),
     [`GET ${REPO}/issues/7`]: () => reply(200, { title: "The ticket", body: "Do it well.", labels: [{ name: "model:fable-astra" }], comments: 1 }),
     [`GET ${REPO}/issues/7/comments`]: () => reply(200, [{ body: "Last word." }]),
@@ -804,6 +819,65 @@ test("an agent's gh api merge runs only when gh pr merge would", async () => {
     "ungated gh api repos/johnrees/widget/pulls/12/merge",
     `gh api graphql -f query=${nested} -F input[pullRequestId]=PR_12 -F input[expectedHeadOid]=${HEAD}`,
   ]);
+});
+
+test("a pre-push lists the branches a push moves, deletions included, and an unreadable line reads as none", () => {
+  const Z = "0".repeat(40);
+  expect(pushedBranches(`refs/heads/x ${HEAD} refs/heads/main ${OLD}\nrefs/tags/v1 ${HEAD} refs/tags/v1 ${Z}\n(delete) ${Z} refs/heads/release/1 ${OLD}\n`)).toEqual(["main", "release/1"]);
+  expect(pushedBranches("")).toEqual([]);
+  expect(pushedBranches(`refs/heads/x ${HEAD} main ${OLD}`)).toBeUndefined();
+  expect(pushedBranches("garbage")).toBeUndefined();
+});
+
+test("an agent's push to the default branch, or to a branch whose rules require checks, is refused; other branches pass", async () => {
+  const deps = (io: ReviewIo, repos: string[] = []) => ({
+    withToken: async (repo: Repo | undefined, use: (env: Record<string, string>) => Promise<number>) => {
+      repos.push(repo === undefined ? "none" : slug(repo));
+      return use({ GH_TOKEN: "t" });
+    },
+    io: () => io,
+  });
+  const line = (branch: string) => `refs/heads/x ${HEAD} refs/heads/${branch} ${OLD}\n`;
+  const url = "https://github.com/johnrees/widget.git";
+  expect(await gateRefusal(guardPush(url, line("main"), deps(world().io)))).toBe(
+    "`main` is johnrees/widget's default branch; agents never move it themselves (John may bypass its rules, and agents act as John): push another branch and open a pull request",
+  );
+  expect(await gateRefusal(guardPush(url, line("release"), deps(world({ rules: REQUIRED }).io)))).toContain("`release` requires status checks in johnrees/widget");
+  // Branch lookups here answer as for main, so classic protection on it holds it too.
+  const classic = world({ branch: { protection: { required_status_checks: { enforcement_level: "everyone", contexts: ["ci"], checks: [] } } } });
+  expect(await gateRefusal(guardPush(url, line("main"), deps(classic.io)))).toContain("default branch");
+  const repos: string[] = [];
+  await guardPush("git@github.com:johnrees/widget.git", line("feature"), deps(world().io, repos));
+  expect(repos).toEqual(["johnrees/widget"]);
+  // Tags carry no required checks and need no lookup; an unreadable push fails closed.
+  await guardPush(url, `refs/tags/v1 ${HEAD} refs/tags/v1 ${OLD}\n`, deps(world().io, repos));
+  expect(repos).toEqual(["johnrees/widget"]);
+  expect(await gateRefusal(guardPush(url, "nonsense\n", deps(world().io)))).toBe("git's pre-push lines are not in the form agent-gh reads");
+  expect(await gateRefusal(guardPush(undefined, line("feature"), deps(world().io)))).toContain("passed no remote URL");
+});
+
+test("an agent's gh api write that moves a held branch is refused, through REST or GraphQL", async () => {
+  const here = parseRepo("johnrees/widget");
+  const calls: string[] = [];
+  const held = world({ rules: REQUIRED });
+  const refuse = async (args: string[], files: Record<string, string> = {}) => gateRefusal(dispatchGh(args, here, mergeDeps(held.io, calls, files)));
+  expect(await refuse(["api", "-X", "PATCH", "repos/johnrees/widget/git/refs/heads/main", "-f", `sha=${HEAD}`])).toContain("`main` is johnrees/widget's default branch");
+  expect(await refuse(["api", "-X", "DELETE", "repos/{owner}/{repo}/git/refs/heads/release"])).toContain("`release` requires status checks");
+  expect(await refuse(["api", "repos/johnrees/widget/git/refs", "-f", "ref=refs/heads/release", "-f", `sha=${HEAD}`])).toContain("`release` requires status checks");
+  expect(await refuse(["api", "repos/johnrees/widget/git/refs", "--input", "ref.json"], { "ref.json": JSON.stringify({ ref: "refs/heads/release", sha: HEAD }) })).toContain("`release` requires");
+  // A contents write commits to its branch, or the default branch when it names none.
+  expect(await refuse(["api", "-X", "PUT", "repos/johnrees/widget/contents/a.txt", "-f", "message=m", "-f", "content=YQ=="])).toContain("default branch");
+  expect(await refuse(["api", "graphql", "-f", 'query=mutation { createCommitOnBranch(input: {branch: {repositoryNameWithOwner: "johnrees/widget", branchName: "main"}, message: {headline: "x"}, expectedHeadOid: "a"}) { commit { oid } } }'])).toContain("default branch");
+  expect(await refuse(["api", "graphql", "-f", 'query=mutation { updateRef(input: {refId: "REF_MAIN", oid: "a"}) { ref { name } } }'])).toContain("default branch");
+  expect(await refuse(["api", "graphql", "-f", "query=mutation($i: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $i) { commit { oid } } }", "-F", "i[branch][repositoryNameWithOwner]=johnrees/widget", "-F", "i[branch][branchName]=release"])).toContain("`release` requires");
+  expect(await refuse(["api", "graphql", "-f", 'query=mutation { updateRefs(input: {repositoryId: "R", refUpdates: []}) { clientMutationId } }'])).toContain("updateRefs");
+  expect(await refuse(["api", "graphql", "-f", "query=mutation($id: ID!) { deleteRef(input: {refId: $id}) { clientMutationId } }"])).toBe("cannot read which branch a GraphQL ref write moves; push with git instead");
+  expect(calls).toEqual([]);
+  // Another branch, a tag, and an unprotected repository's feature branch pass.
+  const open = world();
+  expect(await dispatchGh(["api", "-X", "PATCH", "repos/johnrees/widget/git/refs/heads/feature", "-f", `sha=${HEAD}`], here, mergeDeps(open.io, calls))).toBe(0);
+  expect(await dispatchGh(["api", "repos/johnrees/widget/git/refs", "-f", "ref=refs/tags/v1", "-f", `sha=${HEAD}`], here, mergeDeps(held.io, calls))).toBe(0);
+  expect(calls).toEqual([`gh api -X PATCH repos/johnrees/widget/git/refs/heads/feature -f sha=${HEAD}`, `ungated gh api repos/johnrees/widget/git/refs -f ref=refs/tags/v1 -f sha=${HEAD}`]);
 });
 
 test("a waiver history longer than the gate reads is not trusted", async () => {

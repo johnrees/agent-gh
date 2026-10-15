@@ -19,9 +19,9 @@ import { familyNames } from "./family.ts";
 import { detectIdentity, inAgentSession } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
-import { originUrl, type Repo, resolveRepo } from "./repo.ts";
+import { originUrl, parseRemoteUrl, type Repo, resolveRepo } from "./repo.ts";
 import { EFFORTS, type Effort } from "./review.ts";
-import { dispatchGh, type ReviewIo, reviewFull, reviewSweep, spawnCheck, spawnReviewer } from "./review-run.ts";
+import { dispatchGh, guardPush, type ReviewIo, reviewFull, reviewSweep, spawnCheck, spawnReviewer } from "./review-run.ts";
 import { type Context, runAs, withToken } from "./run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
@@ -42,7 +42,8 @@ const USAGE = `usage:
   agent-gh read-token               print the read App's token (the gh shim's GH_TOKEN on agent machines)
   agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)
   agent-gh guard commit-msg <file>  from a git hook: in an agent session, add its Agent-* trailers and credit its family App
-  agent-gh guard pre-push           from a git hook: passes (kept so existing hooks keep working)
+  agent-gh guard pre-push <remote> <url>
+                                    from a git hook: in an agent session, refuse a push to the default branch or one whose rules require checks
   agent-gh review sweep [--base REF] [--effort E]
                                     a quick bug sweep of the branch by another model family; prints, records nothing
   agent-gh review full [--pr N] [--issue N] [--effort E]
@@ -230,6 +231,16 @@ const main = async (argv: readonly string[]): Promise<number> => {
     const plain: Record<string, string> = {};
     for (const [name, value] of Object.entries(env)) if (value !== undefined) plain[name] = value;
     return (await runChild([git, ...rest], plain)).code;
+  }
+  if (first === "guard" && rest[0] === "pre-push" && inAgentSession(env)) {
+    const input = await new Response(Bun.stdin.stream()).text();
+    const repo = parseRemoteUrl(rest[2] ?? "");
+    const context: Context = { identity: detectIdentity(env), repo, env, api: GITHUB, configDir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) };
+    await guardPush(rest[2], input, {
+      withToken: (target, use) => withToken({ ...context, repo: target }, use),
+      io: (target, childEnv) => reviewIo({ ...context, repo: target }, target, childEnv),
+    });
+    return 0;
   }
   if (first === "guard") {
     const verdict = guard(rest, env, defaultConfigDir(), REGISTRY, () => readGitConfig(process.cwd(), env));
