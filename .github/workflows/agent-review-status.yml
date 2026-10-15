@@ -1,0 +1,25 @@
+name: agent-review status
+# Sets the agent-review and agent-threads statuses on each pull request's
+# head from GitHub Actions, through this repository's own reusable workflow
+# (agent-review.yml) at a release, as the README's "Statuses from GitHub
+# Actions" describes for any repository. pull_request_target runs main's
+# copy, so a change to this file takes effect only after it merges.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled] # edited: a new closing issue
+  pull_request_review:
+  issue_comment:
+permissions: {}
+jobs:
+  agent-review:
+    uses: johnrees/agent-gh/.github/workflows/agent-review.yml@v0.7.0
+    with:
+      version: v0.7.0 # the agent-gh release that sets the statuses
+    # Declaring permissions drops the defaults, so each read is named, though nothing is checked out:
+    # contents (the config, compare, fetching commits), pull-requests (the PR, its commits and reviews),
+    # issues (comments, labels' events, reactions, closing issues), statuses (read and set them).
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: write
