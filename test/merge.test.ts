@@ -24,6 +24,10 @@ test("a newer run of the same workflow supersedes an older one; other workflows 
   // penmon #387: the draft's run failed, the ready run of the same workflow passed.
   expect(checkState(build, [], [at("failure", 1, 10), at("success", 2, 20)], ci)).toBe("passed");
   expect(checkState(build, [], [at("success", 1, 10), at("failure", 2, 20)], ci)).toBe("failed");
+  // An older workflow run whose job was created late (a higher run id) is still older.
+  expect(checkState(build, [], [at("success", 3, 10), at("failure", 2, 20)], ci)).toBe("failed");
+  // Every current run of the newest workflow run must pass.
+  expect(checkState(build, [], [at("failure", 1, 10), at("success", 2, 20), at("failure", 3, 20)], ci)).toBe("failed");
   // A newer queued run (no start time yet) is still the current one.
   expect(checkState(build, [], [at("success", 1, 10), at(null, 2, 20, "queued")], ci)).toBe("pending");
   // Another workflow's job of the same name is judged on its own.

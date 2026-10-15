@@ -42,34 +42,28 @@ export type CheckState = "passed" | "failed" | "pending" | "missing";
 
 const PASSING = ["success", "neutral", "skipped"];
 
-const runId = (run: Record<string, unknown>) => (Number.isSafeInteger(run.id) ? (run.id as number) : undefined);
-
 /**
- * The check runs a required check is judged by. A run is superseded only by
- * a newer one (a higher `id`, set when the run is created, so a queued run
- * with no start time is still new) of the same stream: the same Actions
- * workflow (`workflows` maps a check suite's id to its workflow's id), or
- * the same check suite for another App. So a draft's failed run gives way to
- * the ready pull request's run of that workflow, while two workflows with
- * the same job name are judged separately. A run without an id or suite is
- * never superseded.
+ * The check runs a required check is judged by. An Actions workflow's runs
+ * count only from its newest workflow run: the check suite with the highest
+ * id (`workflows` maps a suite's id to its workflow's id), since suites are
+ * created with their workflow run while a run's own id dates only its job.
+ * So a draft's failed run gives way to the ready pull request's run of that
+ * workflow, while two workflows with the same job name are judged
+ * separately. Other runs (another App's, or a suite of no known workflow)
+ * are never superseded.
  */
 const current = (runs: Record<string, unknown>[], workflows: ReadonlyMap<number, number>): Record<string, unknown>[] => {
-  const kept: Record<string, unknown>[] = [];
-  const streams = new Map<string, Record<string, unknown>>();
+  const suiteOf = (run: Record<string, unknown>) => record(run.check_suite).id as number;
+  const workflowOf = (run: Record<string, unknown>) => (Number.isSafeInteger(record(run.check_suite).id) ? workflows.get(suiteOf(run)) : undefined);
+  const newest = new Map<number, number>();
   for (const run of runs) {
-    const id = runId(run);
-    const suite = record(run.check_suite).id;
-    if (id === undefined || !Number.isSafeInteger(suite)) {
-      kept.push(run);
-      continue;
-    }
-    const workflow = workflows.get(suite as number);
-    const stream = `${String(record(run.app).id)} ${workflow === undefined ? `suite ${suite}` : `workflow ${workflow}`}`;
-    const best = streams.get(stream);
-    if (best === undefined || id > (runId(best) as number)) streams.set(stream, run);
+    const workflow = workflowOf(run);
+    if (workflow !== undefined) newest.set(workflow, Math.max(newest.get(workflow) ?? 0, suiteOf(run)));
   }
-  return [...kept, ...streams.values()];
+  return runs.filter((run) => {
+    const workflow = workflowOf(run);
+    return workflow === undefined || suiteOf(run) === newest.get(workflow);
+  });
 };
 
 /**
