@@ -10,6 +10,8 @@
  * review comment, so agents' and the owner's inline comments cannot be told
  * apart; inline threads are left to the ruleset's conversation resolution.
  */
+import { statusDescription } from "./review.ts";
+
 export const THREADS_CONTEXT = "agent-threads";
 
 export const SEVERITIES = ["P0", "P1", "P2", "P3"] as const;
@@ -104,7 +106,8 @@ export const awaitingOwner = (input: ThreadsInput): ThreadComment[] => {
     const last = lastAgent.get(comment.thread);
     if (last === undefined || after(comment, last)) lastAgent.set(comment.thread, comment);
   }
-  const since = Date.parse(input.since);
+  // An opening time GitHub did not give counts every comment, never none.
+  const since = Number.isNaN(Date.parse(input.since)) ? Number.NEGATIVE_INFINITY : Date.parse(input.since);
   return input.comments.filter((comment) => {
     if (!same(comment.author, input.owner) || byAgent(comment, input.owner, input.agentApps)) return false;
     if (!(Date.parse(comment.createdAt) > since)) return false;
@@ -140,6 +143,6 @@ export const threadsStatus = (required: readonly RequiredComment[]): { readonly 
     ? { state: "success", description: "no comment awaits an agent's answer", targetUrl: undefined }
     : {
         state: "failure",
-        description: `${required.length} comment(s) await an agent's answer, first ${(required[0] as RequiredComment).why} on ${(required[0] as RequiredComment).thread}`,
+        description: statusDescription(`${required.length} comment(s) await an agent's answer, first ${(required[0] as RequiredComment).why} on ${(required[0] as RequiredComment).thread}`),
         targetUrl: (required[0] as RequiredComment).url,
       };

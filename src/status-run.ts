@@ -1,7 +1,6 @@
 import { agentApps } from "./config.ts";
 import { Failure } from "./failure.ts";
 import { request } from "./github.ts";
-import { agentReviewStatus } from "./review.ts";
 import { pull, pullDiff, readReviewConfig, type ReviewIo, waiver } from "./review-run.ts";
 import { slug } from "./repo.ts";
 import { agentPull, carryCandidate, eventTarget, type FoundMarker, markerFor, type MarkerPost, reviewStatus, type Status, validMarkers } from "./status.ts";
@@ -25,13 +24,17 @@ const record = (value: unknown): Record<string, unknown> => (typeof value === "o
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
 const repoPath = (io: ApiIo) => `/repos/${slug(io.repo)}`;
 
-/** The commit messages of a pull request's commits; undefined past the 250 GitHub lists. */
+/** GitHub lists at most this many of a pull request's commits, and says nothing of the rest. */
+const COMMITS_LISTED = 250;
+
+/** The commit messages of a pull request's commits; undefined when GitHub may not have listed them all. */
 const commitMessages = async (io: ApiIo, number: number): Promise<string[] | undefined> => {
   const commits = await everyPage(io, STAGE, `${repoPath(io)}/pulls/${number}/commits`, 3).catch((error: unknown) => {
     if (error instanceof Failure && error.detail.includes("lists over")) return undefined;
     throw error;
   });
-  return commits?.map((commit) => text(record(record(commit).commit).message));
+  if (commits === undefined || commits.length >= COMMITS_LISTED) return undefined;
+  return commits.map((commit) => text(record(record(commit).commit).message));
 };
 
 /** Every review and conversation comment that may hold a review marker. */
@@ -115,16 +118,23 @@ export const deriveStatuses = async (io: StatusIo, number: number): Promise<{ re
   return { head: pr.head, statuses: [review, { context: THREADS_CONTEXT, ...threads }] };
 };
 
+/** The bot whose statuses a run's GITHUB_TOKEN sets: GitHub Actions' (App 15368). */
+const ACTIONS_BOT = "github-actions[bot]";
+
 /**
- * Sets each status on `head` that differs from what it shows. A token that
- * may not write statuses (a fork's run) is reported, and nothing fails: a
- * later run with a writable token sets them.
+ * Sets each status on `head` unless GitHub Actions already set the same one
+ * last (an equal status from anyone else, such as an agent before the
+ * repository moved to the workflow, cannot meet a check tied to GitHub
+ * Actions). A token that may not write statuses (a fork's run) is reported,
+ * and nothing fails: a later run with a writable token sets them.
  */
 export const writeStatuses = async (io: StatusIo, head: string, statuses: readonly Status[]): Promise<void> => {
-  const combined = record(await get(io, STAGE, `${repoPath(io)}/commits/${head}/status?per_page=100`));
+  // Latest first; the first page holds the latest of each context this writes, or the status is set again.
+  const listed = await get(io, STAGE, `${repoPath(io)}/commits/${head}/statuses?per_page=100`);
+  const latest = Array.isArray(listed) ? listed.map(record) : [];
   for (const status of statuses) {
-    const shown = agentReviewStatus(combined, status.context);
-    if (shown?.state === status.state && shown.description === status.description) {
+    const shown = latest.find((entry) => entry.context === status.context);
+    if (shown?.state === status.state && shown.description === status.description && text(record(shown.creator).login) === ACTIONS_BOT) {
       io.print(`agent-gh: ${status.context} on ${head.slice(0, 8)} already reads ${status.state}: ${status.description}`);
       continue;
     }

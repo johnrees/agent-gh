@@ -127,6 +127,10 @@ test("a P0 to P2 notify from an agent waits for an agent's reply marker; P3 neve
   expect(parseReply(`<!-- agent-reply {"v":1} -->`)).toBeUndefined();
   expect(threadsStatus([])).toEqual({ state: "success", description: "no comment awaits an agent's answer", targetUrl: undefined });
   expect(threadsStatus([{ url: "u", thread: "#7", why: "johnrees's comment" }])).toEqual({ state: "failure", description: "1 comment(s) await an agent's answer, first johnrees's comment on #7", targetUrl: "u" });
+  // GitHub refuses a description over 140 characters; a long repository name is cut, not refused.
+  expect(threadsStatus([{ url: "u", thread: `${"o".repeat(80)}/${"r".repeat(80)}#7`, why: "johnrees's comment" }]).description).toHaveLength(140);
+  // A pull request with no opening time counts every comment of the owner's, never none.
+  expect(awaitingOwner({ owner: "johnrees", agentApps: [CLAUDE], since: "", comments: [comment(2, "johnrees", undefined, "2020-01-01T00:00:00Z")] })).toHaveLength(1);
 });
 
 // --- The workflow's statuses, from a fake GitHub and real git ---
@@ -205,13 +209,17 @@ const statusWorld = (scenario: Scenario) => {
       optedIn ? reply(200, { content: Buffer.from(JSON.stringify({ reviewers: { codex: { model: "m" } }, status_writer: "actions" })).toString("base64") }) : reply(404, {}),
     [`GET ${REPO}`]: () => reply(200, { default_branch: "main", owner: { login: "johnrees" } }),
     [`GET ${REPO}/issues/12`]: () => reply(200, { performed_via_github_app: null }),
-    [`GET ${REPO}/pulls/12/commits`]: () => reply(200, commits.map((message) => ({ commit: { message } }))),
+    [`GET ${REPO}/pulls/12/commits`]: (_, url) => {
+      // As GitHub lists them: 100 a page, and never past the 250th.
+      const at = (Number(url.searchParams.get("page") ?? 1) - 1) * 100;
+      return reply(200, commits.slice(0, 250).slice(at, at + 100).map((message) => ({ commit: { message } })));
+    },
     [`GET ${REPO}/issues/12/events`]: () => reply(200, events),
     [`GET ${REPO}/pulls/12/reviews`]: () => reply(200, reviews),
     [`GET ${REPO}/issues/12/comments`]: () => reply(200, comments),
     [`GET ${REPO}/issues/7/comments`]: () => reply(200, []),
     [`GET ${REPO}/compare/main...${head}`]: () => reply(200, { merge_base_commit: { sha: scenario.mergeBase } }),
-    [`GET ${REPO}/commits/${head}/status`]: () => reply(200, { statuses: combined }),
+    [`GET ${REPO}/commits/${head}/statuses`]: () => reply(200, combined),
     [`POST ${REPO}/statuses/${head}`]: () => reply(scenario.statusReply ?? 201, {}),
     "POST /graphql": (body) =>
       body.includes("closedByPullRequestsReferences")
@@ -297,6 +305,9 @@ test("a person's waiver passes agent-review; an App's does not", async () => {
 });
 
 test("a pull request that is not an agent's passes both statuses; a repository without the config gets none", async () => {
+  // GitHub lists only a pull request's first 250 commits, so 250 by hand may hide an agent's: reviewed.
+  const capped = statusWorld({ head: A, mergeBase: B, commits: [...Array.from({ length: 250 }, () => "by hand"), "x\n\nAgent-Harness: claude"] });
+  expect((await deriveStatuses(capped.io, 12))?.statuses[0]).toMatchObject({ state: "pending" });
   for (const scenario of [{ author: { login: "dependabot[bot]", type: "Bot" } }, { commits: ["by hand"] }]) {
     const w = statusWorld({ head: A, mergeBase: B, ...scenario });
     expect((await deriveStatuses(w.io, 12))?.statuses.map((status) => [status.context, status.state, status.description])).toEqual([
@@ -323,9 +334,23 @@ test("statuses are set only when they change, and a token that may not set them 
     { context: "agent-review", state: "pending", description: "needs a review", targetUrl: undefined },
     { context: "agent-threads", state: "success", description: "none", targetUrl: "https://x" },
   ] as const;
-  const fresh = statusWorld({ head: A, mergeBase: B, combined: [{ context: "agent-review", state: "pending", description: "needs a review" }] });
+  const actions = { login: "github-actions[bot]" };
+  const fresh = statusWorld({
+    head: A, mergeBase: B,
+    combined: [
+      { context: "agent-review", state: "pending", description: "needs a review", creator: actions },
+      { context: "agent-threads", state: "success", description: "none", creator: actions },
+    ],
+  });
   await writeStatuses(fresh.io, A, statuses);
-  expect(fresh.posted()).toEqual([{ state: "success", context: "agent-threads", description: "none", target_url: "https://x" }]);
+  expect(fresh.posted()).toEqual([]);
+  // The same status from an agent, which a check tied to GitHub Actions does not count, is set again by Actions.
+  const migrated = statusWorld({ head: A, mergeBase: B, combined: [{ context: "agent-review", state: "pending", description: "needs a review", creator: { login: "johnrees" } }, { context: "agent-threads", state: "failure", description: "x", creator: actions }] });
+  await writeStatuses(migrated.io, A, statuses);
+  expect(migrated.posted()).toEqual([
+    { state: "pending", context: "agent-review", description: "needs a review" },
+    { state: "success", context: "agent-threads", description: "none", target_url: "https://x" },
+  ]);
   const forked = statusWorld({ head: A, mergeBase: B, statusReply: 403 });
   await writeStatuses(forked.io, A, statuses);
   expect(forked.printed.at(-1)).toContain("this run's token may not set statuses (HTTP 403");
