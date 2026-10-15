@@ -57,7 +57,7 @@ export const getJson = async (api: Api, stage: Stage, path: string, token: strin
 export const request = async (
   api: Api,
   stage: Stage,
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
   token: string,
   body?: unknown,

@@ -1,0 +1,42 @@
+name: agent-claims
+# Reusable: when a pull request closes or merges, removes the claim label from
+# each issue it linked or claimed that nothing claims any more, with the
+# caller's GITHUB_TOKEN. The label only mirrors claims (README, "Claims"); this
+# keeps it in step when John closes a claim's pull request or one merges. It
+# never checks out or runs the pull request's code: it downloads a released
+# agent-gh and reads GitHub's API.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The agent-gh release to run (a tag such as v0.8.0, or latest).
+        type: string
+        default: latest
+permissions: {}
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # contents (the config's label name), pull-requests (open pull requests,
+    # to judge each issue), issues (the issues, their comments, and the label).
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Download agent-gh, checked against the release's SHA256SUMS
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          if [ "$VERSION" = latest ]; then base=https://github.com/johnrees/agent-gh/releases/latest/download
+          else base="https://github.com/johnrees/agent-gh/releases/download/$VERSION"; fi
+          curl -fsSL --retry 3 -o agent-gh-linux-x64 "$base/agent-gh-linux-x64"
+          curl -fsSL --retry 3 -o SHA256SUMS "$base/SHA256SUMS"
+          grep ' agent-gh-linux-x64$' SHA256SUMS | sha256sum -c -
+          chmod +x agent-gh-linux-x64
+          ./agent-gh-linux-x64 --version
+      - name: Remove the claim label where nothing claims the issue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./agent-gh-linux-x64 claims sync
