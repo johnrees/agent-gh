@@ -300,16 +300,19 @@ export const agentMachineGit = (agentGh: string): readonly GitSetting[] => [
 ];
 
 /**
- * The global commit-msg hook, as git's config-based hooks (hook.<name>.*):
- * every repository on the machine credits an agent session's commits, with
- * no hook of its own. It runs before a repository's own hook, and the guard
- * replaces or skips trailers already there, so a repository that also has
- * agent-gh's hook gets them once. `hook.agent-gh.enabled=false` in a
- * repository turns it off there.
+ * The global hooks, as git's config-based hooks (hook.<name>.*): every
+ * repository on the machine credits an agent session's commits, and holds
+ * its pushes to the default branch or a branch whose rules require checks,
+ * with no hook of its own. The commit hook runs before a repository's own,
+ * and the guard replaces or skips trailers already there, so a repository
+ * that also has agent-gh's hook gets them once. `hook.agent-gh.enabled=false`
+ * (or `hook.agent-gh-push.enabled=false`) in a repository turns one off there.
  */
 export const commitHook = (agentGh: string): readonly GitSetting[] => [
   { key: "hook.agent-gh.command", values: [`${/\s/.test(agentGh) ? quote(agentGh) : agentGh} guard commit-msg`], exact: true },
   { key: "hook.agent-gh.event", values: ["commit-msg"], exact: true },
+  { key: "hook.agent-gh-push.command", values: [`${/\s/.test(agentGh) ? quote(agentGh) : agentGh} guard pre-push`], exact: true },
+  { key: "hook.agent-gh-push.event", values: ["pre-push"], exact: true },
 ];
 
 /**

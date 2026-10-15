@@ -179,13 +179,32 @@ test("a session agent-gh cannot identify stops the commit with the fix, rather t
   expect(count()).toBe(before);
 });
 
-test("an older hook's guard pre-push passes, so its pushes are never blocked, an agent's or a person's", () => {
-  for (const env of [{}, AGENT]) {
-    const verdict = guard(["pre-push"], env, "/nonexistent", REGISTRY, () => {
+test("a person's push passes the pre-push guard untouched; an agent's never passes it silently", () => {
+  const verdict = (env: Record<string, string>) =>
+    guard(["pre-push", "origin", "https://github.com/johnrees/widget.git"], env, "/nonexistent", REGISTRY, () => {
       throw new Error("pre-push never reads the repository");
     });
-    expect(verdict).toEqual({ code: 0 });
-  }
+  expect(verdict({})).toEqual({ code: 0 });
+  // The CLI checks an agent's push against GitHub before guard runs; here it fails closed.
+  expect(verdict(AGENT).code).toBe(2);
+});
+
+test("an agent's push through the CLI is refused where its repository cannot be told, and a local remote is not held", () => {
+  const line = `refs/heads/feature ${"a".repeat(40)} refs/heads/main ${"0".repeat(40)}\n`;
+  const push = (url: string, env: Record<string, string>) => {
+    const result = Bun.spawnSync([process.execPath, join(root, "src", "main.ts"), "guard", "pre-push", "origin", url], {
+      env: { PATH: process.env.PATH ?? "", HOME: mkdtempSync(join(tmpdir(), "agent-gh-push-")), ...env },
+      stdin: new TextEncoder().encode(line),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return { code: result.exitCode, stderr: result.stderr.toString() };
+  };
+  const alias = push("git@work-github:johnrees/widget.git", AGENT);
+  expect(alias.code).toBe(1);
+  expect(alias.stderr).toContain("cannot tell which GitHub repository this push goes to");
+  expect(push("/tmp/somewhere/remote.git", AGENT)).toEqual({ code: 0, stderr: "" });
+  expect(push("git@work-github:johnrees/widget.git", {})).toEqual({ code: 0, stderr: "" });
 });
 
 test("a hook this version does not understand fails with exit 2 and the update command, never a pass", () => {

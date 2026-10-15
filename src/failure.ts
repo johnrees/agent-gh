@@ -43,6 +43,8 @@ export type Stage =
   | "reading a credential"
   | "reading the review config"
   | "checking the review"
+  | "checking the merge"
+  | "checking the push"
   | "reviewing";
 
 export const describe = (failure: Failure): string =>

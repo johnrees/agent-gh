@@ -38,7 +38,7 @@ The harness is found from a variable it sets for its tools, and the family from 
 
 ## Repository hooks
 
-Where git runs hooks from config (`git hook list` exists), `install-shims` sets `hook.agent-gh.command` and `hook.agent-gh.event=commit-msg` globally, so every repository on the machine credits agent sessions with no setup of its own; `git config hook.agent-gh.enabled false` turns it off in one repository. It runs before a repository's own hook, and the trailers are replaced or skipped when already there, so both together credit a commit once. Older gits, Apple's among them, need the repository hook below; `doctor --machine` says which applies. This repository has one in `.githooks` (`git config core.hooksPath .githooks`).
+Where git runs hooks from config (`git hook list` exists), `install-shims` sets `hook.agent-gh.command` and `hook.agent-gh.event=commit-msg` globally, so every repository on the machine credits agent sessions with no setup of its own; `git config hook.agent-gh.enabled false` turns it off in one repository. It also sets `hook.agent-gh-push` for `pre-push`: an agent session's push to the repository's default branch, or to a branch a ruleset or classic protection requires status checks on, is refused, since agents act as John and John may bypass those rules. A push whose GitHub repository or rules cannot be told is refused too; a remote on a local path is not held, and a person's pushes never are. It runs before a repository's own hook, and the trailers are replaced or skipped when already there, so both together credit a commit once. Older gits, Apple's among them, need the repository hook below; `doctor --machine` says which applies. This repository has one in `.githooks` (`git config core.hooksPath .githooks`).
 
 ```sh
 # .githooks/commit-msg (with git config core.hooksPath .githooks)
@@ -46,7 +46,13 @@ command -v agent-gh > /dev/null || exit 0
 exec agent-gh guard commit-msg "$1"
 ```
 
-A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify` skips it anywhere. An empty message still aborts the commit. `agent-gh guard pre-push` passes and is kept only for older hooks.
+```sh
+# .githooks/pre-push
+command -v agent-gh > /dev/null || exit 0
+exec agent-gh guard pre-push "$@"
+```
+
+A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify` skips it anywhere. An empty message still aborts the commit. An older pre-push hook that runs `agent-gh guard pre-push` without git's arguments refuses an agent's push to a GitHub branch; pass it `"$@"`.
 
 ## Apps
 
@@ -54,12 +60,15 @@ A machine without agent-gh, such as a cloud agent's, skips it, and `--no-verify`
 
 ## Reviews
 
-A repository opts in to cross-family review by committing `.github/agent-review.json` to its base branch. There, in an agent session, the gh shim refuses `gh pr ready` until the pull request's current head has a successful `agent-review` status, so work is reviewed before CI runs on it. A repository without the file, and a person's own `gh`, are never gated.
+A repository opts in to cross-family review by committing `.github/agent-review.json` to its base branch. There, in an agent session, the gh shim refuses `gh pr ready` until the pull request's current head has a successful `agent-review` status, so work is reviewed before CI runs on it. A review that requested changes sets a failing status, and the refusal names it: answer the findings, push a fix, and review the new head. A repository without the file, and a person's own `gh`, are never gated.
 
-- `agent-gh review full` reviews the pushed head of the branch's pull request against the issue it closes (or `--issue N`), from the merge base GitHub reports for the pull request's own repository. It runs the first configured reviewer from another family than the session's (or the config's `pin`), with the issue, its last comment, the pull request's description, and the repository's checklist. The reviewer works in a throwaway checkout of the reviewed commit and may run the config's `checks` there to confirm a finding: Codex in its workspace-write sandbox with network access (read-only when there are no checks), Claude restricted to git's read commands and those checks. The caller's tree is never touched. It posts the findings as a comment for the agent to answer and sets the status on that head. A new commit needs a new review.
-- `agent-gh review sweep` is a quick bug sweep of the branch with no ticket; it prints and records nothing.
+- `agent-gh review full` reviews the pushed head of the branch's pull request against the issue it closes (or `--issue N`), from the merge base GitHub reports for the pull request's own repository. First it runs the config's `checks` itself, in order until one fails or runs past `checks_timeout_minutes` (stopped with everything it started), in a throwaway `git clone --shared` of the head, which has its own `.git`, so nothing they write reaches the caller's repository. Then it runs the first configured reviewer from another family than the author's (or the config's `pin`), with the checks' result and the last `checks_output_lines` lines of their output, the issue, its last comment, the pull request's description, and the repository's checklist. The author is the family App every commit since the merge base credits as `Co-authored-by`; when they credit none or a mix, the session's family, and it says which. The reviewer only reads: Codex in its read-only sandbox, Claude restricted to git's read commands. It posts the findings as a pull request review (a comment: agents act as John, who cannot approve his own pull requests), each on its line where the diff shows that line and otherwise in the body, and sets the status on that head: failure for a `changes_requested` verdict, success for `approve`, with "checks passed", "failed", "timed out", or "not run" and the command that did not pass; the checks' output reaches only the reviewer unless `post_checks_output` is set. A new commit needs a new review.
+- The review's body starts with a marker, `<!-- agent-review {...} -->`, holding the full head sha, the merge base, the `git patch-id --stable` of the diff, the verdict, the checks' result, and the reviewer's family as one JSON object.
+- `agent-gh review sweep` is a quick bug sweep of the branch with no ticket; it runs no checks, and prints and records nothing.
 - Effort comes from the ticket's labels through the config's rules (`--effort` overrides). Reviewers are the `codex` and `claude` CLIs on PATH.
-- John waives the review of one pull request by adding the waiver label himself. A label an agent adds, through its App, waives nothing; `review full` then records "waived by" on the status.
+- John waives the review of one pull request by adding the waiver label himself. A label an agent adds, through its App, waives nothing; `review full` then records "waived by" on the status, and reads the label again before it sets the status, so a waiver added while it ran stands.
+
+In any repository, an agent session's `gh pr merge`, and a `gh api` call that merges a pull request (a REST merge, or the GraphQL `mergePullRequest`, `enablePullRequestAutoMerge`, or `enqueuePullRequest`), runs only when every status check its base branch requires, by ruleset or classic branch protection, has passed on the pull request's head; `--admin`, merges outside a pull request, and a `gh api` call the guard cannot read are refused. The merge then requires the head whose checks passed (gh's `--match-head-commit`, REST's `sha`, or, which a GraphQL merge must give itself, `expectedHeadOid`), so a commit pushed meanwhile is not merged in its place. Agents act as John, who may bypass those rules, so without this an agent's merge would skip them. A check a rule ties to one App counts only that App's check runs.
 
 ```json
 {
@@ -72,12 +81,18 @@ A repository opts in to cross-family review by committing `.github/agent-review.
     ]
   },
   "checklist": "docs/agents/review-checklist.md",
-  "checks": ["bun test", "bun run typecheck"],
-  "waiver_label": "review-waived"
+  "checks": ["make check"],
+  "checks_output_lines": 60,
+  "checks_timeout_minutes": 30,
+  "post_checks_output": false,
+  "waiver_label": "review-waived",
+  "block_on": "changes_requested"
 }
 ```
 
-The family Apps need the Commit statuses permission (write; the read App, read). An App created before it needs it added on its permissions page (`agent-gh settings <family>` prints the link), and each installation must accept the change; until then `review full` posts its comment but cannot set the status.
+`block_on` names the verdict that fails the status; `changes_requested` is its only value and the default. Setting it makes releases before it, which refuse a config key they do not know, refuse to review or to pass `gh pr ready` rather than pass a review that requested changes. `checks_output_lines` (default 60) is how much of the checks' output the reviewer sees; `post_checks_output` (default false) also shows it on the review, which suits only checks that print nothing private. `checks_timeout_minutes` defaults to 30.
+
+The family Apps need the Commit statuses permission (write; the read App, read). An App created before it needs it added on its permissions page (`agent-gh settings <family>` prints the link), and each installation must accept the change; until then `review full` posts its review but cannot set the status.
 
 The first rule whose label patterns (`*` matches anything) all match one of the ticket's labels sets the effort. The config is read from the pull request's base branch, so a branch cannot switch off its own review. The status is set by the agent that asked for the review: it shows that a review was recorded, not that nobody could forge one. A branch ruleset that requires `agent-review` makes it a merge condition too.
 
