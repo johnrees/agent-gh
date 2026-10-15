@@ -1,10 +1,10 @@
 import { agentApps } from "./config.ts";
 import { Failure } from "./failure.ts";
 import { request } from "./github.ts";
-import { pull, pullDiff, readReviewConfig, type ReviewIo, waiver } from "./review-run.ts";
+import { markerPosts, pull, pullDiff, readReviewConfig, type ReviewIo, waiver } from "./review-run.ts";
 import { slug } from "./repo.ts";
-import { agentPull, carryCandidate, eventTarget, type FoundMarker, markerFor, type MarkerPost, reviewStatus, type Status, validMarkers } from "./status.ts";
-import { STATUS_CONTEXT, statusDescription } from "./review.ts";
+import { agentPull, carryCandidate, eventTarget, type FoundMarker, markerFor, passes, reviewStatus, type Status, validMarkers } from "./status.ts";
+import { type BlockOn, STATUS_CONTEXT, statusDescription } from "./review.ts";
 import { THREADS_CONTEXT, threadsStatus } from "./threads.ts";
 import { type ApiIo, everyPage, get, pullThreads, repoOwner } from "./threads-run.ts";
 
@@ -38,18 +38,6 @@ const commitMessages = async (io: ApiIo, number: number): Promise<string[] | und
   return commits.map((commit) => text(record(record(commit).commit).message));
 };
 
-/** Every review and conversation comment that may hold a review marker. */
-const markerPosts = async (io: ApiIo, number: number): Promise<MarkerPost[]> => {
-  const reviews = (await everyPage(io, STAGE, `${repoPath(io)}/pulls/${number}/reviews`)).map(record).map(
-    (review): MarkerPost => ({ author: text(record(review.user).login), appId: undefined, kind: "review", at: text(review.submitted_at), body: text(review.body), url: text(review.html_url) }),
-  );
-  const comments = (await everyPage(io, STAGE, `${repoPath(io)}/issues/${number}/comments`)).map(record).map((comment): MarkerPost => {
-    const app = record(comment.performed_via_github_app).id;
-    return { author: text(record(comment.user).login), appId: Number.isSafeInteger(app) ? (app as number) : undefined, kind: "comment", at: text(comment.created_at), body: text(comment.body), url: text(comment.html_url) };
-  });
-  return [...reviews, ...comments];
-};
-
 /** Fetches commits into the scratch repository, one depth each: only their trees are compared, nothing is run. */
 const fetched = async (io: StatusIo, refs: readonly string[], want: string): Promise<boolean> => {
   await io.git(["fetch", "-q", "--no-tags", "--depth=1", io.remote, ...refs]);
@@ -60,13 +48,13 @@ const names = async (io: StatusIo, from: string, to: string): Promise<string[] |
   (await io.git(["diff", "--name-only", "--no-renames", "--no-ext-diff", from, to]))?.split("\n").filter((name) => name !== "");
 
 /**
- * An approval carried forward to `head`, which has no review of its own: the
- * latest marker for the same patch approved it, and the base's changes since
+ * A passing review carried forward to `head`, which has no review of its own:
+ * the latest marker for the same patch passes `block_on`, and the base's changes since
  * that marker's merge base touch none of the patch's files. Anything git
  * cannot show (a commit it cannot fetch) carries nothing.
  */
-const carriedForward = async (io: StatusIo, number: number, base: string, head: string, markers: readonly FoundMarker[]): Promise<FoundMarker | undefined> => {
-  if (!markers.some((found) => found.marker.verdict === "approve")) return undefined;
+const carriedForward = async (io: StatusIo, number: number, base: string, head: string, markers: readonly FoundMarker[], blockOn: BlockOn): Promise<FoundMarker | undefined> => {
+  if (!markers.some((found) => passes(found, blockOn))) return undefined;
   const compare = record(await get(io, STAGE, `${repoPath(io)}/compare/${encodeURIComponent(base)}...${head}`));
   const mergeBase = text(record(compare.merge_base_commit).sha);
   if (!/^[0-9a-f]{40}$/.test(mergeBase)) return undefined;
@@ -74,7 +62,7 @@ const carriedForward = async (io: StatusIo, number: number, base: string, head: 
   if (!(await fetched(io, [`refs/pull/${number}/head`, mergeBase], head)) && !(await fetched(io, [head, mergeBase], head))) return undefined;
   if ((await io.git(["cat-file", "-e", `${mergeBase}^{commit}`])) === undefined) return undefined;
   const { patchId } = await pullDiff(io, mergeBase, head);
-  const candidate = carryCandidate(markers, patchId);
+  const candidate = carryCandidate(markers, patchId, blockOn);
   if (candidate === undefined) return undefined;
   if (candidate.marker.merge_base === mergeBase) return candidate;
   if (!(await fetched(io, [candidate.marker.merge_base], candidate.marker.merge_base))) return undefined;
@@ -111,9 +99,9 @@ export const deriveStatuses = async (io: StatusIo, number: number): Promise<{ re
   }
   const owner = await repoOwner(io, STAGE);
   const waivedBy = await waiver(io, STAGE, pr, config);
-  const markers = validMarkers(await markerPosts(io, number), owner, apps);
+  const markers = validMarkers(await markerPosts(io, STAGE, number), owner, apps);
   const current = markerFor(markers, pr.head);
-  const carried = current === undefined && waivedBy === undefined ? await carriedForward(io, number, pr.base, pr.head, markers) : undefined;
+  const carried = current === undefined && waivedBy === undefined ? await carriedForward(io, number, pr.base, pr.head, markers, config.blockOn) : undefined;
   const review = reviewStatus({ number, agent, waivedBy, current, carried, blockOn: config.blockOn });
   const threads = threadsStatus(await pullThreads(io, STAGE, pr, owner));
   return { head: pr.head, statuses: [review, { context: THREADS_CONTEXT, ...threads }] };
