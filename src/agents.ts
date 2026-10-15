@@ -100,7 +100,8 @@ export const instructionsBlock = (): string =>
     "- For a read where that fails too, `GH_TOKEN=$(agent-gh read-token) gh <arguments>` reads with the read-only App.",
     "- Commit with plain `git commit`: a commit-msg hook adds `Agent-*` trailers and `Co-authored-by: johnrees-<family>[bot]`. If a commit you made lacks that co-author line, the hook did not run; run `agent-gh doctor` in the repository and say so, rather than adding the trailers by hand.",
     "- `agent-gh doctor --machine` shows what is set up wrong; tell John its FAIL lines rather than working around them silently.",
-    "- In a repository with `.github/agent-review.json`, before marking a pull request ready, run `agent-gh review full` from its pushed head; fix or decline each finding, reply on the pull request, and review again after any push.",
+    "- In a repository with `.github/agent-review.json`, before marking a pull request ready, run `agent-gh review full` from its pushed head, and review again after any push.",
+    '- Answer each review finding, and each `agent-notify` on your pull request, with `agent-gh reply <id> --applied <sha>` (the fix, pushed to the pull request) or `agent-gh reply <id> --declined "<why>"`; a finding\'s review thread is then resolved.',
     END,
   ].join("\n");
 

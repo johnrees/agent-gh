@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { agentApps, REGISTRY } from "./config.ts";
@@ -52,6 +53,7 @@ import {
   sweepPrompt,
   type Ticket,
   waivedBy,
+  withIds,
 } from "./review.ts";
 
 /** Everything the review commands and the gate touch, so tests pass fakes. */
@@ -291,7 +293,7 @@ const gateUnreviewed = async (io: ReviewIo, stage: Stage, pr: Pull, config: Revi
   if (status?.state === "failure") {
     throw new Failure(
       stage,
-      `pull request #${number}'s head ${pr.head.slice(0, 8)} was reviewed and blocked (${status.description}); answer each finding on the pull request, push a fix, and run \`agent-gh review full\` on the new head, ${waive}`,
+      `pull request #${number}'s head ${pr.head.slice(0, 8)} was reviewed and blocked (${status.description}); answer each finding with \`agent-gh reply\`, push a fix, and run \`agent-gh review full\` on the new head, ${waive}`,
     );
   }
   throw new Failure(
@@ -301,7 +303,7 @@ const gateUnreviewed = async (io: ReviewIo, stage: Stage, pr: Pull, config: Revi
 };
 
 /** The pull request a gh selector names, as gh resolves it: by number, by branch, else the current branch's or HEAD's. */
-const pullNumber = async (io: ReviewIo, stage: Stage, target: ReadyTarget): Promise<number | undefined> => {
+export const pullNumber = async (io: ReviewIo, stage: Stage, target: ReadyTarget): Promise<number | undefined> => {
   if ("number" in target) return target.number;
   const named = target.branch;
   const branch = named ?? (await currentBranch(io));
@@ -904,14 +906,15 @@ export const pullDiff = async (io: Pick<ReviewIo, "git">, mergeBase: string, hea
 const postReview = async (io: ReviewIo, number: number, head: string, review: Review, diff: string, body: (outside: readonly Finding[]) => string) => {
   const lines = diffLines(diff);
   const onDiff = (finding: Finding) => lines.get(finding.file)?.has(finding.line) === true;
-  const inline = review.findings.filter(onDiff);
+  const { findings } = review;
+  const inline = findings.filter(onDiff);
   const path = `${repoPath(io)}/pulls/${number}/reviews`;
   const comments = inline.map((finding) => ({ path: finding.file, line: finding.line, side: "RIGHT", body: inlineComment(finding) }));
-  const first = await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(review.findings.filter((finding) => !onDiff(finding))), comments }, [422]);
+  const first = await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(findings.filter((finding) => !onDiff(finding))), comments }, [422]);
   if (first.status !== 422) return;
   if (comments.length === 0) throw new Failure("reviewing", `HTTP 422 from POST ${path}`);
   io.print("agent-gh: GitHub refused a finding's line, so every finding is in the review's body");
-  await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(review.findings), comments: [] });
+  await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(findings), comments: [] });
 };
 
 const STATUS_WAIT_MS = 60_000;
@@ -1004,7 +1007,9 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks, blockOn: config.blockOn, prior });
   const result = await inClone(io, head, (cwd) => io.runReviewer(fullCommand(reviewer, effort, files), prompt, cwd), base);
   if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
-  const review = await answer(io, reviewer, result.stdout, files.out);
+  const answered = await answer(io, reviewer, result.stdout, files.out);
+  // Each finding's id, in its posted marker and the printed JSON: what `agent-gh reply` answers. New for each review.
+  const review = { ...answered, findings: withIds(`${head}\n${randomUUID()}`, answered.findings) };
   const marker: ReviewMarker = {
     v: 1, head, merge_base: mergeBase, patch_id: patchId, verdict: review.verdict, checks: checks.state, reviewer: reviewer.family, priorities: review.findings.map((finding) => finding.priority),
   };
@@ -1015,6 +1020,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   else if ((await recordWaiver(await pull(io, stage, number))) === undefined) {
     await setStatus(io, head, reviewState(marker, config.blockOn), `${outcomeSummary(marker, config.blockOn)}; ${checksSummary(checks)}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
   }
+  if (review.findings.length > 0) io.print('agent-gh: answer each finding with `agent-gh reply <id> --applied <sha>` or `agent-gh reply <id> --declined "<why>"`');
   io.out(`${JSON.stringify(review, null, 2)}\n`);
 };
 
