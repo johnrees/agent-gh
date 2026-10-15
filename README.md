@@ -21,7 +21,7 @@ It installs the checked release and gitleaks in `~/.local/bin`, logs in each App
 Shell startup files are not enough on their own: a harness may start its tools from a snapshot of the environment it was launched in, and a version manager (mise, asdf, Homebrew's shellenv, Nix) can put its own gh back ahead of the shim after the startup files run. So `install-shims` also, for each harness that has run on the machine (its directory exists):
 
 - **Claude Code**: adds a SessionStart hook to `~/.claude/settings.json`, `agent-gh session-env`, which writes the PATH block to `CLAUDE_ENV_FILE`; Claude Code sources it before every command.
-- **Instructions**: adds a managed block to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.pi/agent/AGENTS.md`: run plain `gh`; if it says it is not logged in, run `agent-gh <gh arguments>`, or read with `GH_TOKEN=$(agent-gh read-token) gh ...`; never ask for `gh auth login`; where a repository opts in to reviews, run `agent-gh review full` before marking a pull request ready; answer each finding and notify with `agent-gh reply`; and run `agent-gh claim <N>` before starting work on an issue.
+- **Instructions**: adds a managed block to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.pi/agent/AGENTS.md`: run plain `gh`; if it says it is not logged in, run `agent-gh <gh arguments>`, or read with `GH_TOKEN=$(agent-gh read-token) gh ...`; never ask for `gh auth login`; where a repository opts in to reviews, run `agent-gh review full` before marking a pull request ready; and answer each finding and notify with `agent-gh reply`.
 
 `doctor --machine` checks both, and when another gh comes first it names the version manager responsible.
 
@@ -146,7 +146,7 @@ To make both required: in the repository's settings, Rules, Rulesets, edit the d
 
 ## Claims
 
-An agent claims an issue when it starts work, so parallel sessions see what is taken and never start the same issue by accident.
+An agent claims an issue when it starts work, so parallel sessions see what is taken and never start the same issue by accident. A repository opts in by saying so in its own agent docs; the managed instructions do not tell agents to claim, since a claim opens a branch and a pull request.
 
 - `agent-gh claim <N>`, in a clone with no uncommitted changes: refuses, naming the holder, an issue that is closed or taken (below). Otherwise it fetches the default branch, creates `<family>/<N>-<slug>` from it with one empty commit (the commit-msg hook credits the session; the message is the issue's title and `Refs #N`, so a squash merge reads well), pushes it (never over an existing branch), and opens a draft pull request whose description says `Closes #N` (`--refs`: `Refs #N`, for work that will not finish the issue) and carries a claim marker, `<!-- agent-claim {"v":1,"issue":N,"family":"claude","session":"…","id":"…"} -->`. Keep the marker when rewriting the description. It then reads the claims back: if an earlier claim holds the issue, it closes its own pull request, deletes its branch, returns to where it was, and exits nonzero naming the winner. `--no-pr`, for an issue with no code (research, a decision), claims with a comment carrying the marker instead, under the same check, and a losing comment posts its own release.
 - The session is `AGENT_GH_SESSION` if set, else Claude Code's `CLAUDE_CODE_SESSION_ID`, Codex's `CODEX_THREAD_ID`, or pi's `PI_SESSION_ID`, else a new id that `claim` prints.
