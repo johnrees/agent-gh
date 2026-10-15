@@ -6,9 +6,9 @@
  * The rule (README, "Claims"): an open issue is taken when an open pull
  * request in its repository references it (a closing keyword or `Refs`, or a
  * claim marker in its description), or when a claim comment on it by someone
- * with write access has no release comment. Of several claims, the pull
- * requests come first, lowest number first, then the comments, lowest id
- * first; the first holds the issue. GitHub has no compare-and-swap, so two
+ * with write access has no release comment. Of several claims, the earliest
+ * created holds the issue; within one second, pull requests before comments,
+ * then the lowest number or id. GitHub has no compare-and-swap, so two
  * sessions that both found the issue free settle it this way after posting.
  * The claim label only mirrors this: anyone can add or remove a label.
  */
@@ -100,10 +100,20 @@ export type Claim = {
 /** Comment authors whose markers count: people with write access, as GitHub reports it on the comment. */
 const TRUSTED = ["OWNER", "MEMBER", "COLLABORATOR"];
 
+/** When a claim was created, in ms; one without a readable time comes last. */
+const createdMs = (claim: Claim): number => {
+  const ms = Date.parse(claim.createdAt);
+  return Number.isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
+};
+
 /**
  * The claims on `issue`, the holder first: open pull requests (REST
- * `GET /repos/{repo}/pulls?state=open`, every page) by number, then live
- * claim comments (`GET /repos/{repo}/issues/{issue}/comments`) by id.
+ * `GET /repos/{repo}/pulls?state=open`, every page) and live claim comments
+ * (`GET /repos/{repo}/issues/{issue}/comments`), earliest created first.
+ * Within one second (GitHub's times have no finer grain) pull requests come
+ * before comments, then the lower number or id. So a comment claim that won
+ * is never displaced by a pull request opened after it, and a pull request
+ * claim never by a later comment.
  */
 export const claimsOn = (repo: Repo, issue: number, pulls: readonly unknown[], comments: readonly unknown[]): Claim[] => {
   const fromPulls = pulls
@@ -119,8 +129,7 @@ export const claimsOn = (repo: Repo, issue: number, pulls: readonly unknown[], c
         family: ours?.family ?? null, session: ours?.session ?? null, id: ours?.id ?? null, branch: text(record(pull.head).ref) || null,
         draft: pull.draft === true, createdAt: text(pull.created_at),
       }];
-    })
-    .sort((a, b) => (a.pr as number) - (b.pr as number));
+    });
   const trusted = comments.map(record).filter((comment) => TRUSTED.includes(text(comment.author_association)));
   const released = new Set(trusted.flatMap((comment) => parseRelease(text(comment.body))?.id ?? []));
   const fromComments = trusted
@@ -131,9 +140,12 @@ export const claimsOn = (repo: Repo, issue: number, pulls: readonly unknown[], c
         issue, kind: "comment", pr: null, comment: integer(comment.id), url: text(comment.html_url), author: text(record(comment.user).login),
         family: marker.family, session: marker.session, id: marker.id, branch: null, draft: false, createdAt: text(comment.created_at),
       }];
-    })
-    .sort((a, b) => (a.comment as number) - (b.comment as number));
-  return [...fromPulls, ...fromComments];
+    });
+  const rank = (claim: Claim): [number, number, number] => [createdMs(claim), claim.kind === "pr" ? 0 : 1, (claim.pr ?? claim.comment) as number];
+  return [...fromPulls, ...fromComments].sort((a, b) => {
+    const [x, y] = [rank(a), rank(b)];
+    return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+  });
 };
 
 export type Taken = { readonly taken: boolean; readonly holder: Claim | undefined; readonly claims: readonly Claim[] };

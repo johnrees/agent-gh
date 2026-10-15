@@ -47,13 +47,18 @@ const comment = (id: number, body: string, association = "OWNER") => ({
 });
 const OPEN = { number: 7, state: "open", title: "Fix the widget" };
 
-test("the rule: pull requests hold an issue before comments, lowest number first; only a writer's live comment claims count", () => {
+test("the rule: the earliest claim holds the issue, a pull request before a comment within the same second, then the lowest number; only a writer's live comment claims count", () => {
   const pulls = [pull(40, `Closes #7.\n${marker(7, "codex", "late")}`), pull(31, `Refs #7.\n${marker(7)}`), pull(12, "Unlike #7"), pull(13, marker(8))];
-  const comments = [comment(900, marker(7, "glm", "c", "aaaaaaaaaaaaaaaa")), comment(800, marker(7, "kimi", "x", "bbbbbbbbbbbbbbbb"), "NONE")];
+  const later = (item: ReturnType<typeof comment>, at = "2026-10-15T10:00:00Z") => ({ ...item, created_at: at });
+  const comments = [later(comment(900, marker(7, "glm", "c", "aaaaaaaaaaaaaaaa"))), comment(800, marker(7, "kimi", "x", "bbbbbbbbbbbbbbbb"), "NONE")];
   const result = taken(REPO, OPEN, pulls, comments);
   expect(result.taken).toBe(true);
   expect(result.claims.map((item) => [item.kind, item.pr ?? item.comment, item.family])).toEqual([["pr", 31, "claude"], ["pr", 40, "codex"], ["comment", 900, "glm"]]);
   expect(result.holder?.session).toBe("s-one");
+  // A comment claim posted before a pull request holds the issue, whichever kind the later one is.
+  const early = comment(901, marker(7, "glm", "c", "aaaaaaaaaaaaaaaa"));
+  expect(taken(REPO, OPEN, pulls, [early]).holder).toMatchObject({ kind: "comment", comment: 901 });
+  expect(taken(REPO, OPEN, [pull(41, marker(7), { created_at: "2026-10-15T08:59:59Z" })], [early]).holder).toMatchObject({ kind: "pr", pr: 41 });
   // A person's pull request that closes the issue takes it, with no marker.
   expect(taken(REPO, OPEN, [pull(5, "Fixes #7")], []).holder).toMatchObject({ pr: 5, family: null, author: "johnrees" });
   // A released comment claim, a closed issue, and a pull request number are never taken.
@@ -123,7 +128,7 @@ const world = ({ issues = [{ ...OPEN, labels: [] }] as Issue[], pulls = [] as Pu
     [`POST ${PATH}/pulls`]: (body) => {
       const sent = JSON.parse(body) as { title: string; head: string; body: string; draft: boolean };
       if (state.pulls.some((item) => item.state === "open" && item.head.ref === sent.head)) return reply(422, { message: "A pull request already exists" });
-      const made = { ...pull(state.nextPull++, sent.body, { draft: sent.draft, head: { ref: sent.head, sha: "b".repeat(40), repo: { full_name: "johnrees/widget" } } }), title: sent.title, commits: 1, changed_files: 0 };
+      const made = { ...pull(state.nextPull++, sent.body, { draft: sent.draft, head: { ref: sent.head, sha: "b".repeat(40), repo: { full_name: "johnrees/widget" } }, created_at: "2026-10-15T11:50:00Z" }), title: sent.title, commits: 1, changed_files: 0 };
       state.pulls.push(made);
       routes[`PATCH ${PATH}/pulls/${made.number}`] = (patch) => (Object.assign(made, JSON.parse(patch)), reply(200, made));
       routes[`GET ${PATH}/pulls/${made.number}`] = () => reply(200, made);
@@ -317,6 +322,24 @@ test("a claim with uncommitted changes is refused before it moves anything", asy
   git.run(["add", "f.txt"], a.dir);
   await expect(claim(a.io, { issue: 7, refs: false, noPr: false })).rejects.toThrow("uncommitted changes");
   expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], a.dir).stdout).toBe("main");
+});
+
+test("a pull request claim opened after a comment claim won loses to it, so both sessions never hold the issue", async () => {
+  const w = world();
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  expect(await claim(a.io, { issue: 7, refs: false, noPr: true })).toBe(0);
+  // A competitor who read the issue as free before that comment was posted, and opens its pull request after.
+  const comments = w.state.comments[7] as unknown[];
+  w.state.comments[7] = [];
+  w.state.onPost = () => {
+    w.state.comments[7] = [...comments];
+  };
+  const b = session(w.fake, git, git.clone("b"), "codex", "s-two");
+  expect(await claim(b.io, { issue: 7, refs: false, noPr: false })).toBe(1);
+  expect(b.printed.join("\n")).toContain("#7 went to a claim comment by a claude session (s-one)");
+  expect(w.state.pulls[0]?.state).toBe("closed");
+  expect(taken(REPO, OPEN, w.state.pulls, w.state.comments[7] ?? []).holder).toMatchObject({ kind: "comment", session: "s-one" });
 });
 
 test("--no-pr claims with a comment; one that loses to an earlier comment posts its own release", async () => {
