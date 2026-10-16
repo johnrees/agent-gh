@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { installBinary } from "../scripts/install-binary.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,4 +22,23 @@ test("writers of one file at once each finish, leave a whole text, and no tempor
   expect(codes).toEqual(Array(8).fill(0));
   expect(readFileSync(target, "utf8")).toMatch(/^([a-h])\1{4095}$/);
   expect(readdirSync(dir).sort()).toEqual([".zshrc", "writer.ts"]);
+});
+
+test("install-local leaves an identical installed build alone, and installs a changed one or one with the wrong mode", () => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-gh-install-local-"));
+  const built = join(dir, "dist-agent-gh");
+  const target = join(dir, "bin", "agent-gh");
+  writeFileSync(built, "build 1");
+  expect(installBinary(built, target)).toBe(true);
+  const first = statSync(target);
+  expect(first.mode & 0o777).toBe(0o755);
+  expect(installBinary(built, target)).toBe(false);
+  expect(statSync(target).ino).toBe(first.ino);
+  writeFileSync(built, "build 2");
+  expect(installBinary(built, target)).toBe(true);
+  expect(readFileSync(target, "utf8")).toBe("build 2");
+  chmodSync(target, 0o700);
+  expect(installBinary(built, target)).toBe(true);
+  expect(statSync(target).mode & 0o777).toBe(0o755);
+  expect(readdirSync(join(dir, "bin"))).toEqual(["agent-gh"]);
 });
