@@ -350,6 +350,9 @@ test("gh api endpoints the release guard cannot read are refused, and approving 
     [["api", "r%65pos/johnrees/widget/releases", "-f", "tag_name=v1.2.3"], "cannot read which repository `gh api POST r%65pos/johnrees/widget/releases` writes to"],
     [["api", "-X", "DELETE", "repos%2Fjohnrees%2Fwidget/git/refs/tags/v1.2.3"], "cannot read which repository"],
     [["api", "-X", "PATCH", "r%65pos/johnrees/widget/git/refs/heads/main", "-f", `sha=${COMMIT}`], "cannot read which repository"],
+    // So must an encoded GraphQL endpoint (review finding 4125f56f31c9), whatever its mutation moves or merges.
+    [["api", "gr%61phql", "-f", 'query=mutation { deleteRef(input: {refId: "REF_TAG"}) { clientMutationId } }'], "cannot read `gh api POST gr%61phql`: spell the GraphQL endpoint plainly, as `gh api graphql`"],
+    [["api", "https://api.github.com/GRAPHQL%2F", "-f", 'query=mutation { mergePullRequest(input: {pullRequestId: "PR_1"}) { clientMutationId } }'], "spell the GraphQL endpoint plainly"],
     // A spelling of api.github.com gh would still send John's token to is read as no path.
     [["api", "https://api.github.com:443/repos/johnrees/widget/git/refs", "-f", "ref=refs/tags/v1.2.3", "-f", `sha=${COMMIT}`], "cannot tell what `gh api POST https://api.github.com:443/"],
   ] as [string[], string][]) {

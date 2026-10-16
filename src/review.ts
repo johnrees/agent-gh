@@ -456,6 +456,10 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
   if (relative.includes("://")) return absoluteWrite(call, relative);
   const path = relative.replace(/^\/+/, "").split(/[?#]/)[0] as string;
   if (/^graphql\/?$/i.test(path)) return { kind: "graphql" };
+  // GitHub decodes the path, so `gr%61phql` is GraphQL too; gh sends it as REST, whose body the guard does not read as GitHub would.
+  if (/^graphql\/*$/i.test(decodedOrRaw(path))) {
+    return { kind: "refuse", reason: `cannot read \`gh api ${call.method} ${call.endpoint}\`: spell the GraphQL endpoint plainly, as \`gh api graphql\`` };
+  }
   if (call.method === "GET" || call.method === "HEAD") return { kind: "none" };
   const unreadable = { kind: "refuse", reason: `cannot tell whether \`gh api ${call.method} ${call.endpoint}\` merges a pull request; use \`gh pr merge\`` } as const;
   const segments = path.split("/");
@@ -490,6 +494,15 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
   const placeholders = owner === "{owner}" && name === "{repo}";
   if (!placeholders && /[{}%]/.test(owner + name)) return { kind: "refuse", reason: `cannot tell which repository \`gh api ${call.endpoint}\` merges in; use \`gh pr merge\`` };
   return { kind: "rest", repo: placeholders ? undefined : `${owner}/${name}`, number: Number(pr[3]) };
+};
+
+/** `path` decoded as GitHub reads it, or as it is when it does not decode. */
+const decodedOrRaw = (path: string): string => {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
 };
 
 /** A REST write that moves a branch (git refs, or a contents write that commits), if `path` is one. */
