@@ -5,7 +5,7 @@ import { isConfigured, READ_APP } from "./config.ts";
 import { familyNames } from "./family.ts";
 import type { Api } from "./github.ts";
 import { loginUsable } from "./login.ts";
-import { agentMachineGit, commitHook, configHooks, findReal, gitVersion, holds, isShim, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
+import { agentMachineGit, commitHook, configHooks, findReal, gitVersion, holds, isShim, machineAuthor, personalGhLogin, readMachine, type ShimDeps } from "./shims.ts";
 
 export const RERUN = "rerun the install line";
 
@@ -118,6 +118,13 @@ export const machineDoctor = async (
       held ? "a global pre-push hook holds an agent session's pushes to a branch whose rules require checks" : `not set; ${RERUN}`,
     );
   }
+  const { author, person } = machineAuthor(deps);
+  const identity = "`git config --global user.name <your GitHub login>` and `git config --global user.email <id>+<login>@users.noreply.github.com`";
+  add(
+    person ? "ok" : "FAIL",
+    "git author",
+    person ? author : author === "" ? `none, so commits fail; run ${identity}` : `${author} is an App's, not yours; run ${identity}`,
+  );
   const hook = claudeHookState(deps.home, deps.agentGh);
   if (hook !== "absent") {
     add(
