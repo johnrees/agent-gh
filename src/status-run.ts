@@ -158,10 +158,22 @@ const changedFiles = async (io: StatusIo, mergeBase: string, head: string): Prom
   return files;
 };
 
-/** The reserved files' patch id at `head` from `mergeBase` (null for none), both fetched. */
+/**
+ * The reserved files' patch id at `head` from `mergeBase` (null for none),
+ * both fetched: `git patch-id --verbatim` (git 2.42 or later) of their diff,
+ * read untrimmed, so it ignores line numbers (a rebase keeps it) but no
+ * whitespace, which can change what a file means (a space inside a string).
+ */
 const reservedPatchId = async (io: StatusIo, mergeBase: string, head: string, paths: readonly string[]): Promise<string | null> => {
   const names = reservedFiles(await changedFiles(io, mergeBase, head), paths).names;
-  return names.length === 0 ? null : (await pullDiff(io, mergeBase, head, names)).patchId;
+  if (names.length === 0) return null;
+  const only = names.map((name) => `:(literal)${name}`);
+  const diff = await io.git(["diff", "--no-color", "--no-ext-diff", "-M", "--src-prefix=a/", "--dst-prefix=b/", mergeBase, head, "--", ...only], undefined, true);
+  if (diff === undefined) throw new Failure(STAGE, `could not diff ${head.slice(0, 8)}'s reserved paths`);
+  if (diff === "") return null;
+  const id = (await io.git(["patch-id", "--verbatim"], diff))?.split(" ")[0];
+  if (id === undefined || !/^[0-9a-f]{40}$/.test(id)) throw new Failure(STAGE, "git patch-id --verbatim gave no id for the reserved paths' diff; it needs git 2.42 or later");
+  return id;
 };
 
 /** The other open pull requests here whose head is `head`. */

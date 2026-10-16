@@ -70,8 +70,8 @@ export type ReviewIo = {
   readonly repo: Repo;
   /** The session's family: its work is reviewed by another family. */
   readonly family: string;
-  /** Runs git in the working tree, with `input` on stdin; its trimmed stdout, or undefined when it fails. */
-  readonly git: (args: readonly string[], input?: string) => Promise<string | undefined>;
+  /** Runs git in the working tree, with `input` on stdin; its stdout (trimmed unless `raw`), or undefined when it fails. */
+  readonly git: (args: readonly string[], input?: string, raw?: boolean) => Promise<string | undefined>;
   /** Runs one of the config's checks, a shell command, in `cwd` with `env` added, stopping it after `timeoutMs`; its exit code and its stdout and stderr together. */
   readonly runCheck: (command: string, cwd: string, timeoutMs: number, env: Readonly<Record<string, string>>) => Promise<CheckRun>;
   /** Runs a reviewer CLI in `cwd` with `stdin` (none when empty) and returns its exit code and stdout. */
@@ -1227,20 +1227,12 @@ export const authoredBy = async (io: ReviewIo, mergeBase: string, head: string):
 };
 
 /**
- * The pull request's diff (or only some files'), as `git diff` prints it
- * with fixed options so its patch id does not depend on local config, and
- * that patch id. git patch-id ignores whitespace, so the trimmed output
- * gives the same id.
+ * The pull request's diff, as `git diff` prints it with fixed options so its
+ * patch id does not depend on local config, and that patch id. git patch-id
+ * ignores whitespace, so the trimmed output gives the same id.
  */
-export const pullDiff = async (
-  io: Pick<ReviewIo, "git">,
-  mergeBase: string,
-  head: string,
-  /** Only these files, named as they are (no pathspec magic), when given. */
-  paths?: readonly string[],
-): Promise<{ readonly diff: string; readonly patchId: string | null }> => {
-  const only = paths === undefined ? [] : ["--", ...paths.map((path) => `:(literal)${path}`)];
-  const diff = await io.git(["diff", "--no-color", "--no-ext-diff", "-M", "--src-prefix=a/", "--dst-prefix=b/", mergeBase, head, ...only]);
+export const pullDiff = async (io: Pick<ReviewIo, "git">, mergeBase: string, head: string): Promise<{ readonly diff: string; readonly patchId: string | null }> => {
+  const diff = await io.git(["diff", "--no-color", "--no-ext-diff", "-M", "--src-prefix=a/", "--dst-prefix=b/", mergeBase, head]);
   if (diff === undefined) throw new Failure("reviewing", `could not diff ${mergeBase.slice(0, 8)}..${head.slice(0, 8)}`);
   if (diff === "") return { diff, patchId: null };
   const id = (await io.git(["patch-id", "--stable"], `${diff}\n`))?.split(" ")[0];

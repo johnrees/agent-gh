@@ -139,10 +139,10 @@ const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): Re
   token: env.GH_TOKEN ?? "",
   repo,
   family: context.identity.family,
-  git: async (args, input) => {
+  git: async (args, input, raw) => {
     const child = Bun.spawn(["git", ...args], { env, stdin: input === undefined ? "ignore" : new Blob([input]), stdout: "pipe", stderr: "ignore" });
     const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-    return code === 0 ? out.trim() : undefined;
+    return code !== 0 ? undefined : raw === true ? out : out.trim();
   },
   runCheck: (command, cwd, timeoutMs, extra) => spawnCheck(command, cwd, process.env, timeoutMs, extra),
   runReviewer: async (command, stdin, cwd) => {
@@ -185,10 +185,10 @@ const statusIo = (env: NodeJS.ProcessEnv, repo: Repo, token: string): StatusIo =
     repo,
     remote: `https://github.com/${slug(repo)}.git`,
     ntfyUrl: env.AGENT_GH_NTFY_URL,
-    git: async (args, input) => {
+    git: async (args, input, raw) => {
       const child = Bun.spawn(["git", ...args], { cwd: dir, env: gitEnv, stdin: input === undefined ? "ignore" : new Blob([input]), stdout: "pipe", stderr: "ignore" });
       const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-      return code === 0 ? out.trim() : undefined;
+      return code !== 0 ? undefined : raw === true ? out : out.trim();
     },
     print: (line) => console.error(line),
   };

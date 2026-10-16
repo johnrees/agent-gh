@@ -217,9 +217,9 @@ afterEach(() => {
 });
 
 const gitEnv = (home: string) => ({ PATH: process.env.PATH ?? "", HOME: home, GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "A", GIT_AUTHOR_EMAIL: "a@example.com", GIT_COMMITTER_NAME: "A", GIT_COMMITTER_EMAIL: "a@example.com" });
-const runGit = (env: Record<string, string>, cwd: string, args: readonly string[], input?: string) => {
+const runGit = (env: Record<string, string>, cwd: string, args: readonly string[], input?: string, raw?: boolean) => {
   const result = Bun.spawnSync(["git", ...args], { cwd, env, stdin: input === undefined ? "ignore" : new TextEncoder().encode(input), stdout: "pipe", stderr: "pipe" });
-  return result.exitCode === 0 ? result.stdout.toString().trim() : undefined;
+  return result.exitCode !== 0 ? undefined : raw === true ? result.stdout.toString() : result.stdout.toString().trim();
 };
 
 /**
@@ -376,9 +376,9 @@ const statusWorld = (scenario: Scenario) => {
     repo: { owner: "johnrees", name: "widget" },
     remote: scenario.remote ?? "file:///nowhere",
     ntfyUrl: scenario.ntfy === undefined ? undefined : scenario.ntfy === "unreachable" ? `http://127.0.0.1:1/${TOPIC}` : `${fake.api.base}/ntfy/${TOPIC}`,
-    git: async (args, input) => {
+    git: async (args, input, raw) => {
       gitCalls.push(args.join(" "));
-      return runGit(env, scratch, args, input);
+      return runGit(env, scratch, args, input, raw);
     },
     print: (line) => printed.push(line),
   };
@@ -840,10 +840,12 @@ test("against real git, a person's release binds to the head its event gave, sur
     return statusWorld({ head, mergeBase, remote, hold: { paths: ["a.txt"] }, labels: ["human-approved"], events: [release], ...extra, mergeBases });
   };
   const hold = async (w: ReturnType<typeof statusWorld>) => (await deriveStatuses(w.io, 12))?.statuses[2];
+  // The reserved diff's id as the workflow reads it: untrimmed, through git patch-id --verbatim.
+  const verbatim = (from: string, to: string) => runGit(repo.env, repo.dir, ["patch-id", "--verbatim"], runGit(repo.env, repo.dir, ["diff", "--no-color", "--no-ext-diff", "-M", "--src-prefix=a/", "--dst-prefix=b/", from, to, "--", "a.txt"], undefined, true))?.split(" ")[0] ?? null;
   // As GitHub sends it: the head then, and the pull request's updated_at, the label's own time.
   const releasedAt = (head: string, at = LABELED, base = "main", baseSha = repo.mb1) => ({ name: "pull_request_target", payload: { action: "labeled", label: { name: "human-approved" }, pull_request: { number: 12, head: { sha: head }, base: { ref: base, sha: baseSha }, updated_at: at } } });
   const link = holdLink("johnrees/widget", 12, { label: "needs-human", releaseLabel: "human-approved", paths: ["a.txt"] }, "main", repo.mb1, 501);
-  const { patchId } = await pullDiff(repo.io, repo.mb1, repo.head1, ["a.txt"]);
+  const patchId = verbatim(repo.mb1, repo.head1);
 
   // John releases head1; by the time the release's own run reads the pull request, an agent has pushed head4, another reserved diff.
   // The run binds the release to head1, the head GitHub gave the event, and holds head4.
@@ -868,9 +870,17 @@ test("against real git, a person's release binds to the head its event gave, sur
   // A change to the reserved file holds it again, whatever a later record says.
   const changed = await hold(world(head4, repo.mb2, { comments: recorded }));
   expect(changed).toMatchObject({ state: "failure", description: `held: reserved paths changed since johnrees released at ${repo.head1.slice(0, 8)}; John adds \`human-approved\` again` });
-  const { patchId: changedId } = await pullDiff(repo.io, repo.mb2, head4, ["a.txt"]);
+  const changedId = verbatim(repo.mb2, head4);
   const forge = (login: string) => ({ id: 9000, user: { login }, created_at: minutes(10), updated_at: minutes(10), body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: head4, base: "main", paths_patch_id: changedId }) });
   expect(await hold(world(head4, repo.mb2, { comments: [...recorded, forge("github-actions[bot]")] }))).toMatchObject({ state: "failure" });
+  // Whitespace counts: a space inside a line, or trailing on the diff's very last line (read untrimmed), is a change John has not released.
+  const spaced = amend(repo.head1, "spaced", "a.txt", `${["chan ged", ...lines.slice(1)].join("\n")}\n`);
+  expect(await hold(world(spaced, repo.mb1, { comments: recorded }))).toMatchObject({ state: "failure", description: `held: reserved paths changed since johnrees released at ${repo.head1.slice(0, 8)}; John adds \`human-approved\` again` });
+  const tailX = amend(repo.head1, "tail-x", "a.txt", `${["changed", ...lines.slice(1, 29), "line 30 x"].join("\n")}\n`);
+  const tailY = amend(repo.head1, "tail-y", "a.txt", `${["changed", ...lines.slice(1, 29), "line 30 x "].join("\n")}\n`);
+  const boundX = { id: 9100, user: { login: "github-actions[bot]" }, created_at: minutes(1), updated_at: minutes(1), body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: tailX, base: "main", paths_patch_id: verbatim(repo.mb1, tailX) }) };
+  expect(await hold(world(tailX, repo.mb1, { comments: [boundX] }))).toMatchObject({ state: "success" });
+  expect(await hold(world(tailY, repo.mb1, { comments: [boundX] }))).toMatchObject({ state: "failure", description: `held: reserved paths changed since johnrees released at ${tailX.slice(0, 8)}; John adds \`human-approved\` again` });
   // A record anyone else posts counts for nothing; and with the record gone, no run but the release's own binds it, whatever the head.
   expect(await hold(world(head4, repo.mb2, { comments: [forge("johnrees")] }))).toMatchObject({ state: "failure", description: "held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again" });
   expect(await hold(world(repo.head1, repo.mb1))).toMatchObject({ state: "failure", description: "held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again" });
