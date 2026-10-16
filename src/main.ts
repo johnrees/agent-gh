@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { runChild } from "./child.ts";
 import { parseClaimArgs, sessionId as claimSession } from "./claim.ts";
 import { claim, type ClaimIo, claimsLines, eventIssues, listClaims, release, syncLabels } from "./claim-run.ts";
+import type { LabelRules } from "./next.ts";
 import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, wavesLines } from "./next-run.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
@@ -69,11 +70,18 @@ const USAGE = `usage:
                                     take an issue before working on it: refuse a closed or taken one, else open a draft
                                     pull request closing it (--refs: referencing it) from a new <family>/<N>-<slug> branch,
                                     or (--no-pr) post a claim comment; a claim that loses a race undoes itself
-  agent-gh claim --next [--refs|--no-pr] [-R repo]
+  agent-gh claim --next [--refs|--no-pr] [LABEL FILTERS] [-R repo]
                                     claim the first issue \`next\` offers; after a lost race, the next one (at most three)
-  agent-gh next [--json] [--waves] [-R repo]
+  agent-gh next [--json] [--waves] [LABEL FILTERS] [-R repo]
                                     the issues an agent may take, the next first: open, ready, queued (where a Queue issue
-                                    is configured), unblocked, and unclaimed; --waves: the blocked_by graph in waves
+                                    is configured), unblocked, and unclaimed; --waves: the blocked_by graph in waves;
+                                    --json includes each issue's labels
+                                    LABEL FILTERS, each repeatable, a pattern where * matches anything:
+                                      --skip-label <pattern>     leave out an issue carrying a matching label
+                                      --require-label <pattern>  leave out an issue with no matching label
+                                      --fit-label <group:pattern>  leave out an issue with a label in the pattern's group
+                                                                 (up to its first ":") that does not match: model:sonnet-*
+                                    queue.skip_labels in .github/agent-review.json applies --skip-label for everyone
   agent-gh release <N> [-R repo]    release this session's claim: close its still-empty draft, or post a release comment
   agent-gh claims [--json] [-R repo]
                                     list live claims with their holder and last push and comment (--json: the stable form)
@@ -291,8 +299,8 @@ const claimCommand = async (first: string, rest: readonly string[], env: NodeJS.
   }
   const repo = await resolveRepo("gh", rest, env, () => originUrl(process.cwd()));
   if (repo === undefined) throw new Failure("resolving the repository", "no -R, GH_REPO, or github.com origin remote; run it inside a clone of the repository or pass -R OWNER/REPO");
-  const showNext = async (io: { api: typeof GITHUB; token: string; repo: Repo }, options: { readonly json: boolean; readonly waves: boolean }) => {
-    const result = await nextIssues(repo, apiReader(io));
+  const showNext = async (io: { api: typeof GITHUB; token: string; repo: Repo }, options: { readonly json: boolean; readonly waves: boolean; readonly rules: LabelRules }) => {
+    const result = await nextIssues(repo, apiReader(io), options.rules);
     const value = options.waves ? (options.json ? wavesJson(repo, result) : wavesLines(result, print)) : options.json ? nextJson(repo, result) : nextLines(result, print);
     process.stdout.write(Array.isArray(value) ? `${value.join("\n")}\n` : `${JSON.stringify(value, null, 2)}\n`);
     return 0;
