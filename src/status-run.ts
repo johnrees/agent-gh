@@ -24,6 +24,7 @@ import {
   passes,
   type ReleaseRecord,
   releaseMarker,
+  reservedFiles,
   reviewStatus,
   type Status,
   validMarkers,
@@ -44,8 +45,6 @@ export type StatusIo = ApiIo &
     readonly remote: string;
     /** Where a hold's call is also pushed (the NTFY_URL secret), if anywhere; never printed. */
     readonly ntfyUrl: string | undefined;
-    /** The time now, in milliseconds. */
-    readonly now: () => number;
   };
 
 const STAGE = "deriving the statuses";
@@ -130,21 +129,52 @@ const pullFiles = async (io: ApiIo, pr: Pull): Promise<ChangedFile[] | undefined
 };
 
 /**
- * Whether GitHub Actions set agent-hold on `head` by `at`: the head was then
- * a pull request's, which the person releasing could have seen.
+ * The files the hold's paths reserve in `head`'s diff from `mergeBase`, as
+ * git names them (both names of a rename), so the patch id is read the same
+ * way at any head.
  */
-const heldBefore = async (io: ApiIo, head: string, at: string): Promise<boolean> =>
-  (await everyPage(io, STAGE, `${repoPath(io)}/commits/${head}/statuses`, 10))
+const reservedNames = async (io: StatusIo, mergeBase: string, head: string, paths: readonly string[]): Promise<string[]> => {
+  const out = await io.git(["diff", "--name-status", "-M", "-z", "--no-ext-diff", mergeBase, head]);
+  if (out === undefined) throw new Failure(STAGE, `could not list ${head.slice(0, 8)}'s changed files`);
+  const parts = out.split("\0");
+  const files: ChangedFile[] = [];
+  for (let at = 0; at < parts.length && parts[at] !== ""; ) {
+    const status = parts[at] as string;
+    if (/^[RC]/.test(status)) {
+      files.push({ name: parts[at + 2] ?? "", previous: parts[at + 1] });
+      at += 3;
+    } else {
+      files.push({ name: parts[at + 1] ?? "", previous: undefined });
+      at += 2;
+    }
+  }
+  return reservedFiles(files, paths).names;
+};
+
+/** The reserved files' patch id at `head` (null for none), from its diff from the merge base GitHub reports for it. */
+const reservedPatchId = async (io: StatusIo, pr: Pull, paths: readonly string[], head: string): Promise<string | null> => {
+  const mergeBase = await fetchedPull(io, pr.number, pr.base, head);
+  if (mergeBase === undefined) throw new Failure(STAGE, `could not fetch ${head.slice(0, 8)} and its merge base to compare #${pr.number}'s reserved paths`);
+  const names = await reservedNames(io, mergeBase, head, paths);
+  return names.length === 0 ? null : (await pullDiff(io, mergeBase, head, names)).patchId;
+};
+
+/** The other open pull requests here whose head is `head`. */
+const sharingHead = async (io: ApiIo, number: number, head: string): Promise<number[]> =>
+  (await everyPage(io, STAGE, `${repoPath(io)}/commits/${head}/pulls`, 3))
     .map(record)
-    .some((status) => status.context === HOLD_CONTEXT && text(record(status.creator).login) === ACTIONS_BOT && Date.parse(text(status.created_at)) <= Date.parse(at));
+    .filter((item) => item.state === "open" && text(record(item.head).sha) === head && Number.isSafeInteger(item.number) && item.number !== number)
+    .map((item) => item.number as number);
 
 /**
  * agent-hold for `pr`'s head (holdStatus), from the labels and label events of
  * the pull request and every issue it closes, its files, its release
- * records, and, only when a person's release has to be checked, the
- * reserved files' diff, read from git.
+ * records, the open pull requests sharing its head, and, only when a
+ * person's release has to be checked, the reserved files' diff, read from
+ * git. `releaseHead` is the head the release label's own `labeled` event
+ * gave, in that run alone.
  */
-const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "agent" | "bot" | "person"): Promise<{ readonly status: Status; readonly record?: ReleaseRecord }> => {
+const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "agent" | "bot" | "person", releaseHead: string | undefined): Promise<{ readonly status: Status; readonly record?: ReleaseRecord }> => {
   const threads: (HoldThread & { readonly repo: Repo; readonly number: number })[] = [
     { ref: `#${pr.number}`, repo: io.repo, number: pr.number, labels: pr.labels, events: labelEvents(await issueEvents(io, io.repo, pr.number)) },
   ];
@@ -164,16 +194,18 @@ const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "age
     threads[index] = { ...thread, ask: askFor(comments, added.at, owner, agentApps().map((app) => app.id)).line };
   }
   const files = author === "person" ? [] : await pullFiles(io, pr);
+  // A comment edited since it was posted (its updated_at moved; a reaction leaves it) carries no trusted record.
   const comments = prComments.map((comment) => ({ author: comment.author, body: comment.body, edited: comment.updatedAt !== comment.createdAt }));
-  const input = { hold, author, threads, files, comments, head: pr.head, now: new Date(io.now()).toISOString() };
+  const input = { hold, author, number: pr.number, url: `https://github.com/${slug(io.repo)}/pull/${pr.number}`, threads, files, comments, head: pr.head, sharedWith: await sharingHead(io, pr.number, pr.head) };
   const needs = holdNeeds(input);
-  if (needs === undefined) return holdStatus(input);
-  const mergeBase = await fetchedPull(io, pr.number, pr.base, pr.head);
-  if (mergeBase === undefined) throw new Failure(STAGE, `could not fetch #${pr.number}'s head and merge base to compare its reserved paths`);
-  const { patchId } = await pullDiff(io, mergeBase, pr.head, needs.names);
-  const headBeforeRelease = needs.record === undefined ? await heldBefore(io, pr.head, needs.release.at) : undefined;
-  return holdStatus({ ...input, pathsPatchId: patchId, ...(headBeforeRelease === undefined ? {} : { headBeforeRelease }) });
+  if (needs === undefined || needs.record === "edited" || (needs.record === undefined && releaseHead === undefined)) return holdStatus(input);
+  const pathsPatchId = await reservedPatchId(io, pr, hold.paths, pr.head);
+  const releaseRun = needs.record === undefined && releaseHead !== undefined ? { head: releaseHead, pathsPatchId: releaseHead === pr.head ? pathsPatchId : await reservedPatchId(io, pr, hold.paths, releaseHead) } : undefined;
+  return holdStatus({ ...input, pathsPatchId, ...(releaseRun === undefined ? {} : { releaseRun }) });
 };
+
+/** A pull request's `labeled` event, which this run handles: the label, and the head GitHub gave the event. */
+export type LabeledEvent = { readonly label: string; readonly head: string };
 
 /** What a run derives for a pull request: the statuses for its head, a release record to write first, and the hold it judged by. */
 export type Derived = { readonly head: string; readonly statuses: readonly Status[]; readonly record?: ReleaseRecord; readonly hold?: HoldConfig };
@@ -183,7 +215,7 @@ export type Derived = { readonly head: string; readonly statuses: readonly Statu
  * its base branch's config has `hold`); undefined when it is closed, or its
  * base branch has no review config.
  */
-export const deriveStatuses = async (io: StatusIo, number: number): Promise<Derived | undefined> => {
+export const deriveStatuses = async (io: StatusIo, number: number, labeled?: LabeledEvent): Promise<Derived | undefined> => {
   const pr = await pull(io, STAGE, number);
   if (!pr.open) {
     io.print(`agent-gh: #${number} is closed; no status set`);
@@ -202,7 +234,8 @@ export const deriveStatuses = async (io: StatusIo, number: number): Promise<Deri
     apps,
   );
   // A bot that is no family App (Dependabot) is not an agent, but an agent could merge its pull request: reserved paths hold it.
-  const held = config.hold === undefined ? undefined : await deriveHold(io, pr, config.hold, agent ? "agent" : pr.authorType === "Bot" ? "bot" : "person");
+  const releaseHead = config.hold !== undefined && labeled !== undefined && sameLabel(labeled.label, config.hold.releaseLabel) ? labeled.head : undefined;
+  const held = config.hold === undefined ? undefined : await deriveHold(io, pr, config.hold, agent ? "agent" : pr.authorType === "Bot" ? "bot" : "person", releaseHead);
   const hold = held === undefined ? {} : { hold: config.hold, ...(held.record === undefined ? {} : { record: held.record }) };
   if (!agent) {
     const skip = (context: string): Status => ({ context, state: "success", description: "not an agent PR", targetUrl: undefined });
@@ -288,12 +321,12 @@ const writeRecord = async (io: StatusIo, number: number, value: ReleaseRecord): 
  * a newer one: the last write of any run follows a read made after it.
  * Returns the last derivation.
  */
-const settle = async (io: StatusIo, number: number): Promise<Derived | undefined> => {
-  let derived = await deriveStatuses(io, number);
+const settle = async (io: StatusIo, number: number, labeled: LabeledEvent | undefined): Promise<Derived | undefined> => {
+  let derived = await deriveStatuses(io, number, labeled);
   for (let round = 1; derived !== undefined; round++) {
     if (derived.record !== undefined && !(await writeRecord(io, number, derived.record))) return derived;
     if (!(await writeStatuses(io, derived.head, derived.statuses))) return derived;
-    const now = await deriveStatuses(io, number);
+    const now = await deriveStatuses(io, number, labeled);
     if (now === undefined || sameStatuses(now, derived)) return now;
     if (round >= WRITE_ROUNDS) {
       io.print(`agent-gh: #${number} kept changing while this run wrote its statuses; the next event's run sets them`);
@@ -369,12 +402,20 @@ const callOwner = async (io: StatusIo, number: number, hold: HoldConfig): Promis
   if (called(comments, added.id)) return;
   const ask = askFor(comments, added.at, owner, agentApps().map((app) => app.id));
   const body = callBody({ owner, ref: `#${number}`, hold, ask, event: added.id });
-  const { status: code } = await request(io.api, STAGE, "POST", `${repoPath(io)}/issues/${number}/comments`, io.token, { body });
+  const { status: code, value } = await request(io.api, STAGE, "POST", `${repoPath(io)}/issues/${number}/comments`, io.token, { body });
   if (code === 403 || code === 404) {
     io.print(`agent-gh: this run's token may not comment (HTTP ${code}: ${NO_COMMENT}); a later run calls ${owner} in`);
     return;
   }
   if (code < 200 || code >= 300) throw new Failure(STAGE, `HTTP ${code} from POST ${repoPath(io)}/issues/${number}/comments`);
+  // A labeled run has a concurrency group of its own, so another run may have called at the same moment: the earliest call stands, and a later one removes itself unpushed.
+  const id = record(value).id;
+  const calls = (await issueComments(io, STAGE, io.repo, number, `#${number}`)).filter((comment) => called([comment], added.id)).map((comment) => comment.id);
+  if (Number.isSafeInteger(id) && calls.some((other) => other < (id as number))) {
+    await request(io.api, STAGE, "DELETE", `${repoPath(io)}/issues/comments/${id as number}`, io.token);
+    io.print(`agent-gh: another run called ${owner} in on #${number} at the same moment; this run's call is removed`);
+    return;
+  }
   io.print(`agent-gh: called ${owner} in on #${number}: ${ask.line}`);
   await push(io, `${slug(io.repo)}#${number} needs you`, text(issue.html_url), ask.line);
 };
@@ -418,23 +459,46 @@ const defaultHold = async (io: StatusIo): Promise<HoldConfig | undefined> => {
  * `--pr`), or, for a comment on or a label change to an issue, every open
  * pull request here that closes it; for each, derives and sets its statuses.
  * Then, where the config has `hold`, calls the owner in on the thread the
- * event names, if the hold's label is on it. Only runs in that thread's
- * concurrency group call on it, so two runs never post the same call.
+ * event names while the hold's label holds it. A pull request that cannot be
+ * judged is set to error and the rest still settled, the call still made,
+ * before the run fails. A pull request's `labeled` event is passed on, so
+ * the release label's own run can record its release.
  */
 export const statusCommand = async (io: StatusIo, event: { readonly name: string; readonly payload: unknown }, pr: number | undefined): Promise<void> => {
   const target = pr === undefined ? eventTarget(event.name, event.payload) : { pull: pr };
   if (target === undefined) throw new Failure(STAGE, `a ${event.name} event names no pull request; run it from the agent-review workflow's events, or pass --pr N`);
   const numbers = "pull" in target ? [target.pull] : await closingPulls(io, target.issue);
   if (numbers.length === 0) io.print(`agent-gh: no open pull request closes #${"issue" in target ? target.issue : ""}; no status set`);
-  let derived: Derived | undefined;
+  const labeled = pr === undefined && "pull" in target ? labeledEvent(event.payload) : undefined;
+  // One pull request that cannot be judged never leaves the others as they were, nor stops the call: each is settled, and the run fails after.
+  let failure: unknown;
   for (const number of numbers) {
     try {
-      derived = await settle(io, number);
+      await settle(io, number, labeled);
     } catch (error) {
       await withdraw(io, number, error);
-      throw error;
+      failure ??= error;
     }
   }
-  const hold = "pull" in target ? derived?.hold : await defaultHold(io);
-  if (hold !== undefined) await callOwner(io, "pull" in target ? target.pull : target.issue, hold);
+  try {
+    const hold = "pull" in target ? await pullHold(io, target.pull) : await defaultHold(io);
+    if (hold !== undefined) await callOwner(io, "pull" in target ? target.pull : target.issue, hold);
+  } catch (error) {
+    failure ??= error;
+  }
+  if (failure !== undefined) throw failure;
+};
+
+/** The event's own `labeled` change to a pull request, with the head GitHub gave it; undefined for any other event. */
+const labeledEvent = (payload: unknown): LabeledEvent | undefined => {
+  const event = record(payload);
+  const head = text(record(record(event.pull_request).head).sha);
+  const label = text(record(event.label).name);
+  return event.action === "labeled" && /^[0-9a-f]{40}$/.test(head) && label !== "" ? { label, head } : undefined;
+};
+
+/** The hold on an open pull request's base branch's config. */
+const pullHold = async (io: StatusIo, number: number): Promise<HoldConfig | undefined> => {
+  const pr = await pull(io, STAGE, number);
+  return pr.open ? (await readReviewConfig(io, STAGE, pr.base))?.hold : undefined;
 };

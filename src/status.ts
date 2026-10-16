@@ -306,21 +306,24 @@ export const recordFor = (comments: readonly PostedBy[], event: number): Release
   return records.some((entry) => entry.edited) ? "edited" : records[0]?.value;
 };
 
-/**
- * How long after a release its record may first be written: the runs its own
- * event starts write it within a minute or two. A record missing past that
- * (deleted, or never written) is not written afresh, so it cannot be dropped
- * to bind the release to another head.
- */
-export const RECORD_WINDOW_MS = 15 * 60_000;
-
 /** The longest list GitHub gives of a pull request's files; one with more cannot be checked. */
 export const FILES_LISTED = 3000;
+
+/**
+ * The release label's own `labeled` run: the head GitHub gave that event (the
+ * one the person released) and the reserved files' patch id there. Only it
+ * writes a release record, so no later push, rewind, or deleted record can
+ * bind the release to another head.
+ */
+export type ReleaseRun = { readonly head: string; readonly pathsPatchId: string | null };
 
 export type HoldInput = {
   readonly hold: HoldConfig;
   /** Whose pull request: an agent's; a bot's that is no family App (Dependabot, which an agent could merge); or a person's own, which reserved paths do not hold. */
   readonly author: "agent" | "bot" | "person";
+  /** The pull request's number and URL, which its agent-hold status links, so the merge guard reads only its own. */
+  readonly number: number;
+  readonly url: string;
   /** The pull request first, then each issue it closes. */
   readonly threads: readonly HoldThread[];
   /** The pull request's changed files; undefined when it changes more than GitHub lists. */
@@ -328,23 +331,19 @@ export type HoldInput = {
   /** The pull request's comments, which carry the release records. */
   readonly comments: readonly PostedBy[];
   readonly head: string;
-  /** When this run judges it. */
-  readonly now: string;
+  /** Other open pull requests whose head is this one: a status on a commit is theirs too, so none is judged alone. */
+  readonly sharedWith: readonly number[];
   /** The reserved files' patch id at the head now (`ReleaseRecord.paths_patch_id`); undefined when it was not needed. */
   readonly pathsPatchId?: string | null;
-  /**
-   * Whether GitHub Actions set agent-hold on the head before the release,
-   * so the head is one the person could have seen as they released it;
-   * undefined when it was not needed.
-   */
-  readonly headBeforeRelease?: boolean;
+  /** Set only in the release label's own `labeled` run, when no record binds the release yet. */
+  readonly releaseRun?: ReleaseRun;
 };
 
 /** What a release must be checked against: the release, its files, and the record if one binds it (`edited` if one was tampered with). */
 export type HoldNeeds = { readonly release: LabelEvent; readonly names: readonly string[]; readonly record: ReleaseRecord | "edited" | undefined };
 
-/** What holdStatus needs read from git and the head's statuses: undefined when nothing reserved has a release to check. */
-export const holdNeeds = (input: Omit<HoldInput, "pathsPatchId" | "headBeforeRelease">): HoldNeeds | undefined => {
+/** What holdStatus needs read from git: undefined when nothing reserved has a release to check. */
+export const holdNeeds = (input: Omit<HoldInput, "pathsPatchId" | "releaseRun">): HoldNeeds | undefined => {
   if (input.author === "person" || input.files === undefined) return undefined;
   const pr = input.threads[0];
   const release = pr === undefined ? undefined : personRelease(pr.labels, pr.events, input.hold.releaseLabel);
@@ -353,59 +352,56 @@ export const holdNeeds = (input: Omit<HoldInput, "pathsPatchId" | "headBeforeRel
   return { release, names, record: recordFor(input.comments, release.id) };
 };
 
-const holdStatusOf = (state: Status["state"], description: string): Status => ({ context: HOLD_CONTEXT, state, description: statusDescription(description), targetUrl: undefined });
-
 /**
- * agent-hold for a pull request's head, and the release record to write when
- * this run is the first to see a person's release. In order:
+ * agent-hold for a pull request's head, and the release record to write in
+ * the release's own run. In order:
+ * - held while its head is another open pull request's too, since the status
+ *   on that commit is theirs as well;
  * - held while the hold's label holds the pull request or an issue it closes
  *   (`labelHold`), whoever wrote it, until a person adds the release label;
  * - not held, for a person's own pull request;
  * - held when it changes more files than GitHub lists, which cannot be
  *   checked;
  * - held while it touches a reserved file, until a person adds the release
- *   label, which binds to the reserved files' diff at the head then: a
- *   change to that diff holds it again. A release first seen on a head
- *   pushed after it (no agent-hold set on it before), or more than
- *   RECORD_WINDOW_MS after it, binds nothing, nor does an edited record.
+ *   label. The release label's own run binds the release to the reserved
+ *   files' diff at the head GitHub gave that event (`ReleaseRun`), and a
+ *   change to that diff holds it again. A release no run recorded, or whose
+ *   record was edited, binds nothing.
  */
 export const holdStatus = (input: HoldInput): { readonly status: Status; readonly record?: ReleaseRecord } => {
   const { hold } = input;
+  const of = (state: Status["state"], description: string): Status => ({ context: HOLD_CONTEXT, state, description: statusDescription(description), targetUrl: input.url });
+  const held = (description: string) => ({ status: of("failure", description) });
+  if (input.sharedWith.length > 0) return held(`held: ${input.head.slice(0, 8)} is also the head of ${input.sharedWith.map((number) => `#${number}`).join(", ")}, so neither is judged alone`);
   const pr = input.threads[0];
   const prRelease = pr === undefined ? undefined : personRelease(pr.labels, pr.events, hold.releaseLabel);
-  const holds = input.threads.map((thread) => ({ thread, held: labelHold(thread, hold, prRelease) }));
-  const on = holds.find((entry) => entry.held === "on");
-  if (on !== undefined) return { status: holdStatusOf("failure", `held: \`${hold.label}\` on ${on.thread.ref}: ${on.thread.ask ?? NO_ASK}`) };
-  const removed = holds.find((entry) => entry.held === "removed");
-  if (removed !== undefined) return { status: holdStatusOf("failure", `held: \`${hold.label}\` came off ${removed.thread.ref}, which releases nothing; a person adds \`${hold.releaseLabel}\``) };
-  if (input.author === "person") return { status: holdStatusOf("success", "not an agent PR") };
-  if (input.files === undefined) return { status: holdStatusOf("failure", `held: lists over ${FILES_LISTED.toLocaleString("en-US")} files, too many to check`) };
+  const holds = input.threads.map((thread) => ({ thread, state: labelHold(thread, hold, prRelease) }));
+  const on = holds.find((entry) => entry.state === "on");
+  if (on !== undefined) return held(`held: \`${hold.label}\` on ${on.thread.ref}: ${on.thread.ask ?? NO_ASK}`);
+  const removed = holds.find((entry) => entry.state === "removed");
+  if (removed !== undefined) return held(`held: \`${hold.label}\` came off ${removed.thread.ref}, which releases nothing; a person adds \`${hold.releaseLabel}\``);
+  if (input.author === "person") return { status: of("success", "not an agent PR") };
+  if (input.files === undefined) return held(`held: lists over ${FILES_LISTED.toLocaleString("en-US")} files, too many to check`);
   const reserved = reservedFiles(input.files, hold.paths);
-  if (reserved.files.length === 0) return { status: holdStatusOf("success", "not held") };
+  if (reserved.files.length === 0) return { status: of("success", "not held") };
   const needs = holdNeeds(input);
   if (needs === undefined) {
     const [first, ...rest] = reserved.files;
     const patterns = reserved.patterns.map((pattern) => `\`${pattern}\``).join(", ");
-    return { status: holdStatusOf("failure", `held: touches ${patterns} (${first}${rest.length === 0 ? "" : ` and ${rest.length} more`}); John adds \`${hold.releaseLabel}\``) };
+    return held(`held: touches ${patterns} (${first}${rest.length === 0 ? "" : ` and ${rest.length} more`}); John adds \`${hold.releaseLabel}\``);
   }
   const { release, record: bound } = needs;
   const again = `John adds \`${hold.releaseLabel}\` again`;
-  if (bound === "edited") return { status: holdStatusOf("failure", `held: the record of ${release.actor}'s release was edited; ${again}`) };
-  if (bound === undefined && Date.parse(input.now) - Date.parse(release.at) > RECORD_WINDOW_MS) return { status: holdStatusOf("failure", `held: no record of ${release.actor}'s release; ${again}`) };
+  if (bound === "edited") return held(`held: the record of ${release.actor}'s release was edited; ${again}`);
+  const binding = bound ?? (input.releaseRun === undefined ? undefined : { v: 1 as const, event: release.id, by: release.actor, head: input.releaseRun.head, paths_patch_id: input.releaseRun.pathsPatchId });
+  if (binding === undefined) return held(`held: ${release.actor}'s release is not recorded yet; if this stays, ${again}`);
   // Never released on a guess: what this needs and was not given holds it.
-  if (input.pathsPatchId === undefined) return { status: holdStatusOf("failure", "held: the reserved paths' diff was not read; rerun the workflow") };
-  if (bound !== undefined) {
-    return bound.paths_patch_id === input.pathsPatchId
-      ? { status: holdStatusOf("success", `released by ${bound.by} at ${bound.head.slice(0, 8)}`) }
-      : { status: holdStatusOf("failure", `held: reserved paths changed since ${bound.by} released at ${bound.head.slice(0, 8)}; John adds \`${hold.releaseLabel}\` again`) };
-  }
-  if (input.headBeforeRelease !== true) {
-    return { status: holdStatusOf("failure", `held: ${input.head.slice(0, 8)} was pushed after ${release.actor}'s release; John adds \`${hold.releaseLabel}\` again`) };
-  }
-  return {
-    status: holdStatusOf("success", `released by ${release.actor} at ${input.head.slice(0, 8)}`),
-    record: { v: 1, event: release.id, by: release.actor, head: input.head, paths_patch_id: input.pathsPatchId },
-  };
+  if (input.pathsPatchId === undefined) return held("held: the reserved paths' diff was not read; rerun the workflow");
+  const status =
+    binding.paths_patch_id === input.pathsPatchId
+      ? of("success", `released by ${binding.by} at ${binding.head.slice(0, 8)}`)
+      : of("failure", `held: reserved paths changed since ${binding.by} released at ${binding.head.slice(0, 8)}; ${again}`);
+  return bound === undefined ? { status, record: binding } : { status };
 };
 
 // --- Calling John in when the hold's label goes on ---

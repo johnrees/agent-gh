@@ -170,20 +170,21 @@ test("with no Queue configured, next falls back to the ready issues and says so"
   expect(nextJson(REPO, result).queue).toBeNull();
 });
 
-test("where the config has hold, its label joins queue.skip_labels: next skips an issue carrying it, which still blocks what waits on it", async () => {
+test("where the config has hold, next skips an issue carrying its label, in any case, which still blocks what waits on it", async () => {
   const routes = (hold: unknown, queue?: unknown) => ({
     ...BASE,
     "repos/johnrees/widget/contents/.github/agent-review.json?ref=main": config({ reviewers: { codex: { model: "m" } }, status_writer: "actions", hold, ...(queue === undefined ? {} : { queue }) }),
-    "repos/johnrees/widget/issues?state=open&labels=ready": [issue(2, ["ready", "needs-human"]), issue(8, ["ready"]), issue(9, ["ready", "ask-john"])],
-    "repos/johnrees/widget/issues/8/dependencies/blocked_by": [issue(2, ["ready", "needs-human"])],
+    "repos/johnrees/widget/issues?state=open&labels=ready": [issue(2, ["ready", "Needs-Human"]), issue(8, ["ready"]), issue(9, ["ready", "ask-john"])],
+    "repos/johnrees/widget/issues/8/dependencies/blocked_by": [issue(2, ["ready", "Needs-Human"])],
   });
   const held = await nextIssues(REPO, reader(routes({})).read);
-  expect(held.config.skipLabels).toEqual(["needs-human"]);
+  expect(held.config.holdLabel).toBe("needs-human");
   expect(held.waves.map((wave) => wave.map((item) => [item.issue, item.state]))).toEqual([[[2, "skipped"], [9, "workable"]], [[8, "waiting"]]]);
   const notes: string[] = [];
   expect(nextLines(held, (line) => notes.push(line))).toEqual(["#9 T9"]);
-  expect(notes).toContain("agent-gh: skipped #2 T2: carries needs-human (queue.skip_labels)");
-  expect((await queueConfig(REPO, reader(routes({ label: "ask-john" }, { skip_labels: ["model:redteam"] })).read)).skipLabels).toEqual(["ask-john", "model:redteam"]);
+  expect(notes).toContain("agent-gh: skipped #2 T2: carries Needs-Human (hold.label)");
+  expect(await queueConfig(REPO, reader(routes({ label: "ask-john" }, { skip_labels: ["model:redteam"] })).read)).toMatchObject({ skipLabels: ["model:redteam"], holdLabel: "ask-john" });
+  expect(nextLines(await nextIssues(REPO, reader(routes({ label: "ask-john" }, { skip_labels: ["model:redteam"] })).read), () => {})).toEqual(["#2 T2"]);
   // Without hold, the label means nothing to next.
   const { read } = reader({ ...routes({}), "repos/johnrees/widget/contents/.github/agent-review.json?ref=main": config({ reviewers: { codex: { model: "m" } } }) });
   expect(nextLines(await nextIssues(REPO, read), () => {})).toEqual(["#2 T2", "#9 T9"]);

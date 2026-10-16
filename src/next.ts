@@ -14,7 +14,7 @@
  */
 import type { Claim } from "./claim.ts";
 import { Failure } from "./failure.ts";
-import { labelMatches } from "./review.ts";
+import { labelMatches, sameLabel } from "./review.ts";
 
 /** The label filters of one call: patterns as `labelMatches` reads them, `*` matching any run of characters. */
 export type LabelRules = {
@@ -26,6 +26,8 @@ export type LabelRules = {
   readonly fit: readonly string[];
   /** `queue.skip_labels`, applied like `skip` and named for it in the reason. */
   readonly configured?: readonly string[];
+  /** `hold.label`, where the config has `hold`: an issue carrying it, in any case (GitHub's labels ignore it), waits for John. */
+  readonly held?: string;
 };
 
 export const NO_RULES: LabelRules = { skip: [], require: [], fit: [] };
@@ -47,10 +49,12 @@ export const skippedText = (by: SkippedBy): string => `${by.label === null ? `la
 
 /**
  * Why a picker leaves out an issue with these labels, or undefined to keep
- * it. Checked in order: `queue.skip_labels`, `--skip-label`,
+ * it. Checked in order: `hold.label`, `queue.skip_labels`, `--skip-label`,
  * `--require-label`, `--fit-label`. Throws on a fit pattern with no `:`.
  */
 export const labelFilter = (labels: readonly string[], rules: LabelRules): SkippedBy | undefined => {
+  const waiting = rules.held === undefined ? undefined : labels.find((label) => sameLabel(label, rules.held as string));
+  if (waiting !== undefined) return { rule: "hold.label", pattern: rules.held as string, label: waiting };
   const skips = [...(rules.configured ?? []).map((pattern) => ({ rule: "queue.skip_labels", pattern })), ...rules.skip.map((pattern) => ({ rule: "--skip-label", pattern }))];
   for (const { rule, pattern } of skips) {
     const label = labels.find((candidate) => labelMatches(pattern, candidate));

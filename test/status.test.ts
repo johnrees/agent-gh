@@ -297,8 +297,15 @@ type Scenario = {
   closingTotal?: number;
   /** Pages of the pull requests that close issue #7 (#12 is on the last). */
   closingPages?: number;
-  /** When the run judges it (two minutes after LABELED unless given). */
-  now?: string;
+  /** The merge bases of heads other than the current one, by head. */
+  mergeBases?: Record<string, string>;
+  /** A second open pull request that closes issue #7, closed by the time it is read; and #12's files failing to read. */
+  alsoClosing?: boolean;
+  filesFail?: boolean;
+  /** Other open pull requests whose head is this one's. */
+  sharedWith?: number[];
+  /** Another run's call for the same event, posted the moment this run posts its own. */
+  callRace?: unknown;
 };
 
 /** The secret part of the NTFY_URL secret, which no printed line may show. */
@@ -310,8 +317,9 @@ const statusWorld = (scenario: Scenario) => {
   const issueComments = [...(scenario.issueComments ?? [])];
   const configRefs: string[] = [];
   const posting = (thread: unknown[], number: number) => (body: string) => {
+    if (scenario.callRace !== undefined && body.includes("agent-hold-call")) thread.push(scenario.callRace);
     thread.push({ id: 5000 + thread.length, user: { login: "github-actions[bot]", type: "Bot" }, performed_via_github_app: { id: 15368 }, created_at: "2026-10-11T12:01:00Z", updated_at: "2026-10-11T12:01:00Z", html_url: `https://github.com/johnrees/widget/issues/${number}#c`, body: (JSON.parse(body) as { body: string }).body });
-    return reply(201, {});
+    return reply(201, { id: 5000 + thread.length - 1 });
   };
   const config = (ref: string | null) => ({
     reviewers: { codex: { model: "m" } }, status_writer: "actions",
@@ -328,11 +336,15 @@ const statusWorld = (scenario: Scenario) => {
     [`GET ${REPO}/issues/12`]: () => reply(200, { performed_via_github_app: null, labels: labels.map((name) => ({ name })), html_url: "https://github.com/johnrees/widget/pull/12" }),
     [`GET ${REPO}/issues/7`]: () => reply(200, { labels: (scenario.issueLabels ?? []).map((name) => ({ name })), html_url: "https://github.com/johnrees/widget/issues/7" }),
     [`GET ${REPO}/issues/7/events`]: () => reply(200, scenario.issueEvents ?? []),
+    [`GET ${REPO}/pulls/13`]: () => reply(200, { state: "closed", head: { sha: head }, base: { ref: "main" }, labels: [], user: author }),
     [`GET ${REPO}/pulls/12/files`]: (_, url) => {
+      if (scenario.filesFail === true) return reply(502, {});
       const at = (Number(url.searchParams.get("page") ?? 1) - 1) * 100;
       return reply(200, files.slice(at, at + 100));
     },
     [`POST ${REPO}/issues/12/comments`]: posting(comments, 12),
+    [`GET ${REPO}/commits/${head}/pulls`]: () => reply(200, [{ number: 12, state: "open", head: { sha: head } }, ...(scenario.sharedWith ?? []).map((number) => ({ number, state: "open", head: { sha: head } })), { number: 3, state: "closed", head: { sha: head } }]),
+    ...Object.fromEntries(Array.from({ length: 4 }, (_, n) => [`DELETE ${REPO}/issues/comments/${5000 + n}`, () => new Response(null, { status: 204 })])),
     [`POST ${REPO}/issues/7/comments`]: posting(issueComments, 7),
     [`POST /ntfy/${TOPIC}`]: () => (scenario.ntfy === "fails" ? reply(500, {}) : reply(200, {})),
     [`GET ${REPO}/pulls/12/commits`]: (_, url) => {
@@ -348,6 +360,7 @@ const statusWorld = (scenario: Scenario) => {
     },
     [`GET ${REPO}/issues/7/comments`]: () => reply(200, issueComments),
     [`GET ${REPO}/compare/main...${head}`]: () => reply(200, { merge_base_commit: { sha: scenario.mergeBase } }),
+    ...Object.fromEntries(Object.entries(scenario.mergeBases ?? {}).map(([other, base]) => [`GET ${REPO}/compare/main...${other}`, () => reply(200, { merge_base_commit: { sha: base } })])),
     [`GET ${REPO}/commits/${head}/statuses`]: () => reply(200, combined),
     [`POST ${REPO}/statuses/${head}`]: () => reply(scenario.statusReply ?? 201, {}),
     "POST /graphql": (body) =>
@@ -356,7 +369,7 @@ const statusWorld = (scenario: Scenario) => {
         : body.includes("closedByPullRequestsReferences")
         ? (JSON.parse(body).variables.after === null && scenario.closingPages === 2
             ? reply(200, { data: { repository: { issue: { closedByPullRequestsReferences: { pageInfo: { hasNextPage: true, endCursor: "c1" }, nodes: [{ number: 99, repository: { nameWithOwner: "other/repo" } }] } } } } })
-            : reply(200, { data: { repository: { issue: { closedByPullRequestsReferences: { pageInfo: { hasNextPage: false, endCursor: "c2" }, nodes: [{ number: 12, repository: { nameWithOwner: "johnrees/widget" } }, { number: 99, repository: { nameWithOwner: "other/repo" } }] } } } } }))
+            : reply(200, { data: { repository: { issue: { closedByPullRequestsReferences: { pageInfo: { hasNextPage: false, endCursor: "c2" }, nodes: [{ number: 12, repository: { nameWithOwner: "johnrees/widget" } }, ...(scenario.alsoClosing === true ? [{ number: 13, repository: { nameWithOwner: "johnrees/widget" } }] : []), { number: 99, repository: { nameWithOwner: "other/repo" } }] } } } } }))
         : reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { totalCount: scenario.closingTotal ?? 1, nodes: [{ number: 7, repository: { nameWithOwner: "johnrees/widget" } }] } } } } }),
   });
   stops.push(fake.stop);
@@ -369,7 +382,6 @@ const statusWorld = (scenario: Scenario) => {
     token: "ghs_actions",
     repo: { owner: "johnrees", name: "widget" },
     remote: scenario.remote ?? "file:///nowhere",
-    now: () => Date.parse(scenario.now ?? "2026-10-11T12:02:00Z"),
     ntfyUrl: scenario.ntfy === undefined ? undefined : scenario.ntfy === "unreachable" ? `http://127.0.0.1:1/${TOPIC}` : `${fake.api.base}/ntfy/${TOPIC}`,
     git: async (args, input) => {
       gitCalls.push(args.join(" "));
@@ -579,6 +591,8 @@ test("the reusable workflow is a workflow_call that sets the statuses with GITHU
   expect(job.steps.at(-1).env.AGENT_GH_NTFY_URL).toBe("${{ secrets.NTFY_URL }}");
   expect(JSON.stringify(job.steps.slice(0, -1))).not.toContain("NTFY_URL");
   expect(job.concurrency.group).toContain("github.event.pull_request.number || github.event.issue.number");
+  // A label's run is never cancelled by a later event: a release is recorded only in its own run.
+  expect(job.concurrency.group).toContain("github.event.action == 'labeled' && format('labeled-{0}', github.run_id) ||");
   expect(job.concurrency["cancel-in-progress"]).toBe(true);
   const steps = JSON.stringify(job.steps);
   expect(steps).not.toContain("actions/checkout");
@@ -613,9 +627,10 @@ const PERSON = { login: "johnrees", type: "User" };
 const labelEvent = (id: number, event: "labeled" | "unlabeled", name: string, app: number | null, at: string, actor: { login: string; type: string } = PERSON) => ({
   id, event, label: { name }, actor, performed_via_github_app: app === null ? null : { id: app }, created_at: at,
 });
+const PR_URL = "https://github.com/johnrees/widget/pull/12";
 const thread = (ref: string, labels: string[], events: unknown[], ask?: string): HoldThread => ({ ref, labels, events: labelEvents(events), ...(ask === undefined ? {} : { ask }) });
 const holdInput = (overrides: Partial<Parameters<typeof holdStatus>[0]> = {}): Parameters<typeof holdStatus>[0] => ({
-  hold: HOLD, author: "agent", threads: [thread("#12", [], [])], files: [{ name: "src/a.ts", previous: undefined }], comments: [], head: A, now: minutes(2), ...overrides,
+  hold: HOLD, author: "agent", number: 12, url: PR_URL, threads: [thread("#12", [], [])], files: [{ name: "src/a.ts", previous: undefined }], comments: [], head: A, sharedWith: [], ...overrides,
 });
 const description = (overrides: Partial<Parameters<typeof holdStatus>[0]>) => {
   const { status } = holdStatus(holdInput(overrides));
@@ -624,7 +639,10 @@ const description = (overrides: Partial<Parameters<typeof holdStatus>[0]>) => {
 const file = (name: string, previous?: string) => ({ name, previous });
 
 test("the hold's label holds while it is on the pull request or an issue it closes, and once gone until a person adds the release label: no removal releases it", () => {
-  expect(holdStatus(holdInput())).toEqual({ status: { context: "agent-hold", state: "success", description: "not held", targetUrl: undefined } });
+  // Each agent-hold links its pull request, so the merge guard reads only its own.
+  expect(holdStatus(holdInput())).toEqual({ status: { context: "agent-hold", state: "success", description: "not held", targetUrl: PR_URL } });
+  // A head that is another open pull request's too is held: the status on that commit is theirs as well.
+  expect(description({ sharedWith: [13] })).toBe("failure: held: aaaaaaaa is also the head of #13, so neither is judged alone");
   const added = labelEvent(1, "labeled", "needs-human", CLAUDE, minutes(0));
   expect(description({ threads: [thread("#12", ["needs-human"], [added], "Drop the v1 schema?")] })).toBe("failure: held: `needs-human` on #12: Drop the v1 schema?");
   expect(description({ threads: [thread("#12", [], []), thread("#7", ["Needs-Human"], [added], "Which API?")] })).toBe("failure: held: `needs-human` on #7: Which API?");
@@ -671,35 +689,38 @@ test("a reserved path holds a pull request, by its current name or a rename's ol
   expect(description({ files: schema, threads: [byApp] })).toContain("held: touches `schema/**`");
 });
 
-test("a person's path release binds to the reserved files' diff at the head: the same diff stays released, a changed one is held again, and only GitHub Actions' first record counts", () => {
+test("a person's path release binds, in the release label's own run, to the reserved files' diff at the head GitHub gave that event; only GitHub Actions' first unedited record counts", () => {
   const P1 = "1".repeat(40);
   const P2 = "2".repeat(40);
   const release = labelEvent(501, "labeled", "human-approved", null, LABELED);
   const released = thread("#12", ["human-approved"], [release]);
   const files = [file("schema/a.json")];
-  const first = holdStatus(holdInput({ files, threads: [released], pathsPatchId: P1, headBeforeRelease: true }));
+  // The release's own run writes the record for the head its event gave (B), whatever the head is by then (A).
+  const first = holdStatus(holdInput({ files, threads: [released], pathsPatchId: P1, releaseRun: { head: B, pathsPatchId: P1 } }));
   expect(first).toEqual({
-    status: { context: "agent-hold", state: "success", description: "released by johnrees at aaaaaaaa", targetUrl: undefined },
-    record: { v: 1, event: 501, by: "johnrees", head: A, paths_patch_id: P1 },
+    status: { context: "agent-hold", state: "success", description: "released by johnrees at bbbbbbbb", targetUrl: PR_URL },
+    record: { v: 1, event: 501, by: "johnrees", head: B, paths_patch_id: P1 },
+  });
+  // Pushed or rewound to another reserved diff before the record was written: recorded as released, held all the same.
+  expect(holdStatus(holdInput({ files, threads: [released], pathsPatchId: P2, releaseRun: { head: B, pathsPatchId: P1 } }))).toMatchObject({
+    status: { state: "failure", description: "held: reserved paths changed since johnrees released at bbbbbbbb; John adds `human-approved` again" },
+    record: { head: B, paths_patch_id: P1 },
   });
   const record = { author: "github-actions[bot]", body: `johnrees's release\n\n${releaseMarker(first.record as NonNullable<typeof first.record>)}` };
-  expect(holdStatus(holdInput({ files, threads: [released], comments: [record], head: B, pathsPatchId: P1 }))).toEqual({ status: { context: "agent-hold", state: "success", description: "released by johnrees at aaaaaaaa", targetUrl: undefined } });
-  expect(description({ files, threads: [released], comments: [record], head: B, pathsPatchId: P2 })).toBe("failure: held: reserved paths changed since johnrees released at aaaaaaaa; John adds `human-approved` again");
+  expect(holdStatus(holdInput({ files, threads: [released], comments: [record], head: C, pathsPatchId: P1 }))).toEqual({ status: { context: "agent-hold", state: "success", description: "released by johnrees at bbbbbbbb", targetUrl: PR_URL } });
+  expect(description({ files, threads: [released], comments: [record], head: C, pathsPatchId: P2 })).toBe("failure: held: reserved paths changed since johnrees released at bbbbbbbb; John adds `human-approved` again");
   // A later record, or anyone else's, never rebinds the release.
-  const forged = (author: string) => ({ author, body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: B, paths_patch_id: P2 }) });
-  expect(description({ files, threads: [released], comments: [record, forged("github-actions[bot]")], head: B, pathsPatchId: P2 })).toContain("reserved paths changed since");
+  const forged = (author: string) => ({ author, body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: C, paths_patch_id: P2 }) });
+  expect(description({ files, threads: [released], comments: [record, forged("github-actions[bot]")], head: C, pathsPatchId: P2 })).toContain("reserved paths changed since");
   expect(holdNeeds(holdInput({ files, threads: [released], comments: [forged("johnrees")] }))?.record).toBeUndefined();
-  expect(holdNeeds(holdInput({ files, threads: [released], comments: [forged("github-actions[bot]")] }))?.record).toMatchObject({ head: B });
+  expect(holdNeeds(holdInput({ files, threads: [released], comments: [forged("github-actions[bot]")] }))?.record).toMatchObject({ head: C });
   // Anyone with write access can edit the bot's comment, its author unchanged (checked live): an edited record holds it.
-  expect(description({ files, threads: [released], comments: [{ ...record, edited: true }], head: B, pathsPatchId: P1 })).toBe("failure: held: the record of johnrees's release was edited; John adds `human-approved` again");
-  expect(description({ files, threads: [released], comments: [record, { ...forged("github-actions[bot]"), edited: true }], head: B, pathsPatchId: P1 })).toContain("was edited");
-  // A record missing well after the release (deleted, or never written) is not written afresh on whatever head is there now.
-  expect(description({ files, threads: [released], pathsPatchId: P1, headBeforeRelease: true, now: minutes(16) })).toBe("failure: held: no record of johnrees's release; John adds `human-approved` again");
-  expect(holdStatus(holdInput({ files, threads: [released], pathsPatchId: P1, headBeforeRelease: true, now: minutes(14) })).record).toBeDefined();
-  // A head first seen after the release is not one the person released.
-  expect(description({ files, threads: [released], pathsPatchId: P1, headBeforeRelease: false })).toBe("failure: held: aaaaaaaa was pushed after johnrees's release; John adds `human-approved` again");
+  expect(description({ files, threads: [released], comments: [{ ...record, edited: true }], head: C, pathsPatchId: P1 })).toBe("failure: held: the record of johnrees's release was edited; John adds `human-approved` again");
+  expect(description({ files, threads: [released], comments: [record, { ...forged("github-actions[bot]"), edited: true }], head: C, pathsPatchId: P1 })).toContain("was edited");
+  // No record, outside the release's own run (deleted, or that run failed): nothing binds, whatever the head.
+  expect(description({ files, threads: [released], pathsPatchId: P1 })).toBe("failure: held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again");
   // What was not read is never taken as released.
-  expect(description({ files, threads: [released] })).toBe("failure: held: the reserved paths' diff was not read; rerun the workflow");
+  expect(description({ files, threads: [released], comments: [record] })).toBe("failure: held: the reserved paths' diff was not read; rerun the workflow");
 });
 
 test("the ask is the newest agent comment in the 15 minutes before the label, its first line without markers, inert, and at most 200 characters", () => {
@@ -763,7 +784,7 @@ test("the workflow sets agent-hold from the base branch's hold, never the pull r
   expect((await deriveStatuses(statusWorld({ head: A, mergeBase: B, hold: { paths: ["schema/**"] }, changedFiles: 3001 }).io, 12))?.statuses[2]).toMatchObject({ description: "held: lists over 3,000 files, too many to check" });
 });
 
-test("against real git, a person's release survives a rebase that leaves the reserved diff as it was, and a change to it holds the pull request again", async () => {
+test("against real git, a person's release binds to the head its event gave, survives a rebase that leaves the reserved diff as it was, and a change to it holds the pull request again", async () => {
   const repo = history();
   const remote = `file://${repo.dir}`;
   // head4 changes the reserved a.txt further; head5 changes only b.txt, which is not reserved.
@@ -777,19 +798,26 @@ test("against real git, a person's release survives a rebase that leaves the res
   const head4 = amend(repo.head2, "more", "a.txt", `${["changed", "also changed", ...lines.slice(2)].join("\n")}\n`);
   const head5 = amend(repo.head2, "other", "b.txt", "b3\n");
   const release = labelEvent(501, "labeled", "human-approved", null, LABELED);
-  const seen = { context: "agent-hold", state: "failure", description: "held: touches `a.txt` (a.txt); John adds `human-approved`", creator: { login: "github-actions[bot]" }, created_at: minutes(-30) };
   const world = (head: string, mergeBase: string, extra: Partial<Scenario> = {}) => {
     repo.git(["update-ref", "refs/pull/12/head", head]);
     return statusWorld({ head, mergeBase, remote, hold: { paths: ["a.txt"] }, labels: ["human-approved"], events: [release], files: [{ filename: "a.txt" }], ...extra });
   };
   const hold = async (w: ReturnType<typeof statusWorld>) => (await deriveStatuses(w.io, 12))?.statuses[2];
-
-  // The first run to see the release records it as github-actions[bot], then passes agent-hold; the run after it finds the record.
-  const first = world(repo.head1, repo.mb1, { combined: [seen] });
-  await statusCommand(first.io, { name: "pull_request_target", payload: { action: "labeled", pull_request: { number: 12 } } }, undefined);
+  const releasedAt = (head: string) => ({ name: "pull_request_target", payload: { action: "labeled", label: { name: "human-approved" }, pull_request: { number: 12, head: { sha: head } } } });
   const { patchId } = await pullDiff(repo.io, repo.mb1, repo.head1, ["a.txt"]);
-  expect(first.commented(12)).toEqual([expect.stringContaining(releaseMarker({ v: 1, event: 501, by: "johnrees", head: repo.head1, paths_patch_id: patchId }))]);
-  expect(first.posted().find((status) => status.context === "agent-hold")).toEqual({ state: "success", context: "agent-hold", description: `released by johnrees at ${repo.head1.slice(0, 8)}` });
+
+  // John releases head1; by the time the release's own run reads the pull request, an agent has pushed head4, another reserved diff.
+  // The run binds the release to head1, the head GitHub gave the event, and holds head4.
+  const raced = world(head4, repo.mb2, { mergeBases: { [repo.head1]: repo.mb1 } });
+  await statusCommand(raced.io, releasedAt(repo.head1), undefined);
+  expect(raced.commented(12)).toEqual([expect.stringContaining(releaseMarker({ v: 1, event: 501, by: "johnrees", head: repo.head1, paths_patch_id: patchId }))]);
+  expect(raced.posted().find((status) => status.context === "agent-hold")).toMatchObject({ state: "failure", description: `held: reserved paths changed since johnrees released at ${repo.head1.slice(0, 8)}; John adds \`human-approved\` again` });
+
+  // With head1 still the head, the release's run records it and passes agent-hold; the re-derivation after finds the record.
+  const first = world(repo.head1, repo.mb1);
+  await statusCommand(first.io, releasedAt(repo.head1), undefined);
+  expect(first.commented(12)).toHaveLength(1);
+  expect(first.posted().find((status) => status.context === "agent-hold")).toEqual({ state: "success", context: "agent-hold", description: `released by johnrees at ${repo.head1.slice(0, 8)}`, target_url: "https://github.com/johnrees/widget/pull/12" });
   const recorded = first.comments;
 
   // A rebase over base changes to other files, or a new commit to an unreserved file: the reserved diff is the same, so still released.
@@ -804,9 +832,13 @@ test("against real git, a person's release survives a rebase that leaves the res
   const { patchId: changedId } = await pullDiff(repo.io, repo.mb2, head4, ["a.txt"]);
   const forge = (login: string) => ({ id: 9000, user: { login }, created_at: minutes(10), updated_at: minutes(10), body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: head4, paths_patch_id: changedId }) });
   expect(await hold(world(head4, repo.mb2, { comments: [...recorded, forge("github-actions[bot]")] }))).toMatchObject({ state: "failure" });
-  // A record anyone else posts counts for nothing; and a head GitHub Actions had not seen before the release is not released.
-  expect(await hold(world(head4, repo.mb2, { comments: [forge("johnrees")] }))).toMatchObject({ state: "failure", description: `held: ${head4.slice(0, 8)} was pushed after johnrees's release; John adds \`human-approved\` again` });
-  expect(await hold(world(head4, repo.mb2, { comments: [forge("johnrees")], combined: [{ ...seen, created_at: minutes(1) }] }))).toMatchObject({ state: "failure" });
+  // A record anyone else posts counts for nothing; and with the record gone, no run but the release's own binds it, whatever the head.
+  expect(await hold(world(head4, repo.mb2, { comments: [forge("johnrees")] }))).toMatchObject({ state: "failure", description: "held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again" });
+  expect(await hold(world(repo.head1, repo.mb1))).toMatchObject({ state: "failure", description: "held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again" });
+  // Another label's event is no release's run.
+  const other = world(repo.head1, repo.mb1);
+  await statusCommand(other.io, { name: "pull_request_target", payload: { action: "labeled", label: { name: "bug" }, pull_request: { number: 12, head: { sha: repo.head1 } } } }, undefined);
+  expect(other.commented(12)).toEqual([]);
 }, 30_000);
 
 /** An agent's comment on #12, posted as `owner` through Claude's App. */
@@ -893,6 +925,36 @@ test("a label on a plain issue calls the owner in there and holds every open pul
   await statusCommand(paged.io, { name: "issues", payload: { action: "labeled", issue: { number: 7 } } }, undefined);
   expect(paged.posted().find((status) => status.context === "agent-hold")).toMatchObject({ state: "failure" });
   expect(paged.fake.log.filter((entry) => entry.body.includes("closedByPullRequestsReferences")).map((entry) => JSON.parse(entry.body).variables.after)).toEqual([null, "c1"]);
+});
+
+test("a head another open pull request shares is held: the status on that commit is theirs too", async () => {
+  const w = statusWorld({ head: A, mergeBase: B, hold: {}, sharedWith: [13] });
+  expect((await deriveStatuses(w.io, 12))?.statuses[2]).toEqual({ context: "agent-hold", state: "failure", description: "held: aaaaaaaa is also the head of #13, so neither is judged alone", targetUrl: "https://github.com/johnrees/widget/pull/12" });
+  expect((await deriveStatuses(statusWorld({ head: A, mergeBase: B, hold: {} }).io, 12))?.statuses[2]).toMatchObject({ state: "success", description: "not held" });
+});
+
+test("two runs that call the owner in at once leave one call: the later removes itself and pushes nothing", async () => {
+  const added = labelEvent(900, "labeled", "needs-human", CLAUDE, LABELED);
+  const theirs = { id: 4000, user: { login: "github-actions[bot]" }, created_at: minutes(1), updated_at: minutes(1), body: callMarker({ v: 1, event: 900 }) };
+  const w = statusWorld({ head: A, mergeBase: B, hold: {}, labels: ["needs-human"], events: [added], ntfy: "ok", callRace: theirs });
+  await statusCommand(w.io, LABELED_EVENT, undefined);
+  expect(w.commented(12)).toHaveLength(1);
+  expect(w.fake.log.filter((entry) => entry.method === "DELETE").map((entry) => entry.path)).toEqual([`${REPO}/issues/comments/5001`]);
+  expect(w.pushes()).toEqual([]);
+  expect(w.printed).toContain("agent-gh: another run called johnrees in on #12 at the same moment; this run's call is removed");
+});
+
+test("one pull request an issue's label reaches that cannot be judged is set to error, the rest are still settled, the owner is still called, and the run fails", async () => {
+  const w = statusWorld({
+    head: A, mergeBase: B, hold: { paths: ["schema/**"] }, filesFail: true, alsoClosing: true, ntfy: "ok",
+    issueLabels: ["needs-human"], issueEvents: [labelEvent(80, "labeled", "needs-human", CLAUDE, LABELED)],
+  });
+  let refusal = "";
+  await statusCommand(w.io, { name: "issues", payload: { action: "labeled", issue: { number: 7 } } }, undefined).catch((error: Error) => (refusal = error.message));
+  expect(refusal).toContain("HTTP 502 from GET /repos/johnrees/widget/pulls/12/files");
+  expect(w.posted().map((status) => [status.context, status.state])).toEqual([["agent-review", "error"], ["agent-threads", "error"], ["agent-hold", "error"]]);
+  expect(w.printed).toContain("agent-gh: #13 is closed; no status set");
+  expect(w.commented(7)).toHaveLength(1);
 });
 
 test("a run that cannot derive agent-hold sets it to error with the others, and a pull request closing more issues than GitHub lists cannot be read", async () => {

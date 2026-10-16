@@ -185,7 +185,6 @@ const statusIo = (env: NodeJS.ProcessEnv, repo: Repo, token: string): StatusIo =
     repo,
     remote: `https://github.com/${slug(repo)}.git`,
     ntfyUrl: env.AGENT_GH_NTFY_URL,
-    now: () => Date.now(),
     git: async (args, input) => {
       const child = Bun.spawn(["git", ...args], { cwd: dir, env: gitEnv, stdin: input === undefined ? "ignore" : new Blob([input]), stdout: "pipe", stderr: "ignore" });
       const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);

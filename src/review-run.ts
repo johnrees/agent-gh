@@ -343,22 +343,29 @@ export const ACTIONS_APP = 15368;
 /**
  * Why the hold refuses a merge of `pr`, if it does: where the base branch's
  * config has `hold`, agent-hold must be `success` on the head, set by GitHub
- * Actions, whether or not a ruleset requires it. Auto-merge (`auto`) waits
- * only for the checks a ruleset requires, so it is let through a hold only
- * when one requires agent-hold from GitHub Actions.
+ * Actions for this pull request (its link names it: a status on a commit
+ * shared with another pull request is not this one's), whether or not a
+ * ruleset requires it. Auto-merge (`auto`) waits only for the checks a
+ * ruleset requires, and a hold can come after it is turned on, so it is let
+ * through only where a ruleset requires agent-hold from GitHub Actions,
+ * whatever agent-hold reads now.
  */
-const holdRefusal = async (pr: Pull, hold: HoldConfig, required: readonly RequiredCheck[], auto: boolean, byApps: () => Promise<Record<string, unknown>[]>): Promise<string | undefined> => {
-  const check: RequiredCheck = { context: HOLD_CONTEXT, app: ACTIONS_APP };
-  const statuses = await byApps();
-  const state = checkState(check, statuses, []);
-  if (state === "passed") return undefined;
-  if (auto && required.some((entry) => entry.context === HOLD_CONTEXT && entry.app === ACTIONS_APP)) return undefined;
-  const shown = statuses.find((status) => status.context === HOLD_CONTEXT && status.app_id === ACTIONS_APP);
-  const why = shown === undefined ? `no ${HOLD_CONTEXT} status from GitHub Actions` : `${HOLD_CONTEXT} ${state}: ${text(shown.description)}`;
+const holdRefusal = async (io: ReviewIo, pr: Pull, hold: HoldConfig, required: readonly RequiredCheck[], auto: boolean, byApps: () => Promise<Record<string, unknown>[]>): Promise<string | undefined> => {
   const release = `only a person releases a hold: John adds \`${hold.releaseLabel}\` himself`;
-  return auto
-    ? `pull request #${pr.number}'s head ${pr.head.slice(0, 8)} is not cleared by ${HOLD_CONTEXT} (${why}), and \`--auto\` would not wait for it: ${pr.base}'s rules do not require ${HOLD_CONTEXT} from GitHub Actions; ${release}`
-    : `pull request #${pr.number}'s head ${pr.head.slice(0, 8)} is not cleared by ${HOLD_CONTEXT} (${why}); ${release}, and an agent merges once ${HOLD_CONTEXT} passes`;
+  if (auto) {
+    if (required.some((entry) => entry.context === HOLD_CONTEXT && entry.app === ACTIONS_APP)) return undefined;
+    return `\`--auto\` cannot wait for ${HOLD_CONTEXT} on pull request #${pr.number}: ${pr.base}'s rules do not require ${HOLD_CONTEXT} from GitHub Actions, so a hold that comes later would not stop the merge; merge once ${HOLD_CONTEXT} passes, or ask John to require it`;
+  }
+  const shown = (await byApps()).find((status) => status.context === HOLD_CONTEXT && status.app_id === ACTIONS_APP);
+  const own = `https://github.com/${slug(io.repo)}/pull/${pr.number}`.toLowerCase() === text(shown?.target_url).toLowerCase();
+  if (shown?.state === "success" && own) return undefined;
+  const why =
+    shown === undefined
+      ? `no ${HOLD_CONTEXT} status from GitHub Actions`
+      : !own
+        ? `the latest ${HOLD_CONTEXT} on it is another pull request's (${text(shown.target_url) || "no link"})`
+        : `${HOLD_CONTEXT} ${shown.state === "failure" || shown.state === "error" ? "failed" : text(shown.state)}: ${text(shown.description)}`;
+  return `pull request #${pr.number}'s head ${pr.head.slice(0, 8)} is not cleared by ${HOLD_CONTEXT} (${why}); ${release}, and an agent merges once ${HOLD_CONTEXT} passes`;
 };
 
 /**
@@ -389,7 +396,7 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
   let byApp: Promise<Record<string, unknown>[]> | undefined;
   const byApps = () => (byApp ??= appStatuses(io, stage, pr.head));
   if (hold !== undefined) {
-    const refused = await holdRefusal(pr, hold, required, auto, byApps);
+    const refused = await holdRefusal(io, pr, hold, required, auto, byApps);
     if (refused !== undefined) throw new Failure(stage, refused);
   }
   if (auto || required.length === 0) return pr.head;

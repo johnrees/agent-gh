@@ -51,7 +51,14 @@ export const apiReader = (io: ApiIo, maxPages = 30): Read => async (endpoint) =>
   throw new Failure(STAGE, `/${endpoint.split("?")[0]} lists over ${maxPages * 100} items`);
 };
 
-export type QueueConfig = { readonly issue: number | undefined; readonly label: string; readonly priorityLabels: readonly string[]; readonly skipLabels: readonly string[] };
+export type QueueConfig = {
+  readonly issue: number | undefined;
+  readonly label: string;
+  readonly priorityLabels: readonly string[];
+  readonly skipLabels: readonly string[];
+  /** `hold.label`, where the config has `hold`: every picker skips an issue carrying it, as `queue.skip_labels` would, in any case. */
+  readonly holdLabel?: string;
+};
 
 /** penmon's and soltui's priority labels, highest first. */
 export const DEFAULT_PRIORITY_LABELS = ["priority:high", "priority:medium", "priority:low"];
@@ -72,9 +79,9 @@ export const queueConfig = async (repo: Repo, read: Read): Promise<QueueConfig> 
   }
   // An issue carrying the hold's label waits for John: every picker skips it. parseReviewConfig checks `hold`; this reads its label, defaulting as it does.
   const hold = record(config).hold;
-  const held = hold === undefined ? [] : [typeof record(hold).label === "string" ? (record(hold).label as string) : "needs-human"];
+  const held = hold === undefined ? {} : { holdLabel: typeof record(hold).label === "string" ? (record(hold).label as string) : "needs-human" };
   const queue = record(config).queue;
-  if (queue === undefined) return { issue: undefined, label: "ready", priorityLabels: DEFAULT_PRIORITY_LABELS, skipLabels: held };
+  if (queue === undefined) return { issue: undefined, label: "ready", priorityLabels: DEFAULT_PRIORITY_LABELS, skipLabels: [], ...held };
   const value = record(queue);
   if (typeof queue !== "object" || queue === null || Array.isArray(queue) || Object.keys(value).some((key) => !["issue", "label", "priority_labels", "skip_labels"].includes(key))) {
     throw new Failure(STAGE, `${CONFIG_PATH}: queue takes issue, label, priority_labels, and skip_labels`);
@@ -93,7 +100,8 @@ export const queueConfig = async (repo: Repo, read: Read): Promise<QueueConfig> 
     issue: value.issue as number | undefined,
     label: (value.label as string | undefined) ?? "ready",
     priorityLabels: (priority as string[] | undefined) ?? DEFAULT_PRIORITY_LABELS,
-    skipLabels: [...held, ...((skip as string[] | undefined) ?? [])],
+    skipLabels: (skip as string[] | undefined) ?? [],
+    ...held,
   };
 };
 
@@ -115,7 +123,7 @@ export type NextResult = Waves & { readonly config: QueueConfig; readonly queued
 export const nextIssues = async (repo: Repo, read: Read, rules: LabelRules = NO_RULES): Promise<NextResult> => {
   const name = slug(repo);
   const config = await queueConfig(repo, read);
-  const filters: LabelRules = { ...rules, configured: [...config.skipLabels, ...(rules.configured ?? [])] };
+  const filters: LabelRules = { ...rules, configured: [...config.skipLabels, ...(rules.configured ?? [])], ...(config.holdLabel === undefined ? {} : { held: config.holdLabel }) };
   const queueIssue = config.issue === undefined ? undefined : await read(`repos/${name}/issues/${config.issue}`);
   if (config.issue !== undefined && queueIssue === undefined) throw new Failure(STAGE, `the Queue issue #${config.issue} (\`queue.issue\` in ${CONFIG_PATH}) cannot be read`);
   const queue = queueIssue === undefined ? undefined : parseQueue(text(record(queueIssue).body));
