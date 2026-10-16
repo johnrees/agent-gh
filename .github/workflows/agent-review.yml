@@ -31,14 +31,15 @@ jobs:
     timeout-minutes: 10
     # Declaring permissions drops the defaults, so every scope the run uses is
     # named here: contents (the config, compare, fetching commits),
-    # pull-requests (the PR, its commits, files, and reviews), issues (read:
-    # comments, label events, reactions, closing issues; write: a hold's call
-    # and release record, posted as github-actions[bot]), statuses (read and
-    # set). A caller must grant the same.
+    # pull-requests (the PR, its commits, files, and reviews), issues
+    # (comments, label events, reactions, closing issues), statuses (read and
+    # set). The two writes post a hold's call and release record as
+    # github-actions[bot]: issues: write on an issue, and pull-requests: write
+    # as well on a pull request's conversation. A caller must grant the same.
     permissions:
       contents: read
       issues: write
-      pull-requests: read
+      pull-requests: write
       statuses: write
     # One run per pull request (or per issue, for a comment on or a label
     # change to one): every run derives the statuses from GitHub as it stands,

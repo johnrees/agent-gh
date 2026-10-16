@@ -567,8 +567,8 @@ test("the reusable workflow is a workflow_call that sets the statuses with GITHU
   // NTFY_URL is optional, and reaches agent-gh only through the step's environment.
   expect(workflow.on.workflow_call.secrets).toEqual({ NTFY_URL: { description: expect.any(String), required: false } });
   const job = workflow.jobs.status;
-  // issues: write posts a hold's call and release record; every other scope stays read-only but statuses.
-  expect(job.permissions).toEqual({ contents: "read", issues: "write", "pull-requests": "read", statuses: "write" });
+  // The writes post a hold's call and release record: commenting on a pull request needs pull-requests: write too (checked live).
+  expect(job.permissions).toEqual({ contents: "read", issues: "write", "pull-requests": "write", statuses: "write" });
   expect(job.steps.at(-1).env.AGENT_GH_NTFY_URL).toBe("${{ secrets.NTFY_URL }}");
   expect(JSON.stringify(job.steps.slice(0, -1))).not.toContain("NTFY_URL");
   expect(job.concurrency.group).toContain("github.event.pull_request.number || github.event.issue.number");
@@ -586,7 +586,7 @@ test("the README's caller template grants the reusable workflow every scope it d
   const caller = Bun.YAML.parse(template ?? "") as Record<string, any>;
   const reusable = Bun.YAML.parse(readFileSync(join(import.meta.dir, "..", ".github", "workflows", "agent-review.yml"), "utf8")) as Record<string, any>;
   expect(caller.jobs["agent-review"].permissions).toEqual(reusable.jobs.status.permissions);
-  expect(caller.jobs["agent-review"].permissions.issues).toBe("write");
+  expect(caller.jobs["agent-review"].permissions).toMatchObject({ issues: "write", "pull-requests": "write" });
   expect(caller.jobs["agent-review"].uses).toStartWith("johnrees/agent-gh/.github/workflows/agent-review.yml@");
   expect(caller.jobs["agent-review"].secrets).toEqual({ NTFY_URL: "${{ secrets.NTFY_URL }}" });
   expect(Object.keys(caller.on)).toEqual(["pull_request_target", "pull_request_review", "issue_comment", "issues"]);
@@ -616,29 +616,32 @@ const description = (overrides: Partial<Parameters<typeof holdStatus>[0]>) => {
 };
 const file = (name: string, previous?: string) => ({ name, previous });
 
-test("the hold's label holds while it is on the pull request or an issue it closes, and once gone until a person removed it or added the release label", () => {
+test("the hold's label holds while it is on the pull request or an issue it closes, and once gone until a person adds the release label: no removal releases it", () => {
   expect(holdStatus(holdInput())).toEqual({ status: { context: "agent-hold", state: "success", description: "not held", targetUrl: undefined } });
   const added = labelEvent(1, "labeled", "needs-human", CLAUDE, minutes(0));
   expect(description({ threads: [thread("#12", ["needs-human"], [added], "Drop the v1 schema?")] })).toBe("failure: held: `needs-human` on #12: Drop the v1 schema?");
   expect(description({ threads: [thread("#12", [], []), thread("#7", ["Needs-Human"], [added], "Which API?")] })).toBe("failure: held: `needs-human` on #7: Which API?");
-  // Removed by a person: released. Removed by an agent's App: still held.
-  expect(description({ threads: [thread("#12", [], [added, labelEvent(2, "unlabeled", "needs-human", null, minutes(5))])] })).toBe("success: not held");
-  const byAgent = labelEvent(2, "unlabeled", "needs-human", CLAUDE, minutes(5));
-  expect(description({ threads: [thread("#12", [], [added, byAgent])] })).toBe("failure: held: `needs-human` was removed by an agent on #12; only a person's removal releases it");
-  expect(description({ threads: [thread("#12", [], []), thread("#7", [], [added, byAgent])] })).toBe("failure: held: `needs-human` was removed by an agent on #7; only a person's removal releases it");
-  // A bot's removal is no person's, even with no App recorded.
-  expect(description({ threads: [thread("#12", [], [added, labelEvent(2, "unlabeled", "needs-human", null, minutes(5), { login: "github-actions[bot]", type: "Bot" })])] })).toContain("removed by an agent");
+  // GitHub records no App on a removal (checked live: an agent's reads `performed_via_github_app: null`), so none releases it, whoever's it looks.
+  const byAgent = labelEvent(2, "unlabeled", "needs-human", null, minutes(5));
+  expect(description({ threads: [thread("#12", [], [added, byAgent])] })).toBe("failure: held: `needs-human` came off #12, which releases nothing; a person adds `human-approved`");
+  expect(description({ threads: [thread("#12", [], []), thread("#7", [], [added, byAgent])] })).toBe("failure: held: `needs-human` came off #7, which releases nothing; a person adds `human-approved`");
+  expect(description({ threads: [thread("#12", [], [added, labelEvent(2, "unlabeled", "needs-human", CLAUDE, minutes(5))])] })).toContain("came off #12");
   // The release label, added by a person after the label last went on, releases it once it is gone; an App's, or an older one, does not.
   const release = (app: number | null, at: string) => labelEvent(3, "labeled", "human-approved", app, at);
   expect(description({ threads: [thread("#12", ["human-approved"], [added, byAgent, release(null, minutes(6))])] })).toBe("success: not held");
-  expect(description({ threads: [thread("#12", ["human-approved"], [added, byAgent, release(CLAUDE, minutes(6))])] })).toContain("removed by an agent");
-  expect(description({ threads: [thread("#12", ["human-approved"], [release(null, minutes(-1)), added, byAgent])] })).toContain("removed by an agent");
-  // On the pull request, it releases a closing issue's label too; while the label is on, nothing releases it.
+  expect(description({ threads: [thread("#12", ["human-approved"], [added, byAgent, release(CLAUDE, minutes(6))])] })).toContain("came off #12");
+  expect(description({ threads: [thread("#12", ["human-approved"], [release(null, minutes(-1)), added, byAgent])] })).toContain("came off #12");
+  // A release label a bot added, or one since removed, releases nothing either.
+  expect(description({ threads: [thread("#12", ["human-approved"], [added, byAgent, labelEvent(3, "labeled", "human-approved", null, minutes(6), { login: "github-actions[bot]", type: "Bot" })])] })).toContain("came off #12");
+  expect(description({ threads: [thread("#12", [], [added, byAgent, release(null, minutes(6)), labelEvent(4, "unlabeled", "human-approved", null, minutes(7))])] })).toContain("came off #12");
+  // On the pull request, it releases a closing issue's label too, and it releases a label still on; the label added again holds again.
   expect(description({ threads: [thread("#12", ["human-approved"], [release(null, minutes(6))]), thread("#7", [], [added, byAgent])] })).toBe("success: not held");
-  expect(description({ threads: [thread("#12", ["needs-human", "human-approved"], [added, release(null, minutes(6))], "Ask")] })).toBe("failure: held: `needs-human` on #12: Ask");
+  expect(description({ threads: [thread("#12", ["needs-human", "human-approved"], [added, release(null, minutes(6))], "Ask")] })).toBe("success: not held");
+  const again = labelEvent(5, "labeled", "needs-human", CLAUDE, minutes(8));
+  expect(description({ threads: [thread("#12", ["needs-human", "human-approved"], [added, release(null, minutes(6)), again], "Again?")] })).toBe("failure: held: `needs-human` on #12: Again?");
   // A person's own pull request is still held by the label, however it was removed.
   expect(description({ author: "person", threads: [thread("#12", ["needs-human"], [added], "Ask")] })).toBe("failure: held: `needs-human` on #12: Ask");
-  expect(description({ author: "person", threads: [thread("#12", [], [added, byAgent])] })).toContain("removed by an agent");
+  expect(description({ author: "person", threads: [thread("#12", [], [added, byAgent])] })).toContain("came off #12");
 });
 
 test("a reserved path holds a pull request, by its current name or a rename's old one, until a person adds the release label; a person's own pull request is not held by its paths", () => {
@@ -706,18 +709,21 @@ test("the ask is the newest agent comment in the 15 minutes before the label, it
   const body = callBody({ owner: "jr-owner", ref: "#12", hold: HOLD, ask: { line: "Ask @mallory?", url: "https://x/3" }, event: 900 });
   expect(body.split("\n")[0]).toBe("@jr-owner, an agent needs you on #12: Ask @\u200bmallory?");
   expect(body).toContain("[The ask](https://x/3)");
+  expect(body).toContain("Only a person releases this hold: once it is answered, add `human-approved` yourself. Removing `needs-human` releases nothing");
   expect(body.endsWith(callMarker({ v: 1, event: 900 }))).toBe(true);
 });
 
-test("a person, and no App or bot, is who labelEvents says acted", () => {
+test("a person, and no App or bot, is who labelEvents says added a label, and no removal is a person's", () => {
   const events = labelEvents([
     labelEvent(1, "labeled", "x", null, LABELED),
     labelEvent(2, "labeled", "x", CLAUDE, LABELED),
-    labelEvent(3, "unlabeled", "x", null, LABELED, { login: "github-actions[bot]", type: "Bot" }),
-    labelEvent(4, "unlabeled", "x", null, LABELED, { login: "renovate[bot]", type: "User" }),
-    { id: 5, event: "commented", created_at: LABELED },
+    labelEvent(3, "labeled", "x", null, LABELED, { login: "github-actions[bot]", type: "Bot" }),
+    labelEvent(4, "labeled", "x", null, LABELED, { login: "renovate[bot]", type: "User" }),
+    // A removal is never known to be a person's: GitHub records no App on one.
+    labelEvent(5, "unlabeled", "x", null, LABELED),
+    { id: 6, event: "commented", created_at: LABELED },
   ]);
-  expect(events.map((event) => [event.id, event.person])).toEqual([[1, true], [2, false], [3, false], [4, false]]);
+  expect(events.map((event) => [event.id, event.person])).toEqual([[1, true], [2, false], [3, false], [4, false], [5, false]]);
 });
 
 test("the workflow sets agent-hold from the base branch's hold, never the pull request's own config, and a label on an issue it closes holds it", async () => {
@@ -785,7 +791,7 @@ test("against real git, a person's release survives a rebase that leaves the res
   // A record anyone else posts counts for nothing; and a head GitHub Actions had not seen before the release is not released.
   expect(await hold(world(head4, repo.mb2, { comments: [forge("johnrees")] }))).toMatchObject({ state: "failure", description: `held: ${head4.slice(0, 8)} was pushed after johnrees's release; John adds \`human-approved\` again` });
   expect(await hold(world(head4, repo.mb2, { comments: [forge("johnrees")], combined: [{ ...seen, created_at: minutes(1) }] }))).toMatchObject({ state: "failure" });
-});
+}, 30_000);
 
 /** An agent's comment on #12, posted as `owner` through Claude's App. */
 const agentSays = (id: number, offset: number, body: string, owner = "johnrees") => ({

@@ -52,10 +52,9 @@ export type ReviewConfig = {
 };
 
 /**
- * `hold`: a pull request is held while `label` is on it or on an issue it
- * closes, or while its diff touches a file `paths` names (`Bun.Glob`
- * patterns), until a person releases it: by removing `label` himself, or by
- * adding `releaseLabel`.
+ * `hold`: a pull request is held once `label` has been on it or on an issue
+ * it closes, or while its diff touches a file `paths` names (`Bun.Glob`
+ * patterns), until a person releases it by adding `releaseLabel`.
  */
 export type HoldConfig = { readonly label: string; readonly releaseLabel: string; readonly paths: readonly string[] };
 

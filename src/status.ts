@@ -168,7 +168,12 @@ export type LabelEvent = {
   readonly label: string;
   readonly at: string;
   readonly actor: string;
-  /** A person's own action: no App acted for them (`performed_via_github_app` is null), and they are no bot. */
+  /**
+   * A person's own addition: no App acted for them (`performed_via_github_app`
+   * is null), and they are no bot. Never a removal's: GitHub records no App on
+   * an `unlabeled` event (checked live), so an agent's removal reads as a
+   * person's, and no removal can be told to be one.
+   */
   readonly person: boolean;
 };
 
@@ -182,7 +187,7 @@ export const labelEvents = (events: readonly unknown[]): LabelEvent[] =>
     const viaApp = entry.performed_via_github_app !== null && entry.performed_via_github_app !== undefined;
     return [{
       id: entry.id as number, event: entry.event, label: name, at: typeof entry.created_at === "string" ? entry.created_at : "", actor: login,
-      person: !viaApp && login !== "" && actor.type !== "Bot" && !login.endsWith("[bot]"),
+      person: entry.event === "labeled" && !viaApp && login !== "" && actor.type !== "Bot" && !login.endsWith("[bot]"),
     }];
   });
 
@@ -213,19 +218,18 @@ export type HoldThread = {
 };
 
 /**
- * Whether the hold's label holds a thread: while it is on; once it is gone,
- * until the last change to it is a person's removal, or a person added the
- * release label (on the thread or on the pull request, `prRelease`) after
- * the label last went on. An agent's removal releases nothing.
+ * Whether the hold's label holds a thread (`on` it still, or `removed` from
+ * it): from the time it last went on until a person adds the release label
+ * (on the thread, or on the pull request, `prRelease`), whether or not it is
+ * still on. Its removal releases nothing, since GitHub cannot say whose it
+ * was (`LabelEvent.person`); adding it again holds again.
  */
 export const labelHold = (thread: HoldThread, hold: HoldConfig, prRelease: LabelEvent | undefined): "on" | "removed" | undefined => {
-  if (thread.labels.some((label) => sameLabel(label, hold.label))) return "on";
+  const on = thread.labels.some((label) => sameLabel(label, hold.label));
   const added = lastAdded(thread.events, hold.label);
-  if (added === undefined) return undefined;
-  const change = thread.events.findLast((event) => sameLabel(event.label, hold.label));
-  if (change?.event === "unlabeled" && change.person) return undefined;
+  if (added === undefined) return on ? "on" : undefined;
   const released = [personRelease(thread.labels, thread.events, hold.releaseLabel), prRelease].some((release) => release !== undefined && later(release, added));
-  return released ? undefined : "removed";
+  return released ? undefined : on ? "on" : "removed";
 };
 
 /** A changed file as the pull request's files list gives it: its name, and its name before a rename. */
@@ -334,7 +338,7 @@ const holdStatusOf = (state: Status["state"], description: string): Status => ({
  * agent-hold for a pull request's head, and the release record to write when
  * this run is the first to see a person's release. In order:
  * - held while the hold's label holds the pull request or an issue it closes
- *   (`labelHold`), whoever wrote it;
+ *   (`labelHold`), whoever wrote it, until a person adds the release label;
  * - not held, for a person's own pull request;
  * - held when it changes more files than GitHub lists, which cannot be
  *   checked;
@@ -351,7 +355,7 @@ export const holdStatus = (input: HoldInput): { readonly status: Status; readonl
   const on = holds.find((entry) => entry.held === "on");
   if (on !== undefined) return { status: holdStatusOf("failure", `held: \`${hold.label}\` on ${on.thread.ref}: ${on.thread.ask ?? NO_ASK}`) };
   const removed = holds.find((entry) => entry.held === "removed");
-  if (removed !== undefined) return { status: holdStatusOf("failure", `held: \`${hold.label}\` was removed by an agent on ${removed.thread.ref}; only a person's removal releases it`) };
+  if (removed !== undefined) return { status: holdStatusOf("failure", `held: \`${hold.label}\` came off ${removed.thread.ref}, which releases nothing; a person adds \`${hold.releaseLabel}\``) };
   if (input.author === "person") return { status: holdStatusOf("success", "not an agent PR") };
   if (input.files === undefined) return { status: holdStatusOf("failure", `held: lists over ${FILES_LISTED.toLocaleString("en-US")} files, too many to check`) };
   const reserved = reservedFiles(input.files, hold.paths);
@@ -448,7 +452,7 @@ export const callBody = (input: { readonly owner: string; readonly ref: string; 
     "",
     input.ask.url === undefined ? "No agent posted an ask in the 15 minutes before the label went on; read the thread." : `[The ask](${input.ask.url})`,
     "",
-    `Only a person releases this hold: remove \`${input.hold.label}\` yourself once it is answered. An agent removing it, or adding \`${input.hold.releaseLabel}\`, releases nothing.`,
+    `Only a person releases this hold: once it is answered, add \`${input.hold.releaseLabel}\` yourself. Removing \`${input.hold.label}\` releases nothing (GitHub records no App on a removal, so an agent's would read as yours), and nor does an agent adding \`${input.hold.releaseLabel}\`.`,
     "",
     callMarker({ v: 1, event: input.event }),
   ].join("\n");

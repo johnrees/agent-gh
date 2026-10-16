@@ -252,6 +252,9 @@ const sameStatuses = (a: { readonly head: string; readonly statuses: readonly St
 /** Rounds of derive-and-write before a run gives up chasing a pull request that keeps changing (the next event's run follows it). */
 const WRITE_ROUNDS = 3;
 
+/** Why a run's token may not comment: the scopes a hold's comments need, or a fork's read-only run. */
+const NO_COMMENT = "the workflow needs `issues: write` and, on a pull request, `pull-requests: write`; a fork's pull_request_review run is read-only";
+
 /**
  * Posts a person's release record on the pull request, as
  * `github-actions[bot]`, before the status it lets pass is set. A token that
@@ -265,7 +268,7 @@ const writeRecord = async (io: StatusIo, number: number, value: ReleaseRecord): 
   ].join("\n");
   const { status: code } = await request(io.api, STAGE, "POST", `${repoPath(io)}/issues/${number}/comments`, io.token, { body });
   if (code === 403 || code === 404) {
-    io.print(`agent-gh: this run's token may not comment (HTTP ${code}; a fork's pull request runs read-only), so ${value.by}'s release of #${number} is not recorded yet`);
+    io.print(`agent-gh: this run's token may not comment (HTTP ${code}: ${NO_COMMENT}), so ${value.by}'s release of #${number} is not recorded yet`);
     return false;
   }
   if (code < 200 || code >= 300) throw new Failure(STAGE, `HTTP ${code} from POST ${repoPath(io)}/issues/${number}/comments`);
@@ -362,7 +365,7 @@ const callOwner = async (io: StatusIo, number: number, hold: HoldConfig): Promis
   const body = callBody({ owner, ref: `#${number}`, hold, ask, event: added.id });
   const { status: code } = await request(io.api, STAGE, "POST", `${repoPath(io)}/issues/${number}/comments`, io.token, { body });
   if (code === 403 || code === 404) {
-    io.print(`agent-gh: this run's token may not comment (HTTP ${code}; a fork's pull request runs read-only); a later run calls ${owner} in`);
+    io.print(`agent-gh: this run's token may not comment (HTTP ${code}: ${NO_COMMENT}); a later run calls ${owner} in`);
     return;
   }
   if (code < 200 || code >= 300) throw new Failure(STAGE, `HTTP ${code} from POST ${repoPath(io)}/issues/${number}/comments`);

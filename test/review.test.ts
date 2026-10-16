@@ -944,7 +944,7 @@ test("where the base branch's config has hold, an agent's merge needs agent-hold
   const merge = async (status: unknown[], args = ["pr", "merge", "12"], rules: unknown[] = []) =>
     gateRefusal(dispatchGh(args, here, mergeDeps(world({ config: HELD, status: status as never, rules }).io, calls)));
   expect(await merge([hold("failure")])).toBe(
-    "pull request #12's head aaaaaaaa is not cleared by agent-hold (agent-hold failed: held: `needs-human` on #12: Ask); only a person releases a hold: John removes `needs-human` himself, or adds `human-approved` for reserved paths, and an agent merges once agent-hold passes",
+    "pull request #12's head aaaaaaaa is not cleared by agent-hold (agent-hold failed: held: `needs-human` on #12: Ask); only a person releases a hold: John adds `human-approved` himself, and an agent merges once agent-hold passes",
   );
   expect(await merge([hold("pending")])).toContain("(agent-hold pending: held: `needs-human` on #12: Ask)");
   // An agent's App can set a status with that name; it is not GitHub Actions', so it clears nothing.
@@ -971,7 +971,7 @@ test("--auto, or GraphQL enablePullRequestAutoMerge, passes a hold only where th
   const requires = (check: Record<string, unknown>) => [{ type: "required_status_checks", parameters: { required_status_checks: [check] } }];
   const auto = (rules: unknown[]) => mergeDeps(world({ config: HELD, status: failing as never, rules }).io, calls);
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto"], here, auto([])))).toBe(
-    "pull request #12's head aaaaaaaa is not cleared by agent-hold (agent-hold failed: held: touches `schema/**` (schema/a.json); John adds `human-approved`), and `--auto` would not wait for it: main's rules do not require agent-hold from GitHub Actions; only a person releases a hold: John removes `needs-human` himself, or adds `human-approved` for reserved paths",
+    "pull request #12's head aaaaaaaa is not cleared by agent-hold (agent-hold failed: held: touches `schema/**` (schema/a.json); John adds `human-approved`), and `--auto` would not wait for it: main's rules do not require agent-hold from GitHub Actions; only a person releases a hold: John adds `human-approved` himself",
   );
   // A requirement any App's status meets (an agent could set it) is not enough.
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto"], here, auto(requires({ context: "agent-hold" }))))).toContain("`--auto` would not wait for it");

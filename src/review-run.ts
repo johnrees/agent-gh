@@ -355,7 +355,7 @@ const holdRefusal = async (pr: Pull, hold: HoldConfig, required: readonly Requir
   if (auto && required.some((entry) => entry.context === HOLD_CONTEXT && entry.app === ACTIONS_APP)) return undefined;
   const shown = statuses.find((status) => status.context === HOLD_CONTEXT && status.app_id === ACTIONS_APP);
   const why = shown === undefined ? `no ${HOLD_CONTEXT} status from GitHub Actions` : `${HOLD_CONTEXT} ${state}: ${text(shown.description)}`;
-  const release = `only a person releases a hold: John removes \`${hold.label}\` himself, or adds \`${hold.releaseLabel}\` for reserved paths`;
+  const release = `only a person releases a hold: John adds \`${hold.releaseLabel}\` himself`;
   return auto
     ? `pull request #${pr.number}'s head ${pr.head.slice(0, 8)} is not cleared by ${HOLD_CONTEXT} (${why}), and \`--auto\` would not wait for it: ${pr.base}'s rules do not require ${HOLD_CONTEXT} from GitHub Actions; ${release}`
     : `pull request #${pr.number}'s head ${pr.head.slice(0, 8)} is not cleared by ${HOLD_CONTEXT} (${why}); ${release}, and an agent merges once ${HOLD_CONTEXT} passes`;
