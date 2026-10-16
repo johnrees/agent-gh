@@ -7,7 +7,7 @@ import { taken } from "./claim.ts";
 import { claim, type ClaimIo, UNKNOWN } from "./claim-run.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { request } from "./github.ts";
-import { type Blocker, frontier, type Node, parseQueue, type WaveIssue, type Waves, waves } from "./next.ts";
+import { type Blocker, frontier, labelFilter, type LabelRules, NO_RULES, type Node, parseQueue, skippedText, type WaveIssue, type Waves, waves } from "./next.ts";
 import { parseRepo, type Repo, slug } from "./repo.ts";
 import { CONFIG_PATH } from "./review.ts";
 import type { ApiIo } from "./threads-run.ts";
@@ -51,16 +51,19 @@ export const apiReader = (io: ApiIo, maxPages = 30): Read => async (endpoint) =>
   throw new Failure(STAGE, `/${endpoint.split("?")[0]} lists over ${maxPages * 100} items`);
 };
 
-export type QueueConfig = { readonly issue: number | undefined; readonly label: string; readonly priorityLabels: readonly string[] };
+export type QueueConfig = { readonly issue: number | undefined; readonly label: string; readonly priorityLabels: readonly string[]; readonly skipLabels: readonly string[] };
 
 /** penmon's and soltui's priority labels, highest first. */
 export const DEFAULT_PRIORITY_LABELS = ["priority:high", "priority:medium", "priority:low"];
 
-/** `queue` in the review config on the default branch: `{"issue": N, "label": "ready"}`, both optional. */
+/**
+ * `queue` in the review config on the default branch: `{"issue": N, "label":
+ * "ready", "priority_labels": [...], "skip_labels": [...]}`, all optional.
+ */
 export const queueConfig = async (repo: Repo, read: Read): Promise<QueueConfig> => {
   const base = text(record(await read(`repos/${slug(repo)}`)).default_branch);
   const file = await read(`repos/${slug(repo)}/contents/${CONFIG_PATH}?ref=${encodeURIComponent(base)}`);
-  if (file === undefined) return { issue: undefined, label: "ready", priorityLabels: DEFAULT_PRIORITY_LABELS };
+  if (file === undefined) return { issue: undefined, label: "ready", priorityLabels: DEFAULT_PRIORITY_LABELS, skipLabels: [] };
   let config: unknown;
   try {
     config = JSON.parse(Buffer.from(text(record(file).content), "base64").toString("utf8"));
@@ -68,10 +71,10 @@ export const queueConfig = async (repo: Repo, read: Read): Promise<QueueConfig> 
     throw new Failure(STAGE, `${CONFIG_PATH} on ${base} is not valid JSON`);
   }
   const queue = record(config).queue;
-  if (queue === undefined) return { issue: undefined, label: "ready", priorityLabels: DEFAULT_PRIORITY_LABELS };
+  if (queue === undefined) return { issue: undefined, label: "ready", priorityLabels: DEFAULT_PRIORITY_LABELS, skipLabels: [] };
   const value = record(queue);
-  if (typeof queue !== "object" || queue === null || Array.isArray(queue) || Object.keys(value).some((key) => !["issue", "label", "priority_labels"].includes(key))) {
-    throw new Failure(STAGE, `${CONFIG_PATH}: queue takes issue, label, and priority_labels`);
+  if (typeof queue !== "object" || queue === null || Array.isArray(queue) || Object.keys(value).some((key) => !["issue", "label", "priority_labels", "skip_labels"].includes(key))) {
+    throw new Failure(STAGE, `${CONFIG_PATH}: queue takes issue, label, priority_labels, and skip_labels`);
   }
   if (value.issue !== undefined && !(Number.isSafeInteger(value.issue) && (value.issue as number) > 0)) throw new Failure(STAGE, `${CONFIG_PATH}: queue.issue must be an issue number`);
   if (value.label !== undefined && (typeof value.label !== "string" || value.label.trim() === "")) throw new Failure(STAGE, `${CONFIG_PATH}: queue.label must be a label name`);
@@ -79,7 +82,16 @@ export const queueConfig = async (repo: Repo, read: Read): Promise<QueueConfig> 
   if (priority !== undefined && !(Array.isArray(priority) && priority.every((name) => typeof name === "string" && name.trim() !== ""))) {
     throw new Failure(STAGE, `${CONFIG_PATH}: queue.priority_labels must be a list of label names, highest first ([] for none)`);
   }
-  return { issue: value.issue as number | undefined, label: (value.label as string | undefined) ?? "ready", priorityLabels: (priority as string[] | undefined) ?? DEFAULT_PRIORITY_LABELS };
+  const skip = value.skip_labels;
+  if (skip !== undefined && !(Array.isArray(skip) && skip.every((pattern) => typeof pattern === "string" && pattern.trim() !== ""))) {
+    throw new Failure(STAGE, `${CONFIG_PATH}: queue.skip_labels must be a list of label patterns`);
+  }
+  return {
+    issue: value.issue as number | undefined,
+    label: (value.label as string | undefined) ?? "ready",
+    priorityLabels: (priority as string[] | undefined) ?? DEFAULT_PRIORITY_LABELS,
+    skipLabels: (skip as string[] | undefined) ?? [],
+  };
 };
 
 /** `owner/name` of an issue's `repository_url`. */
@@ -94,10 +106,13 @@ export type NextResult = Waves & { readonly config: QueueConfig; readonly queued
  * The graph from GitHub: the Queue's issues and the ready ones, and every
  * open blocker of theirs in this repository, transitively; a blocker in
  * another repository is read from the dependency list and never followed.
+ * The label filters (the flags' `rules` and the config's `skip_labels`) mark
+ * a dispatched issue skipped; it stays in the graph.
  */
-export const nextIssues = async (repo: Repo, read: Read): Promise<NextResult> => {
+export const nextIssues = async (repo: Repo, read: Read, rules: LabelRules = NO_RULES): Promise<NextResult> => {
   const name = slug(repo);
   const config = await queueConfig(repo, read);
+  const filters: LabelRules = { ...rules, configured: [...config.skipLabels, ...(rules.configured ?? [])] };
   const queueIssue = config.issue === undefined ? undefined : await read(`repos/${name}/issues/${config.issue}`);
   if (config.issue !== undefined && queueIssue === undefined) throw new Failure(STAGE, `the Queue issue #${config.issue} (\`queue.issue\` in ${CONFIG_PATH}) cannot be read`);
   const queue = queueIssue === undefined ? undefined : parseQueue(text(record(queueIssue).body));
@@ -126,7 +141,12 @@ export const nextIssues = async (repo: Repo, read: Read): Promise<NextResult> =>
     const holder = taken(repo, issue, pulls, await readList(read, `repos/${name}/issues/${number}/comments`)).holder;
     const names = list(issue.labels).map((item) => text(record(item).name));
     const rank = config.priorityLabels.findIndex((name) => names.includes(name));
-    nodes.set(number, { number, title: text(issue.title), dispatched, blockers, claim: holder, ...(rank === -1 ? {} : { priority: { label: config.priorityLabels[rank] as string, rank } }) });
+    const skipped = dispatched ? labelFilter(names, filters) : undefined;
+    nodes.set(number, {
+      number, title: text(issue.title), dispatched, blockers, claim: holder, labels: names,
+      ...(skipped === undefined ? {} : { skipped }),
+      ...(rank === -1 ? {} : { priority: { label: config.priorityLabels[rank] as string, rank } }),
+    });
   }
   return { ...waves({ queue, nodes }), config, queued: queue !== undefined };
 };
@@ -138,9 +158,15 @@ const claimNote = (item: WaveIssue) =>
 const fallback = (result: NextResult) =>
   `agent-gh: no Queue issue is configured (\`queue.issue\` in ${CONFIG_PATH}); falling back to open \`${result.config.label}\` issues by priority label, then the ones that unblock the most, then by number`;
 
-/** Plain `next`: one workable issue per line, the next first; claimed ones go to `print`. */
+/** One stderr line per issue of wave 1 the label filters left out. */
+const skippedNotes = (result: NextResult, print: (line: string) => void) => {
+  for (const item of result.waves[0] ?? []) if (item.state === "skipped" && item.skipped_by !== null) print(`agent-gh: skipped #${item.issue} ${item.title}: ${skippedText(item.skipped_by)}`);
+};
+
+/** Plain `next`: one workable issue per line, the next first; claimed and skipped ones go to `print`. */
 export const nextLines = (result: NextResult, print: (line: string) => void): string[] => {
   if (!result.queued) print(fallback(result));
+  skippedNotes(result, print);
   const items = frontier(result);
   for (const item of items.filter((candidate) => candidate.state === "in_progress")) print(`agent-gh: #${item.issue} ${item.title}: ${claimNote(item)}`);
   const workable = items.filter((item) => item.state === "workable");
@@ -149,13 +175,13 @@ export const nextLines = (result: NextResult, print: (line: string) => void): st
     : workable.map((item) => `#${item.issue} ${item.title}`);
 };
 
-/** `next --json`: the frontier with each issue's claim. */
+/** `next --json`: the frontier with each issue's labels and claim. */
 export const nextJson = (repo: Repo, result: NextResult) => ({
   v: 1,
   repo: slug(repo),
   queue: result.config.issue ?? null,
   label: result.config.label,
-  issues: frontier(result).map((item) => ({ issue: item.issue, title: item.title, priority: item.priority, claim: item.claim })),
+  issues: frontier(result).map((item) => ({ issue: item.issue, title: item.title, priority: item.priority, labels: item.labels, claim: item.claim })),
 });
 
 /** `next --waves --json`. */
@@ -179,6 +205,7 @@ export const wavesLines = (result: NextResult, print: (line: string) => void): s
       item.unblocks === 0 ? "" : `unblocks ${item.unblocks}`,
       item.waiting_on.length === 0 ? "" : `waits on ${item.waiting_on.join(", ")}`,
       item.state === "not_dispatched" ? `not dispatched` : "",
+      item.skipped_by === null ? "" : `skipped: ${skippedText(item.skipped_by)}`,
       claimNote(item),
     ].filter((note) => note !== "");
     return `  #${item.issue} ${item.title}${notes.length === 0 ? "" : ` (${notes.join("; ")})`}`;
@@ -191,6 +218,8 @@ export const wavesLines = (result: NextResult, print: (line: string) => void): s
       if (busy.length > 0) lines.push("Wave 1, in progress:", ...busy.map(line));
       const idle = issues.filter((item) => item.state === "not_dispatched");
       if (idle.length > 0) lines.push("Wave 1, unblocked but not dispatched:", ...idle.map(line));
+      const left = issues.filter((item) => item.state === "skipped");
+      if (left.length > 0) lines.push("Wave 1, skipped by a label filter:", ...left.map(line));
     } else lines.push(`Wave ${index + 1}:`, ...issues.map(line));
   });
   if (result.stuck.length > 0) lines.push("Stuck (a cycle, or an open issue elsewhere):", ...result.stuck.map(line));
@@ -204,20 +233,21 @@ const ATTEMPTS = 3;
 /**
  * `agent-gh claim --next`: claims the first workable issue; when that claim
  * loses a race (or the issue was taken meanwhile), reads the frontier again
- * and tries the next, a few times at most.
+ * and tries the next, a few times at most. The label filters apply to each read.
  */
-export const claimNext = async (io: ClaimIo, read: Read, options: { readonly refs: boolean; readonly noPr: boolean }): Promise<number> => {
+export const claimNext = async (io: ClaimIo, read: Read, options: { readonly refs: boolean; readonly noPr: boolean; readonly rules?: LabelRules }): Promise<number> => {
   const tried = new Set<number>();
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-    const result = await nextIssues(io.repo, read);
+    const result = await nextIssues(io.repo, read, options.rules);
     if (attempt === 1 && !result.queued) io.print(fallback(result));
+    if (attempt === 1) skippedNotes(result, io.print);
     const pick = frontier(result).find((item) => item.state === "workable" && !tried.has(item.issue));
     if (pick === undefined) {
       io.print(`agent-gh: no eligible issue: none ${result.queued ? "in the Queue " : ""}is open, \`${result.config.label}\`, unblocked, and unclaimed`);
       return 1;
     }
     io.print(`agent-gh: claiming #${pick.issue} ${pick.title}`);
-    const code = await claim(io, { issue: pick.issue, ...options });
+    const code = await claim(io, { issue: pick.issue, refs: options.refs, noPr: options.noPr });
     // Only a refusal or a lost race leaves no claim behind; an unconfirmed one stands, so nothing more is claimed.
     if (code === 0 || code === UNKNOWN) return code;
     tried.add(pick.issue);

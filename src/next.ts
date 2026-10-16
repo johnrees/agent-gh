@@ -9,9 +9,63 @@
  * layer the open issues of the graph (the dispatched ones and their blockers,
  * transitively): wave 1 has no open blocker, and each later wave waits only
  * on earlier ones. This is a frontier for parallel workers to read, not a
- * scheduler.
+ * scheduler. A dispatched issue the label filters leave out is skipped: never
+ * offered or claimed, but still in the graph, so it blocks its dependents.
  */
 import type { Claim } from "./claim.ts";
+import { Failure } from "./failure.ts";
+import { labelMatches } from "./review.ts";
+
+/** The label filters of one call: patterns as `labelMatches` reads them, `*` matching any run of characters. */
+export type LabelRules = {
+  /** `--skip-label`: leave out an issue when any of its labels matches. */
+  readonly skip: readonly string[];
+  /** `--require-label`: leave out an issue unless some label matches each pattern. */
+  readonly require: readonly string[];
+  /** `--fit-label`: leave out an issue with a label in the pattern's group unless that label also matches it. */
+  readonly fit: readonly string[];
+  /** `queue.skip_labels`, applied like `skip` and named for it in the reason. */
+  readonly configured?: readonly string[];
+};
+
+export const NO_RULES: LabelRules = { skip: [], require: [], fit: [] };
+
+/** Why an issue is filtered: the rule that matched, its pattern, and the label that matched (null when a required one is missing). */
+export type SkippedBy = { readonly rule: string; readonly pattern: string; readonly label: string | null };
+
+/** The group a `--fit-label` pattern names: its text up to and including the first `:`; undefined without one. */
+export const fitGroup = (pattern: string): string | undefined => {
+  const colon = pattern.indexOf(":");
+  return colon === -1 ? undefined : pattern.slice(0, colon + 1);
+};
+
+/** The rule as a person reads it: `queue.skip_labels`, or the flag with its pattern. */
+export const ruleText = (by: SkippedBy): string => (by.rule.startsWith("--") ? `${by.rule} ${by.pattern}` : by.rule);
+
+/** The reason as a sentence: `carries needs-human (queue.skip_labels)`. */
+export const skippedText = (by: SkippedBy): string => `${by.label === null ? `lacks a label matching ${by.pattern}` : `carries ${by.label}`} (${ruleText(by)})`;
+
+/**
+ * Why a picker leaves out an issue with these labels, or undefined to keep
+ * it. Checked in order: `queue.skip_labels`, `--skip-label`,
+ * `--require-label`, `--fit-label`. Throws on a fit pattern with no `:`.
+ */
+export const labelFilter = (labels: readonly string[], rules: LabelRules): SkippedBy | undefined => {
+  const skips = [...(rules.configured ?? []).map((pattern) => ({ rule: "queue.skip_labels", pattern })), ...rules.skip.map((pattern) => ({ rule: "--skip-label", pattern }))];
+  for (const { rule, pattern } of skips) {
+    const label = labels.find((candidate) => labelMatches(pattern, candidate));
+    if (label !== undefined) return { rule, pattern, label };
+  }
+  const missing = rules.require.find((pattern) => !labels.some((label) => labelMatches(pattern, label)));
+  if (missing !== undefined) return { rule: "--require-label", pattern: missing, label: null };
+  for (const pattern of rules.fit) {
+    const group = fitGroup(pattern);
+    if (group === undefined) throw new Failure("finding the next issue", `--fit-label ${pattern}: a fit pattern names a label group, so it needs a ":" (model:sonnet-*)`);
+    const label = labels.find((candidate) => labelMatches(`${group}*`, candidate) && !labelMatches(pattern, candidate));
+    if (label !== undefined) return { rule: "--fit-label", pattern, label };
+  }
+  return undefined;
+};
 
 /**
  * The issues a Queue issue's body orders: each numbered list item queues the
@@ -34,6 +88,10 @@ export type Node = {
   readonly blockers: readonly Blocker[];
   /** The claim holding it, if any. */
   readonly claim: Claim | undefined;
+  /** Its label names. */
+  readonly labels: readonly string[];
+  /** Why the label filters leave it out, if they do. It still blocks its dependents. */
+  readonly skipped?: SkippedBy;
   /** Its highest priority label, and that label's rank (0 highest); undefined for none. */
   readonly priority?: { readonly label: string; readonly rank: number };
 };
@@ -45,7 +103,7 @@ export type GraphInput = {
   readonly nodes: ReadonlyMap<number, Node>;
 };
 
-export type IssueState = "workable" | "in_progress" | "not_dispatched" | "waiting";
+export type IssueState = "workable" | "in_progress" | "not_dispatched" | "skipped" | "waiting";
 
 export type WaveIssue = {
   readonly issue: number;
@@ -59,6 +117,10 @@ export type WaveIssue = {
   readonly unblocks: number;
   /** Its highest priority label, or null. */
   readonly priority: string | null;
+  /** Its label names, sorted. */
+  readonly labels: readonly string[];
+  /** The rule and label that filtered it (state `skipped`), or null. */
+  readonly skipped_by: SkippedBy | null;
   readonly claim: { readonly kind: "pr" | "comment"; readonly pr: number | null; readonly url: string; readonly family: string | null; readonly session: string | null } | null;
 };
 
@@ -169,9 +231,11 @@ export const waves = (input: GraphInput): Waves => {
   const entry = (number: number, layer: number | undefined): WaveIssue => {
     const node = nodes.get(number) as Node;
     const waitingOn = node.blockers.filter((blocker) => blocker.open).map(ref);
-    const state: IssueState = layer !== 1 ? "waiting" : !node.dispatched ? "not_dispatched" : node.claim !== undefined ? "in_progress" : "workable";
+    // A filtered issue is skipped in whatever wave it lands; waiting_on still says what it waits on.
+    const state: IssueState =
+      node.skipped !== undefined ? "skipped" : layer !== 1 ? "waiting" : !node.dispatched ? "not_dispatched" : node.claim !== undefined ? "in_progress" : "workable";
     const claim = node.claim === undefined ? null : { kind: node.claim.kind, pr: node.claim.pr, url: node.claim.url, family: node.claim.family, session: node.claim.session };
-    return { issue: number, title: node.title, state, queued: queued(number), waiting_on: waitingOn, unblocks: unblocks(number), priority: node.priority?.label ?? null, claim };
+    return { issue: number, title: node.title, state, queued: queued(number), waiting_on: waitingOn, unblocks: unblocks(number), priority: node.priority?.label ?? null, labels: [...node.labels].sort(), skipped_by: state === "skipped" ? (node.skipped ?? null) : null, claim };
   };
   const rank = (item: WaveIssue) => nodes.get(item.issue)?.priority?.rank ?? Number.MAX_SAFE_INTEGER;
   const order = (a: WaveIssue, b: WaveIssue) =>

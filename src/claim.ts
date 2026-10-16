@@ -13,6 +13,7 @@
  * The claim label only mirrors this: anyone can add or remove a label.
  */
 import { randomBytes } from "node:crypto";
+import { fitGroup, type LabelRules } from "./next.ts";
 import type { Env } from "./harness.ts";
 import { type Repo, slug } from "./repo.ts";
 
@@ -246,8 +247,8 @@ export const ago = (iso: string | null, nowMs: number): string => {
 /** A claim command's parsed arguments; `-R`/`--repo` is read separately, as gh reads it. */
 export type ClaimArgs =
   | { readonly command: "claim"; readonly issue: number; readonly refs: boolean; readonly noPr: boolean }
-  | { readonly command: "claim-next"; readonly refs: boolean; readonly noPr: boolean }
-  | { readonly command: "next"; readonly json: boolean; readonly waves: boolean }
+  | { readonly command: "claim-next"; readonly refs: boolean; readonly noPr: boolean; readonly rules: LabelRules }
+  | { readonly command: "next"; readonly json: boolean; readonly waves: boolean; readonly rules: LabelRules }
   | { readonly command: "release"; readonly issue: number }
   | { readonly command: "claims"; readonly json: boolean }
   | { readonly command: "sync"; readonly issues: readonly number[] };
@@ -255,24 +256,38 @@ export type ClaimArgs =
 /**
  * `claim N|--next [--refs|--no-pr]`, `release N`, `claims [--json]`,
  * `claims sync [--issue N]...`, `next [--json] [--waves]`, each with an
- * optional `-R repo`; undefined when they do not parse.
+ * optional `-R repo`; undefined when they do not parse. `next` and
+ * `claim --next` also take `--skip-label`, `--require-label`, and
+ * `--fit-label`, each repeatable, with a pattern as the next word or after `=`.
  */
 export const parseClaimArgs = (command: string, args: readonly string[]): ClaimArgs | undefined => {
   const words: string[] = [];
+  const labels: Record<"skip" | "require" | "fit", string[]> = { skip: [], require: [], fit: [] };
+  let labelFlags = 0;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index] as string;
-    if (arg === "-R" || arg === "--repo") {
+    const flag = /^--(skip|require|fit)-label(?:=([\s\S]*))?$/.exec(arg);
+    if (flag !== null) {
+      // The pattern is the next word, or what follows `=`; a missing, blank, or flag-like one is refused.
+      const pattern = flag[2] ?? args[++index];
+      if (pattern === undefined || pattern.trim() === "" || (flag[2] === undefined && pattern.startsWith("--"))) return undefined;
+      if (flag[1] === "fit" && fitGroup(pattern) === undefined) return undefined;
+      labels[flag[1] as "skip" | "require" | "fit"].push(pattern);
+      labelFlags++;
+    } else if (arg === "-R" || arg === "--repo") {
       if (args[++index] === undefined) return undefined;
     } else if (!arg.startsWith("--repo=") && !(arg.startsWith("-R") && arg.length > 2)) words.push(arg);
   }
   const number = (value: string | undefined) => (value !== undefined && /^[1-9]\d{0,9}$/.test(value) ? Number(value) : undefined);
+  const takesLabels = (command === "claim" && words.includes("--next")) || command === "next";
+  if (labelFlags > 0 && !takesLabels) return undefined;
   if (command === "claim") {
     const issues = words.filter((word) => !word.startsWith("-"));
     const next = words.includes("--next");
     const flags = words.filter((word) => word.startsWith("-") && word !== "--next");
     if (next) {
       if (issues.length > 0 || words.filter((word) => word === "--next").length > 1 || flags.some((flag) => flag !== "--refs" && flag !== "--no-pr") || flags.length > 1) return undefined;
-      return { command: "claim-next", refs: flags.includes("--refs"), noPr: flags.includes("--no-pr") };
+      return { command: "claim-next", refs: flags.includes("--refs"), noPr: flags.includes("--no-pr"), rules: labels };
     }
     const issue = number(issues[0]);
     if (issue === undefined || issues.length !== 1 || flags.some((flag) => flag !== "--refs" && flag !== "--no-pr") || new Set(flags).size !== flags.length) return undefined;
@@ -285,7 +300,7 @@ export const parseClaimArgs = (command: string, args: readonly string[]): ClaimA
   }
   if (command === "next") {
     if (words.some((word) => word !== "--json" && word !== "--waves") || new Set(words).size !== words.length) return undefined;
-    return { command, json: words.includes("--json"), waves: words.includes("--waves") };
+    return { command, json: words.includes("--json"), waves: words.includes("--waves"), rules: labels };
   }
   if (command !== "claims") return undefined;
   if (words[0] === "sync") {
