@@ -308,19 +308,17 @@ export const recordFor = (comments: readonly PostedBy[], event: number): Release
   return records.some((entry) => entry.edited) ? "edited" : records[0]?.value;
 };
 
-/** The longest list GitHub gives of a pull request's files; one with more cannot be checked. */
-export const FILES_LISTED = 3000;
-
 /**
  * What an agent-hold status links: its pull request, with a fingerprint of
- * the base branch, the merge base, and the hold it was judged against. A
- * status on a commit is any pull request's with that head, and outlives a
- * retarget, a merge into the base that moves the merge base (and so the
- * diff), or a change to the base branch's hold, so the merge guard counts
+ * what it was judged against: the base branch, the merge base, the hold, and
+ * the person's release then (its event, or none). A status on a commit is
+ * any pull request's with that head, and outlives a retarget, a merge into
+ * the base that moves the merge base (and so the diff), a change to the
+ * base branch's hold, or a release taken back, so the merge guard counts
  * only one linking the pull request it merges against what it reads now.
  */
-export const holdLink = (repo: string, number: number, hold: HoldConfig, base: string, mergeBase: string): string =>
-  `https://github.com/${repo}/pull/${number}#agent-hold-${createHash("sha256").update(JSON.stringify([base, mergeBase, hold.label.toLowerCase(), hold.releaseLabel.toLowerCase(), hold.paths])).digest("hex").slice(0, 12)}`;
+export const holdLink = (repo: string, number: number, hold: HoldConfig, base: string, mergeBase: string, release: number | null): string =>
+  `https://github.com/${repo}/pull/${number}#agent-hold-${createHash("sha256").update(JSON.stringify([base, mergeBase, hold.label.toLowerCase(), hold.releaseLabel.toLowerCase(), hold.paths, release])).digest("hex").slice(0, 12)}`;
 
 /**
  * Why the hold's label holds a pull request, from it (first) and the issues
@@ -371,8 +369,8 @@ export type HoldInput = {
   readonly url: string;
   /** The pull request first, then each issue it closes. */
   readonly threads: readonly HoldThread[];
-  /** The pull request's changed files; undefined when it changes more than GitHub lists. */
-  readonly files: readonly ChangedFile[] | undefined;
+  /** The pull request's changed files, from its merge base (none read for a person's own, which its paths do not hold). */
+  readonly files: readonly ChangedFile[];
   /** The pull request's comments, which carry the release records. */
   readonly comments: readonly PostedBy[];
   readonly head: string;
@@ -391,7 +389,7 @@ export type HoldNeeds = { readonly release: LabelEvent; readonly names: readonly
 
 /** What holdStatus needs read from git: undefined when nothing reserved has a release to check. */
 export const holdNeeds = (input: Omit<HoldInput, "pathsPatchId" | "releaseRun">): HoldNeeds | undefined => {
-  if (input.author === "person" || input.files === undefined) return undefined;
+  if (input.author === "person") return undefined;
   const pr = input.threads[0];
   const release = pr === undefined ? undefined : personRelease(pr.labels, pr.events, input.hold.releaseLabel);
   const { names } = reservedFiles(input.files, input.hold.paths);
@@ -407,8 +405,6 @@ export const holdNeeds = (input: Omit<HoldInput, "pathsPatchId" | "releaseRun">)
  * - held while the hold's label holds the pull request or an issue it closes
  *   (`labelHold`), whoever wrote it, until a person adds the release label;
  * - not held, for a person's own pull request;
- * - held when it changes more files than GitHub lists, which cannot be
- *   checked;
  * - held while it touches a reserved file, until a person adds the release
  *   label. The release label's own run binds the release to the reserved
  *   files' diff at the head GitHub gave that event (`ReleaseRun`), and a
@@ -423,7 +419,6 @@ export const holdStatus = (input: HoldInput): { readonly status: Status; readonl
   const label = labelHoldReason(input.threads, hold);
   if (label !== undefined) return held(label);
   if (input.author === "person") return { status: of("success", "not an agent PR") };
-  if (input.files === undefined) return held(`held: lists over ${FILES_LISTED.toLocaleString("en-US")} files, too many to check`);
   const reserved = reservedFiles(input.files, hold.paths);
   if (reserved.files.length === 0) return { status: of("success", "not held") };
   const needs = holdNeeds(input);

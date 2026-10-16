@@ -10,7 +10,7 @@ import { HARNESSES, type Env } from "./harness.ts";
 import { parseRemoteUrl, parseRepo, type Repo, slug } from "./repo.ts";
 import { absent, checkState, type PushedTag, pushedRefs, type RequiredCheck, requiredChecks } from "./merge.ts";
 import { type ApiIo, closingIssues, describeRequired, everyPage, pullThreads, repoOwner } from "./threads-run.ts";
-import { HOLD_CONTEXT, holdLink, type HoldThread, labelEvents, labelHoldReason, type MarkerPost, validMarkers } from "./status.ts";
+import { HOLD_CONTEXT, holdLink, type HoldThread, labelEvents, labelHoldReason, type MarkerPost, personRelease, validMarkers } from "./status.ts";
 import {
   agentReviewStatus,
   type ApiCall,
@@ -117,8 +117,6 @@ export type Pull = PullRequest & {
   readonly author: string;
   /** GitHub's account type for the author: `User`, `Bot`, or `Organization`. */
   readonly authorType: string;
-  /** How many files it changes, as GitHub counts them; undefined when GitHub does not say. */
-  readonly changedFiles?: number;
 };
 
 export const pull = async (io: ApiIo, stage: Stage, number: number): Promise<Pull> => {
@@ -130,7 +128,6 @@ export const pull = async (io: ApiIo, stage: Stage, number: number): Promise<Pul
   return {
     number, title: text(value.title), body: text(value.body), head, base, labels: labelNames(value.labels), open: value.state === "open",
     createdAt: text(value.created_at), author: text(user.login), authorType: text(user.type),
-    ...(Number.isSafeInteger(value.changed_files) ? { changedFiles: value.changed_files as number } : {}),
   };
 };
 
@@ -369,7 +366,8 @@ const liveThreads = async (io: ReviewIo, pr: Pull): Promise<HoldThread[]> => {
 const holdRefusal = async (io: ReviewIo, pr: Pull, hold: HoldConfig, required: readonly RequiredCheck[], auto: boolean, byApps: () => Promise<Record<string, unknown>[]>): Promise<string | undefined> => {
   const release = `only a person releases a hold: John adds \`${hold.releaseLabel}\` himself`;
   // The label is read live, so one added while its run waits still holds.
-  const label = labelHoldReason(await liveThreads(io, pr), hold);
+  const threads = await liveThreads(io, pr);
+  const label = labelHoldReason(threads, hold);
   if (label !== undefined) return `pull request #${pr.number} is ${label}; ${release}`;
   if (auto && !required.some((entry) => entry.context === HOLD_CONTEXT && entry.app === ACTIONS_APP)) {
     return `\`--auto\` cannot wait for ${HOLD_CONTEXT} on pull request #${pr.number}: ${pr.base}'s rules do not require ${HOLD_CONTEXT} from GitHub Actions, so a hold that comes later would not stop the merge; merge once ${HOLD_CONTEXT} passes, or ask John to require it`;
@@ -377,12 +375,14 @@ const holdRefusal = async (io: ReviewIo, pr: Pull, hold: HoldConfig, required: r
   const shown = (await byApps()).find((status) => status.context === HOLD_CONTEXT && status.app_id === ACTIONS_APP);
   const compare = record((await call(io, MERGE_STAGE, "GET", `${repoPath(io)}/compare/${encodeURIComponent(pr.base)}...${pr.head}`)).value);
   const mergeBase = text(record(compare.merge_base_commit).sha);
-  const own = holdLink(slug(io.repo), pr.number, hold, pr.base, mergeBase).toLowerCase() === text(shown?.target_url).toLowerCase();
+  // The release the status relied on must still stand: a person's release taken back changes the fingerprint.
+  const released = threads[0] === undefined ? undefined : personRelease(threads[0].labels, threads[0].events, hold.releaseLabel);
+  const own = holdLink(slug(io.repo), pr.number, hold, pr.base, mergeBase, released?.id ?? null).toLowerCase() === text(shown?.target_url).toLowerCase();
   const why =
     shown === undefined
       ? `no ${HOLD_CONTEXT} status from GitHub Actions`
       : !own
-        ? `the latest ${HOLD_CONTEXT} on it was not judged for this pull request against ${pr.base}, its merge base, and its hold now (${text(shown.target_url) || "no link"}); the agent-review workflow sets it on the next event`
+        ? `the latest ${HOLD_CONTEXT} on it was not judged for this pull request against ${pr.base}, its merge base, its hold, and its release now (${text(shown.target_url) || "no link"}); the agent-review workflow sets it on the next event`
         : `${HOLD_CONTEXT} ${shown.state === "failure" || shown.state === "error" ? "failed" : text(shown.state)}: ${text(shown.description)}`;
   if (auto) return own ? undefined : `\`--auto\` would wait on another pull request's ${HOLD_CONTEXT} on #${pr.number}'s head ${pr.head.slice(0, 8)} (${why})`;
   if (shown?.state === "success" && own) return undefined;

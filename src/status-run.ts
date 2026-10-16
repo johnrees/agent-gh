@@ -12,7 +12,6 @@ import {
   carryCandidate,
   type ChangedFile,
   eventTarget,
-  FILES_LISTED,
   type FoundMarker,
   HOLD_CONTEXT,
   labelHold,
@@ -22,6 +21,7 @@ import {
   releaseRunMatches,
   type HoldThread,
   labelEvents,
+  personRelease,
   markerFor,
   passes,
   type ReleaseRecord,
@@ -120,22 +120,27 @@ const issueEvents = async (io: ApiIo, repo: Repo, number: number): Promise<unkno
 
 const threadRef = (io: ApiIo, repo: Repo, number: number): string => (slug(repo).toLowerCase() === slug(io.repo).toLowerCase() ? `#${number}` : `${slug(repo)}#${number}`);
 
-/** The pull request's changed files; undefined when it changes more than GitHub lists, so they cannot all be checked. */
-const pullFiles = async (io: ApiIo, pr: Pull): Promise<ChangedFile[] | undefined> => {
-  if (pr.changedFiles !== undefined && pr.changedFiles > FILES_LISTED) return undefined;
-  const files = await everyPage(io, STAGE, `${repoPath(io)}/pulls/${pr.number}/files`, FILES_LISTED / 100).catch((error: unknown) => {
-    if (error instanceof Failure && error.detail.includes("lists over")) return undefined;
-    throw error;
-  });
-  return files?.map(record).map((file) => ({ name: text(file.filename), previous: typeof file.previous_filename === "string" ? file.previous_filename : undefined }));
+/** The merge base GitHub reports for `head` against `base`, a branch or a commit: immutable, so what is judged against it stays put. */
+const mergeBaseOf = async (io: ApiIo, base: string, head: string): Promise<string> => {
+  const mergeBase = text(record(record(await get(io, STAGE, `${repoPath(io)}/compare/${encodeURIComponent(base)}...${head}`)).merge_base_commit).sha);
+  if (!/^[0-9a-f]{40}$/.test(mergeBase)) throw new Failure(STAGE, `the merge base of ${head.slice(0, 8)} with ${base}: invalid response`);
+  return mergeBase;
+};
+
+/** Fetches `head` and `mergeBase` into the scratch repository, one deep, to diff them; refused when git cannot. */
+const fetchPair = async (io: StatusIo, number: number, head: string, mergeBase: string): Promise<void> => {
+  await io.git(["init", "-q", "--bare"]);
+  const got = (await fetched(io, [`refs/pull/${number}/head`, mergeBase], head)) || (await fetched(io, [head, mergeBase], head));
+  if (!got || (await io.git(["cat-file", "-e", `${mergeBase}^{commit}`])) === undefined) throw new Failure(STAGE, `could not fetch ${head.slice(0, 8)} and its merge base to read #${number}'s changed files`);
 };
 
 /**
- * The files the hold's paths reserve in `head`'s diff from `mergeBase`, as
- * git names them (both names of a rename), so the patch id is read the same
- * way at any head.
+ * Every file `head` changes from `mergeBase`, as git names them (both names
+ * of a rename): read from the same two commits the status is judged and
+ * fingerprinted by, never a list GitHub may have drawn from another moment,
+ * and with no cap on how many.
  */
-const reservedNames = async (io: StatusIo, mergeBase: string, head: string, paths: readonly string[]): Promise<string[]> => {
+const changedFiles = async (io: StatusIo, mergeBase: string, head: string): Promise<ChangedFile[]> => {
   const out = await io.git(["diff", "--name-status", "-M", "-z", "--no-ext-diff", mergeBase, head]);
   if (out === undefined) throw new Failure(STAGE, `could not list ${head.slice(0, 8)}'s changed files`);
   const parts = out.split("\0");
@@ -150,14 +155,12 @@ const reservedNames = async (io: StatusIo, mergeBase: string, head: string, path
       at += 2;
     }
   }
-  return reservedFiles(files, paths).names;
+  return files;
 };
 
-/** The reserved files' patch id at `head` (null for none), from its diff from the merge base GitHub reports for it with `base`. */
-const reservedPatchId = async (io: StatusIo, pr: Pull, paths: readonly string[], head: string, base: string): Promise<string | null> => {
-  const mergeBase = await fetchedPull(io, pr.number, base, head);
-  if (mergeBase === undefined) throw new Failure(STAGE, `could not fetch ${head.slice(0, 8)} and its merge base to compare #${pr.number}'s reserved paths`);
-  const names = await reservedNames(io, mergeBase, head, paths);
+/** The reserved files' patch id at `head` from `mergeBase` (null for none), both fetched. */
+const reservedPatchId = async (io: StatusIo, mergeBase: string, head: string, paths: readonly string[]): Promise<string | null> => {
+  const names = reservedFiles(await changedFiles(io, mergeBase, head), paths).names;
   return names.length === 0 ? null : (await pullDiff(io, mergeBase, head, names)).patchId;
 };
 
@@ -195,20 +198,28 @@ const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "age
     const comments = index === 0 ? prComments : await issueComments(io, STAGE, thread.repo, thread.number, thread.ref);
     threads[index] = { ...thread, ask: askFor(comments, added.at, owner, agentApps().map((app) => app.id)).line };
   }
-  const files = author === "person" ? [] : await pullFiles(io, pr);
+  // One merge base, read once: the files, the patch ids, and the fingerprint are all judged against it.
+  const mergeBase = await mergeBaseOf(io, pr.base, pr.head);
+  const reads = author !== "person" && hold.paths.length > 0;
+  if (reads) await fetchPair(io, pr.number, pr.head, mergeBase);
+  const files = reads ? await changedFiles(io, mergeBase, pr.head) : [];
   // A comment edited since it was posted (its updated_at moved; a reaction leaves it) carries no trusted record.
   const comments = prComments.map((comment) => ({ author: comment.author, body: comment.body, edited: comment.updatedAt !== comment.createdAt }));
-  const mergeBase = text(record(record(await get(io, STAGE, `${repoPath(io)}/compare/${encodeURIComponent(pr.base)}...${pr.head}`)).merge_base_commit).sha);
-  if (!/^[0-9a-f]{40}$/.test(mergeBase)) throw new Failure(STAGE, `#${pr.number}'s merge base: invalid response`);
-  const url = holdLink(slug(io.repo), pr.number, hold, pr.base, mergeBase);
+  const release = threads[0] === undefined ? undefined : personRelease(threads[0].labels, threads[0].events, hold.releaseLabel);
+  const url = holdLink(slug(io.repo), pr.number, hold, pr.base, mergeBase, release?.id ?? null);
   const input = { hold, author, number: pr.number, url, threads, files, comments, head: pr.head, base: pr.base, sharedWith: await sharingHead(io, pr.number, pr.head) };
   const needs = holdNeeds(input);
   // Only the run of the release's own `labeled` event records it, at the head that event gave.
   const own = needs !== undefined && labeled !== undefined && releaseRunMatches(threads[0]?.events ?? [], hold.releaseLabel, needs.release, labeled.at);
   if (needs === undefined || needs.record === "edited" || (needs.record === undefined && !own)) return holdStatus(input);
-  const pathsPatchId = await reservedPatchId(io, pr, hold.paths, pr.head, pr.base);
+  const pathsPatchId = await reservedPatchId(io, mergeBase, pr.head, hold.paths);
   // The release's diff is the one its event showed: that head, against the base branch's commit then, whatever has merged into it since.
-  const releaseRun = needs.record === undefined && own ? { head: labeled.head, base: labeled.base, pathsPatchId: await reservedPatchId(io, pr, hold.paths, labeled.head, labeled.baseSha) } : undefined;
+  let releaseRun: { readonly head: string; readonly base: string; readonly pathsPatchId: string | null } | undefined;
+  if (needs.record === undefined && own) {
+    const released = await mergeBaseOf(io, labeled.baseSha, labeled.head);
+    await fetchPair(io, pr.number, labeled.head, released);
+    releaseRun = { head: labeled.head, base: labeled.base, pathsPatchId: await reservedPatchId(io, released, labeled.head, hold.paths) };
+  }
   return holdStatus({ ...input, pathsPatchId, ...(releaseRun === undefined ? {} : { releaseRun }) });
 };
 
