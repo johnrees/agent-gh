@@ -49,7 +49,7 @@ import {
 } from "../src/review-run.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
 import { parseRepo, type Repo, repoFlag, slug } from "../src/repo.ts";
-import { pushedBranches } from "../src/merge.ts";
+import { pushedRefs } from "../src/merge.ts";
 
 /** The issue's example config: Codex and Claude reviewers, effort from the ticket's labels. */
 const EXAMPLE = {
@@ -1156,12 +1156,16 @@ test("an agent's gh api merge runs only when gh pr merge would", async () => {
   ]);
 });
 
-test("a pre-push lists the branches a push moves, deletions included, and an unreadable line reads as none", () => {
+test("a pre-push lists the branches and tags a push moves, deletions included, and an unreadable line reads as none", () => {
   const Z = "0".repeat(40);
-  expect(pushedBranches(`refs/heads/x ${HEAD} refs/heads/main ${OLD}\nrefs/tags/v1 ${HEAD} refs/tags/v1 ${Z}\n(delete) ${Z} refs/heads/release/1 ${OLD}\n`)).toEqual(["main", "release/1"]);
-  expect(pushedBranches("")).toEqual([]);
-  expect(pushedBranches(`refs/heads/x ${HEAD} main ${OLD}`)).toBeUndefined();
-  expect(pushedBranches("garbage")).toBeUndefined();
+  expect(pushedRefs(`refs/heads/x ${HEAD} refs/heads/main ${OLD}\nrefs/tags/v1 ${HEAD} refs/tags/v1 ${Z}\n(delete) ${Z} refs/heads/release/1 ${OLD}\n(delete) ${Z} refs/tags/v0 ${OLD}\nrefs/notes/x ${HEAD} refs/notes/x ${Z}\n`)).toEqual({
+    branches: ["main", "release/1"],
+    tags: [{ tag: "v1", local: HEAD, remote: Z }, { tag: "v0", local: Z, remote: OLD }],
+  });
+  expect(pushedRefs("")).toEqual({ branches: [], tags: [] });
+  expect(pushedRefs(`refs/heads/x ${HEAD} main ${OLD}`)).toBeUndefined();
+  expect(pushedRefs(`refs/tags/v1 ${HEAD} refs/tags/ ${OLD}`)).toBeUndefined();
+  expect(pushedRefs("garbage")).toBeUndefined();
 });
 
 test("an agent's push to the default branch, or to a branch whose rules require checks, is refused; other branches pass", async () => {
@@ -1184,8 +1188,8 @@ test("an agent's push to the default branch, or to a branch whose rules require 
   const repos: string[] = [];
   await guardPush("git@github.com:johnrees/widget.git", line("feature"), deps(world().io, repos));
   expect(repos).toEqual(["johnrees/widget"]);
-  // Tags carry no required checks and need no lookup; an unreadable push fails closed.
-  await guardPush(url, `refs/tags/v1 ${HEAD} refs/tags/v1 ${OLD}\n`, deps(world().io, repos));
+  // Other refs carry no rules and need no lookup (tags need John's grant: release.test.ts); an unreadable push fails closed.
+  await guardPush(url, `refs/notes/x ${HEAD} refs/notes/x ${OLD}\n`, deps(world().io, repos));
   expect(repos).toEqual(["johnrees/widget"]);
   expect(await gateRefusal(guardPush(url, "nonsense\n", deps(world().io)))).toBe("git's pre-push lines are not in the form agent-gh reads");
   expect(await gateRefusal(guardPush(undefined, line("feature"), deps(world().io)))).toContain("passed no remote URL");
@@ -1212,11 +1216,11 @@ test("an agent's gh api write that moves a held branch is refused, through REST 
   expect(await refuse(["api", "graphql", "-f", 'query=mutation { updateRefs(input: {repositoryId: "R", refUpdates: []}) { clientMutationId } }'])).toContain("updateRefs");
   expect(await refuse(["api", "graphql", "-f", "query=mutation($id: ID!) { deleteRef(input: {refId: $id}) { clientMutationId } }"])).toBe("cannot read which branch a GraphQL ref write moves; push with git instead");
   expect(calls).toEqual([]);
-  // Another branch, a tag, and an unprotected repository's feature branch pass.
+  // Another branch, a ref that is neither branch nor tag (tags need John's grant: release.test.ts), and an unprotected repository's feature branch pass.
   const open = world();
   expect(await dispatchGh(["api", "-X", "PATCH", "repos/johnrees/widget/git/refs/heads/feature", "-f", `sha=${HEAD}`], here, mergeDeps(open.io, calls))).toBe(0);
-  expect(await dispatchGh(["api", "repos/johnrees/widget/git/refs", "-f", "ref=refs/tags/v1", "-f", `sha=${HEAD}`], here, mergeDeps(held.io, calls))).toBe(0);
-  expect(calls).toEqual([`gh api -X PATCH repos/johnrees/widget/git/refs/heads/feature -f sha=${HEAD}`, `ungated gh api repos/johnrees/widget/git/refs -f ref=refs/tags/v1 -f sha=${HEAD}`]);
+  expect(await dispatchGh(["api", "repos/johnrees/widget/git/refs", "-f", "ref=refs/notes/x", "-f", `sha=${HEAD}`], here, mergeDeps(held.io, calls))).toBe(0);
+  expect(calls).toEqual([`gh api -X PATCH repos/johnrees/widget/git/refs/heads/feature -f sha=${HEAD}`, `ungated gh api repos/johnrees/widget/git/refs -f ref=refs/notes/x -f sha=${HEAD}`]);
 });
 
 test("a waiver history longer than the gate reads is not trusted", async () => {

@@ -21,7 +21,7 @@ It installs the checked release and gitleaks in `~/.local/bin`, logs in each App
 Shell startup files are not enough on their own: a harness may start its tools from a snapshot of the environment it was launched in, and a version manager (mise, asdf, Homebrew's shellenv, Nix) can put its own gh back ahead of the shim after the startup files run. So `install-shims` also, for each harness that has run on the machine (its directory exists):
 
 - **Claude Code**: adds a SessionStart hook to `~/.claude/settings.json`, `agent-gh session-env`, which writes the PATH block to `CLAUDE_ENV_FILE`; Claude Code sources it before every command.
-- **Instructions**: adds a managed block to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.pi/agent/AGENTS.md`: run plain `gh`; if it says it is not logged in, run `agent-gh <gh arguments>`, or read with `GH_TOKEN=$(agent-gh read-token) gh ...`; never ask for `gh auth login`; where a repository opts in to reviews, run `agent-gh review full` before marking a pull request ready; and answer each finding and notify with `agent-gh reply`.
+- **Instructions**: adds a managed block to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.pi/agent/AGENTS.md`: run plain `gh`; if it says it is not logged in, run `agent-gh <gh arguments>`, or read with `GH_TOKEN=$(agent-gh read-token) gh ...`; never ask for `gh auth login`; where a repository opts in to reviews, run `agent-gh review full` before marking a pull request ready; answer each finding and notify with `agent-gh reply`; and never push a tag or write a release unless John has run `agent-gh allow release <tag>` for it.
 
 `doctor --machine` checks both, and when another gh comes first it names the version manager responsible.
 
@@ -38,7 +38,7 @@ The harness is found from a variable it sets for its tools, and the family from 
 
 ## Repository hooks
 
-Where git runs hooks from config (`git hook list` exists), `install-shims` sets `hook.agent-gh.command` and `hook.agent-gh.event=commit-msg` globally, so every repository on the machine credits agent sessions with no setup of its own; `git config hook.agent-gh.enabled false` turns it off in one repository. It also sets `hook.agent-gh-push` for `pre-push`: an agent session's push to the repository's default branch, or to a branch a ruleset or classic protection requires status checks on, is refused, since agents act as John and John may bypass those rules. A push whose GitHub repository or rules cannot be told is refused too; a remote on a local path is not held, and a person's pushes never are. It runs before a repository's own hook, and the trailers are replaced or skipped when already there, so both together credit a commit once. Older gits, Apple's among them, need the repository hooks below; `doctor --machine` checks the commit and push hooks apart, and says which applies. This repository has one in `.githooks` (`git config core.hooksPath .githooks`).
+Where git runs hooks from config (`git hook list` exists), `install-shims` sets `hook.agent-gh.command` and `hook.agent-gh.event=commit-msg` globally, so every repository on the machine credits agent sessions with no setup of its own; `git config hook.agent-gh.enabled false` turns it off in one repository. It also sets `hook.agent-gh-push` for `pre-push`: an agent session's push to the repository's default branch, or to a branch a ruleset or classic protection requires status checks on, is refused, since agents act as John and John may bypass those rules. So is a new tag John has not granted, and deleting or moving any tag ([Releases](#releases)). A push whose GitHub repository or rules cannot be told is refused too; a remote on a local path is not held, and a person's pushes never are. It runs before a repository's own hook, and the trailers are replaced or skipped when already there, so both together credit a commit once. Older gits, Apple's among them, need the repository hooks below; `doctor --machine` checks the commit and push hooks apart, and says which applies. This repository has one in `.githooks` (`git config core.hooksPath .githooks`).
 
 ```sh
 # .githooks/commit-msg (with git config core.hooksPath .githooks)
@@ -187,6 +187,34 @@ A claim pull request is a draft with an agent's empty commit, so the agent-revie
 `agent-gh next --waves [--json]` lays out the dependency graph for parallel workers: the queued and `ready` issues and, transitively, their open blockers in this repository (a blocker in another repository is read, never followed or offered; a closed one is resolved). Wave 1 is the frontier, every issue with no open blocker: workable, in progress (claimed), or unblocked but not dispatched (not `ready` or not queued). Each later wave waits only on earlier ones, and each issue names what it waits on. Within a wave the Queue's order comes first; then the highest priority label (`queue.priority_labels`, highest first, default `["priority:high", "priority:medium", "priority:low"]`, `[]` for none; an issue with two takes the higher), so a repository without a Queue is ordered by priority; then the issues that unblock the most; then the lowest number. `--json` and `--waves` show each issue's priority; plain `next` is wave 1's workable issues in that order. Issues on a cycle, or behind one or behind an open issue in another repository, are listed as stuck with the cycle, and never offered. It schedules nothing.
 
 `agent-gh claim --next [--refs|--no-pr]` claims the first issue `next` offers. When that claim loses a race, it reads the frontier again and tries the next one, three times at most (never after an unconfirmed claim), so several workers running it spread across the frontier.
+
+## Releases
+
+Agents never cut, change, or approve a release unless John has granted that one tag. A tag ruleset does not stop them, since they act as John, its bypass actor, so the guard does, as the merge guard does for branches. In an agent session:
+
+- **Tags**: the pre-push hook refuses a new tag (`git push origin v1`, `--tags`, `--follow-tags`) without a grant for it, each tag its own, and refuses deleting or moving a tag, grant or not.
+- **`gh release`**: `create`, `edit`, `upload`, and `delete-asset` need a grant for their tag (`edit --tag` for the new one too); `delete` is always refused; `list`, `view`, `download`, `verify`, and `verify-asset` run as they are. The tag is read with each subcommand's own flags, and `-R` in any spelling.
+- **`gh api`**: creating a tag (`POST git/refs` with `refs/tags/...`, or GraphQL `createRef`) or writing a release (`POST releases`, `PATCH` or `DELETE releases/{id}`, an asset upload to uploads.github.com) needs a grant for the release's tag, read from the body or from GitHub. A write to a tag's own ref (`PATCH` or `DELETE git/refs/tags/...`, GraphQL `updateRef`, `updateRefs`, or `deleteRef`), any GraphQL mutation that names a release, and an endpoint the guard cannot read are refused.
+- **Deployments**: approving or rejecting one (`POST actions/runs/{id}/pending_deployments` or `deployment_protection_rule`, GraphQL `approveDeployments` or `rejectDeployments`) is always refused, so a release workflow behind a protected environment still waits for John's click.
+
+Every refusal names the tag and what John runs.
+
+**The grant** is an issue John opens with his own login. In his own terminal (it refuses in an agent session):
+
+```sh
+agent-gh allow release v1.2.3 [--at <full commit sha>] [-R OWNER/REPO]
+```
+
+It opens "Release v1.2.3" with the real gh (never a shim), labelled `agent-release` (created when missing), its body a sentence and `<!-- agent-gh-allow {"v":1,"action":"release","tag":"v1.2.3","sha":null} -->`. Where gh does not act as the repository's owner, as on an agent machine, whose gh only reads, it prints a prefilled new-issue link and the fields to paste instead. A grant holds while the issue is open, was opened by the repository's owner with no App (`performed_via_github_app` null), is under 24 hours old, and has never been edited, closed, reopened, or transferred (agents act as John, so they could do any of those to his issue), and its marker names the tag and, when `--at` named one, the commit the tag points at. A pull request never counts, since GitHub records no App for one. The label only helps the guard find grants; anyone can add one, so it is not trusted.
+
+A grant covers creating that tag while it does not exist on GitHub (or already points at the granted commit, so a retry is harmless), and `gh release create`, `edit`, `upload`, and `delete-asset` for it while it holds. A new tag `gh release` creates is pinned to the granted commit with `--target`; a REST release write that would create one must give that commit as `target_commitish`. A tag is created once and never moved or deleted, so a grant is one-shot with no state in agent-gh. Closing the issue revokes it, and expiry clears the rest. It is not a variable or a file because an agent runs as the same Unix user as John and could write either.
+
+Stated limits:
+
+- `git push --no-verify` skips the pre-push hook, as it does for branches.
+- On John's own Mac, a determined agent could run the real gh with John's keyring login and open a grant, as it could add a waiver label. Agent machines have no such login.
+- `gh workflow run` of a dispatch-triggered release workflow is not held. Such a repository should run its release job in a protected environment, whose approval agents cannot give.
+- A gh alias or extension is not expanded, so one that writes a release is not held; agents use gh's own commands.
 
 ## Development
 

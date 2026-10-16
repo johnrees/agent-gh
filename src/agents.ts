@@ -102,6 +102,7 @@ export const instructionsBlock = (): string =>
     "- `agent-gh doctor --machine` shows what is set up wrong; tell John its FAIL lines rather than working around them silently.",
     "- In a repository with `.github/agent-review.json`, before marking a pull request ready, run `agent-gh review full` from its pushed head, and review again after any push.",
     '- Answer each review finding, and each `agent-notify` on your pull request, with `agent-gh reply <id> --applied <sha>` (the fix, pushed to the pull request) or `agent-gh reply <id> --declined "<why>"`; a finding\'s review thread is then resolved.',
+    "- Never push a tag or create or edit a release unless John has run `agent-gh allow release <tag>` for it; ask him.",
     END,
   ].join("\n");
 

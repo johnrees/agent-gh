@@ -8,6 +8,7 @@
 import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { allowRelease, parseAllowArgs } from "./allow.ts";
 import { runChild } from "./child.ts";
 import { parseClaimArgs, sessionId as claimSession } from "./claim.ts";
 import { claim, type ClaimIo, claimsLines, eventIssues, listClaims, release, syncLabels } from "./claim-run.ts";
@@ -79,6 +80,9 @@ const USAGE = `usage:
                                     list live claims with their holder and last push and comment (--json: the stable form)
   agent-gh claims sync [--issue N]... [-R repo]
                                     remove the claim label from issues nothing claims (in GitHub Actions: the closed PR's)
+  agent-gh allow release <tag> [--at <sha>] [-R repo]
+                                    in your own terminal: grant agents one tag, pushed once (at <sha>, a full commit sha,
+                                    when given), and its release, for 24 hours: an issue your own gh opens, or one you paste
   agent-gh which <gh|git>           print the real program, past any agent-gh shim; copy this, never \`command -v gh\`, into a test's PATH`;
 
 /** Opens a URL in a local browser if there is one; the printed URL is always the fallback. */
@@ -509,6 +513,39 @@ const main = async (argv: readonly string[]): Promise<number> => {
     }
     await login(family, deviceDeps());
     return 0;
+  }
+  if (first === "allow") {
+    const parsed = parseAllowArgs(rest);
+    if (parsed === undefined) {
+      console.error(USAGE);
+      return 1;
+    }
+    if (inAgentSession(env)) {
+      throw new Failure("granting a release", `an agent cannot grant itself a release; John runs \`agent-gh allow release ${parsed.tag}\` in his own terminal`);
+    }
+    const repo = await resolveRepo("gh", rest, env, () => originUrl(process.cwd()));
+    if (repo === undefined) throw new Failure("granting a release", "no -R, GH_REPO, or github.com origin remote; run it inside a clone of the repository or pass -R OWNER/REPO");
+    // The person's own gh, past agent-gh's shims, so GitHub records the issue as theirs with no App.
+    const gh = whichReal("gh", env.PATH, defaultShimDir());
+    const plain: Record<string, string> = {};
+    for (const [name, value] of Object.entries(env)) if (value !== undefined) plain[name] = value;
+    return allowRelease(
+      {
+        gh:
+          gh === undefined
+            ? undefined
+            : async (args) => {
+                const child = Bun.spawn([gh, ...args], { env: plain, stdin: "ignore", stdout: "pipe", stderr: "inherit" });
+                const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+                return { code, stdout };
+              },
+        print: (line) => console.error(line),
+        out: (text) => process.stdout.write(text),
+      },
+      repo,
+      parsed.tag,
+      parsed.sha,
+    );
   }
   if (first === "claim" || first === "release" || first === "claims" || first === "next") return claimCommand(first, rest, env);
   const review = first === "review" ? reviewOptions(rest) : undefined;

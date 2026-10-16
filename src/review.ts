@@ -429,18 +429,32 @@ export type ApiMerge =
   | { readonly kind: "none" }
   | { readonly kind: "rest"; readonly repo: string | undefined; readonly number: number }
   | { readonly kind: "graphql" }
-  | { readonly kind: "refuse"; readonly reason: string }
+  /** A refusal; `release` marks one of the release guard's, which names John's grant. */
+  | { readonly kind: "refuse"; readonly reason: string; readonly release?: true }
   /**
    * A write that moves a branch: the branch the path names, else the field
    * that names it (`ref` for a new ref, `branch` for a contents write, whose
    * absence means the default branch).
    */
   | { readonly kind: "ref"; readonly repo: string | undefined; readonly branch: string }
-  | { readonly kind: "ref-field"; readonly repo: string | undefined; readonly field: "ref" | "branch" };
+  | { readonly kind: "ref-field"; readonly repo: string | undefined; readonly field: "ref" | "branch" }
+  /** A write to an existing tag's ref, which moves or deletes it: agents never do either. */
+  | { readonly kind: "tag"; readonly repo: string | undefined; readonly tag: string }
+  /** A release write: to the release `id` names (an edit, a deletion, an asset), or a new one (`id` undefined), whose tag the body names. */
+  | { readonly kind: "release"; readonly repo: string | undefined; readonly id: number | undefined };
+
+/** Every release refusal names what John runs; `<tag>` when the tag is not known. */
+export const RELEASE_GRANT = "John's grant (`agent-gh allow release <tag>`)";
+
+const DEPLOYMENTS =
+  "agents never approve or reject a deployment: an environment's approval is John's click on the run's page, and no grant (`agent-gh allow release <tag>`) covers it";
 
 export const apiMerge = (call: ApiCall): ApiMerge => {
   if (call.endpoint === undefined) return { kind: "none" };
-  const path = call.endpoint.replace(/^https?:\/\/api\.github\.com\//i, "").replace(/^\//, "").split(/[?#]/)[0] as string;
+  const relative = call.endpoint.replace(/^https?:\/\/api\.github\.com\//i, "");
+  // gh sends any endpoint holding `://` to that URL as it is.
+  if (relative.includes("://")) return absoluteWrite(call, relative);
+  const path = relative.replace(/^\/+/, "").split(/[?#]/)[0] as string;
   if (/^graphql\/?$/i.test(path)) return { kind: "graphql" };
   if (call.method === "GET" || call.method === "HEAD") return { kind: "none" };
   const unreadable = { kind: "refuse", reason: `cannot tell whether \`gh api ${call.method} ${call.endpoint}\` merges a pull request; use \`gh pr merge\`` } as const;
@@ -458,7 +472,8 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
   }
   if (names.some((name) => name === "." || name === "..")) return unreadable;
   const operation = names.map((name) => name.toLowerCase());
-  const refWrite = refPlan(path, skip, names, operation, call.method);
+  if (operation.includes("pending_deployments") || operation.includes("deployment_protection_rule")) return { kind: "refuse", reason: DEPLOYMENTS, release: true };
+  const refWrite = refPlan(path, skip, names, operation, call.method) ?? releasePlan(path, skip, operation, call.method);
   if (refWrite !== undefined) return refWrite;
   if (!operation.some((segment) => segment === "merge" || segment === "merges")) return { kind: "none" };
   const pr = /^repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)\/merge\/?$/i.exec(path);
@@ -479,17 +494,147 @@ const refPlan = (path: string, skip: number, names: readonly string[], operation
   // A fork's merge-upstream moves its `branch` (the default when it names none) past any pull request.
   const upstream = operation[0] === "merge-upstream";
   if (!refs && !contents && !upstream) return undefined;
+  const repo = pathRepo(path, skip);
+  if (typeof repo === "object") return repo;
+  if (contents || upstream) return { kind: "ref-field", repo, field: "branch" };
+  if (operation.length === 2) return method === "POST" ? { kind: "ref-field", repo, field: "ref" } : { kind: "none" };
+  // A tag is created by a POST to git/refs (above); a write to its own ref moves or deletes it.
+  if (operation[2] === "tags") return { kind: "tag", repo, tag: names.slice(3).join("/").replace(/\/$/, "") };
+  // Only branches carry required checks; other refs are not held.
+  if (operation[2] !== "heads" || operation.length < 4) return { kind: "none" };
+  return { kind: "ref", repo, branch: names.slice(3).join("/").replace(/\/$/, "") };
+};
+
+/** The repository a `repos/OWNER/REPO/...` path names (undefined for gh's `{owner}/{repo}`, the current one), or a refusal. */
+const pathRepo = (path: string, skip: number): string | undefined | ApiMerge => {
   if (skip !== 3) return { kind: "refuse", reason: `cannot tell which repository \`gh api ${path}\` writes to; name it as repos/OWNER/REPO` };
   const repoPart = /^repos\/([^/]+)\/([^/]+)\//i.exec(path);
   const [owner, name] = [repoPart?.[1] ?? "", repoPart?.[2] ?? ""];
   const placeholders = owner === "{owner}" && name === "{repo}";
   if (!placeholders && /[{}%]/.test(owner + name)) return { kind: "refuse", reason: `cannot tell which repository \`gh api ${path}\` writes to` };
-  const repo = placeholders ? undefined : `${owner}/${name}`;
-  if (contents || upstream) return { kind: "ref-field", repo, field: "branch" };
-  if (operation.length === 2) return method === "POST" ? { kind: "ref-field", repo, field: "ref" } : { kind: "none" };
-  // Only branches carry required checks; tags and other refs are not held.
-  if (operation[2] !== "heads" || operation.length < 4) return { kind: "none" };
-  return { kind: "ref", repo, branch: names.slice(3).join("/").replace(/\/$/, "") };
+  return placeholders ? undefined : `${owner}/${name}`;
+};
+
+/**
+ * A REST write to a repository's releases, if `path` is one: a new release, or
+ * the release its id names (an edit, a deletion, or a new asset). Release
+ * notes drafted by generate-notes and reactions write no release; an asset's
+ * own endpoint names no release, and any other write is refused.
+ */
+const releasePlan = (path: string, skip: number, operation: readonly string[], method: string): ApiMerge | undefined => {
+  if (operation[0] !== "releases") return undefined;
+  const repo = pathRepo(path, skip);
+  if (typeof repo === "object") return { ...repo, release: true } as ApiMerge;
+  const parts = operation.at(-1) === "" ? operation.slice(0, -1) : operation;
+  const unreadable: ApiMerge = { kind: "refuse", reason: `cannot tell which release \`gh api ${method} ${path}\` writes; use \`gh release\`, which needs ${RELEASE_GRANT}`, release: true };
+  if (parts.length === 1) return method === "POST" ? { kind: "release", repo, id: undefined } : unreadable;
+  if (parts.length === 2 && parts[1] === "generate-notes") return method === "POST" ? { kind: "none" } : unreadable;
+  if (parts[1] === "assets") {
+    return { kind: "refuse", reason: `cannot tell which release \`gh api ${method} ${path}\` changes an asset of; use \`gh release upload --clobber\` or \`gh release delete-asset\`, which need ${RELEASE_GRANT}`, release: true };
+  }
+  if (!/^\d+$/.test(parts[1] as string)) return unreadable;
+  const id = Number(parts[1]);
+  if (parts.length === 2) return method === "PATCH" || method === "DELETE" ? { kind: "release", repo, id } : unreadable;
+  if (parts[2] === "reactions") return { kind: "none" };
+  if (parts.length === 3 && parts[2] === "assets" && method === "POST") return { kind: "release", repo, id };
+  return unreadable;
+};
+
+/**
+ * A `gh api` call to a full URL other than api.github.com's: a release asset
+ * upload to uploads.github.com, or a write gh would send John's token with to
+ * another github.com host, which the guard cannot read. Other hosts are not
+ * GitHub's.
+ */
+const absoluteWrite = (call: ApiCall, endpoint: string): ApiMerge => {
+  if (call.method === "GET" || call.method === "HEAD") return { kind: "none" };
+  let host: string;
+  try {
+    host = new URL(endpoint).hostname.toLowerCase().replace(/\.$/, "");
+  } catch {
+    return { kind: "refuse", reason: `cannot read the URL \`gh api ${call.method} ${endpoint}\` writes to` };
+  }
+  if (host !== "github.com" && !host.endsWith(".github.com")) return { kind: "none" };
+  const upload = /^https?:\/\/[^/]+\/repos\/([^/?#]+)\/([^/?#]+)\/releases\/(\d+)\/assets\/?(?:[?#]|$)/i.exec(endpoint);
+  if (host === "uploads.github.com" && upload !== null) {
+    const [owner, name] = [upload[1] as string, upload[2] as string];
+    const placeholders = owner === "{owner}" && name === "{repo}";
+    if (placeholders || !/[{}%]/.test(owner + name)) return { kind: "release", repo: placeholders ? undefined : `${owner}/${name}`, id: Number(upload[3]) };
+  }
+  return { kind: "refuse", reason: `cannot tell what \`gh api ${call.method} ${endpoint}\` writes; name an api.github.com endpoint as a path (a release upload needs ${RELEASE_GRANT})`, release: true };
+};
+
+/**
+ * The first `count` command words of gh's arguments, as gh's parser (cobra)
+ * finds them: before them, a flag that is not a switch it knows takes the
+ * next word as its value, so `gh release --target x create` runs `create`.
+ */
+const commandWords = (args: readonly string[], count: number): string[] => {
+  const words: string[] = [];
+  for (let index = 0; index < args.length && words.length < count; index++) {
+    const arg = args[index] as string;
+    if (arg === "--") break;
+    if (arg.startsWith("--")) {
+      if (!arg.includes("=") && arg !== "--help" && arg !== "--version") index++;
+    } else if (arg.startsWith("-") && arg.length === 2) {
+      if (arg !== "-h") index++;
+    } else if (!arg.startsWith("-")) words.push(arg);
+  }
+  return words;
+};
+
+/** What `gh release` does, for the release guard. */
+export type ReleaseCommand =
+  /** A read (list, view, download, verify), or help. */
+  | { readonly kind: "read" }
+  /** A subcommand this release does not know, which is refused. */
+  | { readonly kind: "unknown"; readonly subcommand: string; readonly repo: string | undefined }
+  /**
+   * A write: its tag (undefined when it cannot be read), its `-R`, its
+   * `--target`, and, for `edit`, the `--tag` it moves the release to.
+   */
+  | {
+      readonly kind: "write";
+      readonly subcommand: "create" | "edit" | "upload" | "delete-asset" | "delete";
+      readonly tag: string | undefined;
+      readonly repo: string | undefined;
+      readonly target: string | undefined;
+      readonly newTag: string | undefined;
+    };
+
+const RELEASE_READS = ["list", "ls", "view", "download", "verify", "verify-asset"];
+
+/** Each release write's flags that take a value, `-R`/`--repo` among them. */
+const RELEASE_FLAGS = new Map<string, ValueFlags>([
+  ["create", { long: ["repo", "discussion-category", "notes", "notes-file", "notes-start-tag", "target", "title"], short: "RnFt" }],
+  ["edit", { long: ["repo", "discussion-category", "notes", "notes-file", "tag", "target", "title"], short: "RnFt" }],
+  ["upload", READY_FLAGS],
+  ["delete-asset", READY_FLAGS],
+  ["delete", READY_FLAGS],
+]);
+
+/**
+ * `gh release`, as gh reads it: a read, an unknown subcommand, or a write and
+ * the tag it names (the first word after the subcommand, read with that
+ * subcommand's own flags). Undefined for any other command.
+ */
+export const releaseCommand = (args: readonly string[]): ReleaseCommand | undefined => {
+  const [command, sub] = commandWords(args, 2);
+  if (command !== "release") return undefined;
+  if (sub === undefined || RELEASE_READS.includes(sub)) return { kind: "read" };
+  const name = sub === "new" ? "create" : sub;
+  const flags = RELEASE_FLAGS.get(name);
+  if (flags === undefined) return { kind: "unknown", subcommand: sub, repo: ghArgs(args, READY_FLAGS).last("R", "repo") };
+  const { words, last } = ghArgs(args, flags);
+  return {
+    kind: "write",
+    subcommand: name as "create" | "edit" | "upload" | "delete-asset" | "delete",
+    // Where gh's first two words are not the command, the tag cannot be told with certainty.
+    tag: words[0] === "release" && words[1] === sub ? words[2] : undefined,
+    repo: last("R", "repo"),
+    target: last("target"),
+    newTag: name === "edit" ? last("tag") : undefined,
+  };
 };
 
 /**
@@ -568,17 +713,26 @@ const MERGE_NAMES = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullR
  * requires. Empty when it merges nothing; a refusal when it merges a branch,
  * or this cannot read a merge's pull request id with certainty.
  */
-/** A branch a GraphQL write would move: by ref or branch node id, or by repository and name. */
-export type GraphqlRefWrite = { readonly node: string } | { readonly repo: string; readonly branch: string };
+/**
+ * A ref a GraphQL write would move: a ref or branch node id, a branch by
+ * repository and name, or a tag `createRef` creates in the repository whose
+ * node id it names, at `oid`.
+ */
+export type GraphqlRefWrite =
+  | { readonly node: string }
+  | { readonly repo: string; readonly branch: string }
+  | { readonly tag: string; readonly repositoryId: string; readonly oid: string };
 
 const REF_WRITES = /\b(updateRefs|createRef|updateRef|deleteRef|createCommitOnBranch)\b/g;
 
 /**
- * The branches a GraphQL document's ref-moving mutations aim at, read from
- * each one's own arguments outside comments and strings: `updateRef` and
+ * The refs a GraphQL document's ref-moving mutations aim at, read from each
+ * one's own arguments outside comments and strings: `updateRef` and
  * `deleteRef` by `refId`, `createCommitOnBranch` by its branch's id or
- * repository and name. `updateRefs` and `createRef` are refused (use git
- * push, which the pre-push guard holds), as is any this cannot read.
+ * repository and name, and `createRef` of a tag (`refs/tags/...`), which needs
+ * John's grant. `updateRefs`, and `createRef` of anything but a tag, are
+ * refused (use git push, which the pre-push guard holds), as is any this
+ * cannot read.
  */
 export const graphqlRefWrites = (query: string, variables: Readonly<Record<string, unknown>>): readonly GraphqlRefWrite[] | { readonly refuse: string } => {
   const unreadable = { refuse: "cannot read which branch a GraphQL ref write moves; push with git instead" };
@@ -587,11 +741,18 @@ export const graphqlRefWrites = (query: string, variables: Readonly<Record<strin
   const writes: GraphqlRefWrite[] = [];
   for (const match of mask.matchAll(REF_WRITES)) {
     const name = match[1] as string;
-    if (name === "updateRefs" || name === "createRef") return { refuse: `agents do not use the GraphQL ${name} mutation; push with git, which checks the branch` };
+    if (name === "updateRefs") return { refuse: "agents do not use the GraphQL updateRefs mutation; push with git, which checks each branch and tag" };
     const open = /^\s*\(/.exec(mask.slice((match.index as number) + match[0].length));
     const range = open === null ? undefined : parenthesised(mask, (match.index as number) + match[0].length + open[0].length - 1);
     if (range === undefined) return unreadable;
     const [text, args] = [query.slice(range.from, range.to), mask.slice(range.from, range.to)];
+    if (name === "createRef") {
+      const [ref, repositoryId, oid] = ["name", "repositoryId", "oid"].map((field) => inputField(text, args, field, variables));
+      if (typeof ref !== "string" || typeof repositoryId !== "string" || typeof oid !== "string") return { refuse: "cannot read which ref a GraphQL createRef creates, in which repository, or where; push with git instead" };
+      if (!/^refs\/tags\/./i.test(ref)) return { refuse: "agents create only tags with the GraphQL createRef mutation; push a branch with git, which checks it" };
+      writes.push({ tag: ref.slice("refs/tags/".length), repositoryId, oid });
+      continue;
+    }
     if (name !== "createCommitOnBranch") {
       const id = inputField(text, args, "refId", variables);
       if (typeof id !== "string") return unreadable;
@@ -615,6 +776,19 @@ export const graphqlRefWrites = (query: string, variables: Readonly<Record<strin
     else return unreadable;
   }
   return writes;
+};
+
+/**
+ * Why a GraphQL document is refused outright for releases, or undefined: it
+ * approves or rejects a deployment, which is John's click, or it is a
+ * mutation naming any field with "release" in it, which fails closed should
+ * GitHub add a release mutation. A document this cannot mask is read whole.
+ */
+export const graphqlReleaseRefusal = (query: string): string | undefined => {
+  const mask = masked(query) ?? query;
+  if (/\b(approveDeployments|rejectDeployments)\b/.test(mask)) return DEPLOYMENTS;
+  if (/\bmutation\b/.test(mask) && /\b\w*release\w*\s*\(/i.test(mask)) return `agents do not write releases through GraphQL; use \`gh release\`, which needs ${RELEASE_GRANT}`;
+  return undefined;
 };
 
 export const graphqlMerges = (query: string, variables: Readonly<Record<string, unknown>>): readonly GraphqlMerge[] | { readonly refuse: string } => {

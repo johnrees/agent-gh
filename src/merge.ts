@@ -89,21 +89,29 @@ export const checkState = (check: RequiredCheck, statuses: unknown, runs: unknow
   return "passed";
 };
 
+/** A tag a push writes: its name, the object it sends (git's zeros for a deletion), and the remote's (zeros when the remote has no such tag). */
+export type PushedTag = { readonly tag: string; readonly local: string; readonly remote: string };
+
+/** Whether a pre-push object name is git's zeros: nothing, for a deletion's local side or a ref the remote lacks. */
+export const absent = (sha: string): boolean => /^0+$/.test(sha);
+
 /**
- * The branches a push moves, from the lines git gives a pre-push hook
- * (`<local ref> <local sha> <remote ref> <remote sha>`), deletions
- * included; tags and other refs carry no required checks. Undefined when a
- * line is not in that form, so the guard fails closed.
+ * The branches and tags a push moves, from the lines git gives a pre-push
+ * hook (`<local ref> <local sha> <remote ref> <remote sha>`), deletions
+ * included; other refs carry no rules. Undefined when a line is not in that
+ * form, so the guard fails closed.
  */
-export const pushedBranches = (stdin: string): string[] | undefined => {
+export const pushedRefs = (stdin: string): { readonly branches: string[]; readonly tags: PushedTag[] } | undefined => {
   const branches: string[] = [];
+  const tags: PushedTag[] = [];
   for (const line of stdin.split("\n")) {
     if (line.trim() === "") continue;
     const parts = line.split(" ");
     if (parts.length !== 4 || !/^[0-9a-f]{40,64}$/.test(parts[1] as string) || !/^[0-9a-f]{40,64}$/.test(parts[3] as string)) return undefined;
-    const remote = parts[2] as string;
-    if (remote.startsWith("refs/heads/")) branches.push(remote.slice("refs/heads/".length));
-    else if (!remote.startsWith("refs/")) return undefined;
+    const [local, remoteRef, remote] = [parts[1] as string, parts[2] as string, parts[3] as string];
+    if (remoteRef.startsWith("refs/heads/")) branches.push(remoteRef.slice("refs/heads/".length));
+    else if (remoteRef.startsWith("refs/tags/") && remoteRef.length > "refs/tags/".length) tags.push({ tag: remoteRef.slice("refs/tags/".length), local, remote });
+    else if (!remoteRef.startsWith("refs/") || remoteRef === "refs/tags/") return undefined;
   }
-  return [...new Set(branches)];
+  return { branches: [...new Set(branches)], tags };
 };

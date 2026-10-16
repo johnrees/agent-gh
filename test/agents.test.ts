@@ -72,6 +72,7 @@ test("instructions go to each harness that has run here, once, and keep what is 
   expect(readFileSync(join(dir, ".codex", "AGENTS.md"), "utf8")).toBe(`${instructionsBlock()}\n`);
   expect(staleInstructions(dir)).toEqual([]);
   expect(claude).toContain("before marking a pull request ready, run `agent-gh review full` from its pushed head");
+  expect(claude).toContain("- Never push a tag or create or edit a release unless John has run `agent-gh allow release <tag>` for it; ask him.");
 
   // An older block is rewritten in place.
   writeFileSync(join(dir, ".codex", "AGENTS.md"), "top\n<!-- >>> agent-gh >>> -->\nold\n<!-- <<< agent-gh <<< -->\nbottom\n");
