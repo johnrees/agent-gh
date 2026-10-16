@@ -198,23 +198,22 @@ const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "age
   const files = author === "person" ? [] : await pullFiles(io, pr);
   // A comment edited since it was posted (its updated_at moved; a reaction leaves it) carries no trusted record.
   const comments = prComments.map((comment) => ({ author: comment.author, body: comment.body, edited: comment.updatedAt !== comment.createdAt }));
-  const input = { hold, author, number: pr.number, url: holdLink(slug(io.repo), pr.number, hold, pr.base), threads, files, comments, head: pr.head, base: pr.base, sharedWith: await sharingHead(io, pr.number, pr.head) };
+  const mergeBase = text(record(record(await get(io, STAGE, `${repoPath(io)}/compare/${encodeURIComponent(pr.base)}...${pr.head}`)).merge_base_commit).sha);
+  if (!/^[0-9a-f]{40}$/.test(mergeBase)) throw new Failure(STAGE, `#${pr.number}'s merge base: invalid response`);
+  const url = holdLink(slug(io.repo), pr.number, hold, pr.base, mergeBase);
+  const input = { hold, author, number: pr.number, url, threads, files, comments, head: pr.head, base: pr.base, sharedWith: await sharingHead(io, pr.number, pr.head) };
   const needs = holdNeeds(input);
   // Only the run of the release's own `labeled` event records it, at the head that event gave.
   const own = needs !== undefined && labeled !== undefined && releaseRunMatches(threads[0]?.events ?? [], hold.releaseLabel, needs.release, labeled.at);
-  const released = own ? { head: labeled.head, base: labeled.base } : undefined;
-  if (needs === undefined || needs.record === "edited" || (needs.record === undefined && released === undefined)) return holdStatus(input);
+  if (needs === undefined || needs.record === "edited" || (needs.record === undefined && !own)) return holdStatus(input);
   const pathsPatchId = await reservedPatchId(io, pr, hold.paths, pr.head, pr.base);
-  // The release's diff is the one its event showed: that head, against that event's base branch.
-  const releaseRun =
-    needs.record === undefined && released !== undefined
-      ? { ...released, pathsPatchId: released.head === pr.head && released.base === pr.base ? pathsPatchId : await reservedPatchId(io, pr, hold.paths, released.head, released.base) }
-      : undefined;
+  // The release's diff is the one its event showed: that head, against the base branch's commit then, whatever has merged into it since.
+  const releaseRun = needs.record === undefined && own ? { head: labeled.head, base: labeled.base, pathsPatchId: await reservedPatchId(io, pr, hold.paths, labeled.head, labeled.baseSha) } : undefined;
   return holdStatus({ ...input, pathsPatchId, ...(releaseRun === undefined ? {} : { releaseRun }) });
 };
 
-/** A pull request's `labeled` event, which this run handles: the label, the head and base branch GitHub gave the event, and when (the pull request's `updated_at` then). */
-export type LabeledEvent = { readonly label: string; readonly head: string; readonly base: string; readonly at: string };
+/** A pull request's `labeled` event, which this run handles: the label, the head and base branch (and its commit) GitHub gave the event, and when (the pull request's `updated_at` then). */
+export type LabeledEvent = { readonly label: string; readonly head: string; readonly base: string; readonly baseSha: string; readonly at: string };
 
 /** What a run derives for a pull request: the statuses for its head, a release record to write first, and the hold it judged by. */
 export type Derived = { readonly head: string; readonly statuses: readonly Status[]; readonly record?: ReleaseRecord; readonly hold?: HoldConfig };
@@ -505,7 +504,9 @@ const labeledEvent = (payload: unknown): LabeledEvent | undefined => {
   const label = text(record(event.label).name);
   const at = text(record(event.pull_request).updated_at);
   const base = text(record(record(event.pull_request).base).ref);
-  return event.action === "labeled" && /^[0-9a-f]{40}$/.test(head) && label !== "" && base !== "" && !Number.isNaN(Date.parse(at)) ? { label, head, base, at } : undefined;
+  const baseSha = text(record(record(event.pull_request).base).sha);
+  const valid = event.action === "labeled" && /^[0-9a-f]{40}$/.test(head) && /^[0-9a-f]{40}$/.test(baseSha) && label !== "" && base !== "" && !Number.isNaN(Date.parse(at));
+  return valid ? { label, head, base, baseSha, at } : undefined;
 };
 
 /** The hold on an open pull request's base branch's config. */

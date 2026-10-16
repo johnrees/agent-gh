@@ -313,13 +313,31 @@ export const FILES_LISTED = 3000;
 
 /**
  * What an agent-hold status links: its pull request, with a fingerprint of
- * the base branch and the hold it was judged against. A status on a commit
- * is any pull request's with that head, and outlives a retarget or a change
- * to the base branch's hold, so the merge guard counts only one linking the
- * pull request it merges against the base and hold it reads now.
+ * the base branch, the merge base, and the hold it was judged against. A
+ * status on a commit is any pull request's with that head, and outlives a
+ * retarget, a merge into the base that moves the merge base (and so the
+ * diff), or a change to the base branch's hold, so the merge guard counts
+ * only one linking the pull request it merges against what it reads now.
  */
-export const holdLink = (repo: string, number: number, hold: HoldConfig, base: string): string =>
-  `https://github.com/${repo}/pull/${number}#agent-hold-${createHash("sha256").update(JSON.stringify([base, hold.label.toLowerCase(), hold.releaseLabel.toLowerCase(), hold.paths])).digest("hex").slice(0, 12)}`;
+export const holdLink = (repo: string, number: number, hold: HoldConfig, base: string, mergeBase: string): string =>
+  `https://github.com/${repo}/pull/${number}#agent-hold-${createHash("sha256").update(JSON.stringify([base, mergeBase, hold.label.toLowerCase(), hold.releaseLabel.toLowerCase(), hold.paths])).digest("hex").slice(0, 12)}`;
+
+/**
+ * Why the hold's label holds a pull request, from it (first) and the issues
+ * it closes (`labelHold`), or undefined: the workflow's agent-hold and the
+ * merge guard, which checks it live, so a label added while its run waits
+ * still holds.
+ */
+export const labelHoldReason = (threads: readonly HoldThread[], hold: HoldConfig): string | undefined => {
+  const pr = threads[0];
+  const prRelease = pr === undefined ? undefined : personRelease(pr.labels, pr.events, hold.releaseLabel);
+  const holds = threads.map((thread) => ({ thread, state: labelHold(thread, hold, prRelease) }));
+  const on = holds.find((entry) => entry.state === "on");
+  if (on !== undefined) return `held: \`${hold.label}\` on ${on.thread.ref}${on.thread.ask === undefined ? "" : `: ${on.thread.ask}`}`;
+  const removed = holds.find((entry) => entry.state === "removed");
+  if (removed !== undefined) return `held: \`${hold.label}\` came off ${removed.thread.ref}, which releases nothing; a person adds \`${hold.releaseLabel}\``;
+  return undefined;
+};
 
 /**
  * Whether a `labeled` run is the release's own: the latest addition of the
@@ -342,6 +360,7 @@ export const releaseRunMatches = (events: readonly LabelEvent[], releaseLabel: s
  * bind the release to another head.
  */
 export type ReleaseRun = { readonly head: string; readonly base: string; readonly pathsPatchId: string | null };
+
 
 export type HoldInput = {
   readonly hold: HoldConfig;
@@ -401,13 +420,8 @@ export const holdStatus = (input: HoldInput): { readonly status: Status; readonl
   const of = (state: Status["state"], description: string): Status => ({ context: HOLD_CONTEXT, state, description: statusDescription(description), targetUrl: input.url });
   const held = (description: string) => ({ status: of("failure", description) });
   if (input.sharedWith.length > 0) return held(`held: ${input.head.slice(0, 8)} is also the head of ${input.sharedWith.map((number) => `#${number}`).join(", ")}, so neither is judged alone`);
-  const pr = input.threads[0];
-  const prRelease = pr === undefined ? undefined : personRelease(pr.labels, pr.events, hold.releaseLabel);
-  const holds = input.threads.map((thread) => ({ thread, state: labelHold(thread, hold, prRelease) }));
-  const on = holds.find((entry) => entry.state === "on");
-  if (on !== undefined) return held(`held: \`${hold.label}\` on ${on.thread.ref}: ${on.thread.ask ?? NO_ASK}`);
-  const removed = holds.find((entry) => entry.state === "removed");
-  if (removed !== undefined) return held(`held: \`${hold.label}\` came off ${removed.thread.ref}, which releases nothing; a person adds \`${hold.releaseLabel}\``);
+  const label = labelHoldReason(input.threads, hold);
+  if (label !== undefined) return held(label);
   if (input.author === "person") return { status: of("success", "not an agent PR") };
   if (input.files === undefined) return held(`held: lists over ${FILES_LISTED.toLocaleString("en-US")} files, too many to check`);
   const reserved = reservedFiles(input.files, hold.paths);
