@@ -358,12 +358,12 @@ const holdRefusal = async (io: ReviewIo, pr: Pull, hold: HoldConfig, required: r
     return `\`--auto\` cannot wait for ${HOLD_CONTEXT} on pull request #${pr.number}: ${pr.base}'s rules do not require ${HOLD_CONTEXT} from GitHub Actions, so a hold that comes later would not stop the merge; merge once ${HOLD_CONTEXT} passes, or ask John to require it`;
   }
   const shown = (await byApps()).find((status) => status.context === HOLD_CONTEXT && status.app_id === ACTIONS_APP);
-  const own = holdLink(slug(io.repo), pr.number, hold).toLowerCase() === text(shown?.target_url).toLowerCase();
+  const own = holdLink(slug(io.repo), pr.number, hold, pr.base).toLowerCase() === text(shown?.target_url).toLowerCase();
   const why =
     shown === undefined
       ? `no ${HOLD_CONTEXT} status from GitHub Actions`
       : !own
-        ? `the latest ${HOLD_CONTEXT} on it was not judged for this pull request under ${pr.base}'s hold now (${text(shown.target_url) || "no link"}); the agent-review workflow sets it on the next event`
+        ? `the latest ${HOLD_CONTEXT} on it was not judged for this pull request against ${pr.base} and its hold now (${text(shown.target_url) || "no link"}); the agent-review workflow sets it on the next event`
         : `${HOLD_CONTEXT} ${shown.state === "failure" || shown.state === "error" ? "failed" : text(shown.state)}: ${text(shown.description)}`;
   if (auto) return own ? undefined : `\`--auto\` would wait on another pull request's ${HOLD_CONTEXT} on #${pr.number}'s head ${pr.head.slice(0, 8)} (${why})`;
   if (shown?.state === "success" && own) return undefined;

@@ -262,12 +262,13 @@ export const reservedFiles = (files: readonly ChangedFile[], paths: readonly str
 
 /**
  * What binds a person's path release: the release label's event, who added
- * it, the head it released, and the `git patch-id --stable` of the head's
- * diff from its merge base in the reserved files then (null for none). The
- * workflow writes it as `github-actions[bot]` when it first sees the
- * release; a record anyone else posts counts for nothing.
+ * it, the head it released and the base branch it was against, and the
+ * `git patch-id --stable` of the head's diff from its merge base with that
+ * branch in the reserved files then (null for none). The release's own run
+ * writes it as `github-actions[bot]`; a record anyone else posts counts for
+ * nothing.
  */
-export type ReleaseRecord = { readonly v: 1; readonly event: number; readonly by: string; readonly head: string; readonly paths_patch_id: string | null };
+export type ReleaseRecord = { readonly v: 1; readonly event: number; readonly by: string; readonly head: string; readonly base: string; readonly paths_patch_id: string | null };
 
 const RELEASE = /<!-- agent-hold-release (\{[^\n]*?\}) -->/;
 const SHA = /^[0-9a-f]{40}$/;
@@ -282,8 +283,8 @@ export const parseRelease = (body: string): ReleaseRecord | undefined => {
     const value = record(JSON.parse(match[1] as string));
     const ok =
       value.v === 1 && Number.isSafeInteger(value.event) && typeof value.by === "string" && typeof value.head === "string" && SHA.test(value.head) &&
-      (value.paths_patch_id === null || (typeof value.paths_patch_id === "string" && SHA.test(value.paths_patch_id)));
-    return ok ? { v: 1, event: value.event as number, by: value.by as string, head: value.head as string, paths_patch_id: value.paths_patch_id as string | null } : undefined;
+      typeof value.base === "string" && value.base !== "" && (value.paths_patch_id === null || (typeof value.paths_patch_id === "string" && SHA.test(value.paths_patch_id)));
+    return ok ? { v: 1, event: value.event as number, by: value.by as string, head: value.head as string, base: value.base as string, paths_patch_id: value.paths_patch_id as string | null } : undefined;
   } catch {
     return undefined;
   }
@@ -312,22 +313,27 @@ export const FILES_LISTED = 3000;
 
 /**
  * What an agent-hold status links: its pull request, with a fingerprint of
- * the hold it was judged by. A status on a commit is any pull request's with
- * that head, and outlives a change to the base branch's hold, so the merge
- * guard counts only one linking the pull request it merges under the hold
- * it reads now.
+ * the base branch and the hold it was judged against. A status on a commit
+ * is any pull request's with that head, and outlives a retarget or a change
+ * to the base branch's hold, so the merge guard counts only one linking the
+ * pull request it merges against the base and hold it reads now.
  */
-export const holdLink = (repo: string, number: number, hold: HoldConfig): string =>
-  `https://github.com/${repo}/pull/${number}#agent-hold-${createHash("sha256").update(JSON.stringify([hold.label.toLowerCase(), hold.releaseLabel.toLowerCase(), hold.paths])).digest("hex").slice(0, 12)}`;
+export const holdLink = (repo: string, number: number, hold: HoldConfig, base: string): string =>
+  `https://github.com/${repo}/pull/${number}#agent-hold-${createHash("sha256").update(JSON.stringify([base, hold.label.toLowerCase(), hold.releaseLabel.toLowerCase(), hold.paths])).digest("hex").slice(0, 12)}`;
 
 /**
  * Whether a `labeled` run is the release's own: the latest addition of the
  * release label at or before the run's event time (`at`, the pull request's
- * `updated_at` in its payload) is `release`. Another addition's run, an
- * agent's before the person's say, records nothing.
+ * `updated_at` in its payload, which GitHub gives to the second) is
+ * `release`, and no other change to that label shares its second. Another
+ * addition's run, an agent's before the person's say, records nothing, and
+ * neither does a run that cannot tell which it is.
  */
-export const releaseRunMatches = (events: readonly LabelEvent[], releaseLabel: string, release: LabelEvent, at: string): boolean =>
-  events.filter((event) => event.event === "labeled" && sameLabel(event.label, releaseLabel) && Date.parse(event.at) <= Date.parse(at)).at(-1)?.id === release.id;
+export const releaseRunMatches = (events: readonly LabelEvent[], releaseLabel: string, release: LabelEvent, at: string): boolean => {
+  const changes = events.filter((event) => sameLabel(event.label, releaseLabel));
+  const second = changes.filter((event) => Date.parse(event.at) === Date.parse(release.at));
+  return second.length === 1 && changes.filter((event) => event.event === "labeled" && Date.parse(event.at) <= Date.parse(at)).at(-1)?.id === release.id;
+};
 
 /**
  * The release label's own `labeled` run: the head GitHub gave that event (the
@@ -335,7 +341,7 @@ export const releaseRunMatches = (events: readonly LabelEvent[], releaseLabel: s
  * writes a release record, so no later push, rewind, or deleted record can
  * bind the release to another head.
  */
-export type ReleaseRun = { readonly head: string; readonly pathsPatchId: string | null };
+export type ReleaseRun = { readonly head: string; readonly base: string; readonly pathsPatchId: string | null };
 
 export type HoldInput = {
   readonly hold: HoldConfig;
@@ -351,6 +357,8 @@ export type HoldInput = {
   /** The pull request's comments, which carry the release records. */
   readonly comments: readonly PostedBy[];
   readonly head: string;
+  /** The base branch it is judged against now. */
+  readonly base: string;
   /** Other open pull requests whose head is this one: a status on a commit is theirs too, so none is judged alone. */
   readonly sharedWith: readonly number[];
   /** The reserved files' patch id at the head now (`ReleaseRecord.paths_patch_id`); undefined when it was not needed. */
@@ -413,8 +421,13 @@ export const holdStatus = (input: HoldInput): { readonly status: Status; readonl
   const { release, record: bound } = needs;
   const again = `John adds \`${hold.releaseLabel}\` again`;
   if (bound === "edited") return held(`held: the record of ${release.actor}'s release was edited; ${again}`);
-  const binding = bound ?? (input.releaseRun === undefined ? undefined : { v: 1 as const, event: release.id, by: release.actor, head: input.releaseRun.head, paths_patch_id: input.releaseRun.pathsPatchId });
+  const binding = bound ?? (input.releaseRun === undefined ? undefined : { v: 1 as const, event: release.id, by: release.actor, head: input.releaseRun.head, base: input.releaseRun.base, paths_patch_id: input.releaseRun.pathsPatchId });
   if (binding === undefined) return held(`held: ${release.actor}'s release is not recorded yet; if this stays, ${again}`);
+  // A release judged the diff against one base branch; retargeted, the diff is another.
+  if (binding.base !== input.base) {
+    const status = of("failure", `held: ${binding.by} released it against ${binding.base}, and it targets ${input.base} now; ${again}`);
+    return bound === undefined ? { status, record: binding } : { status };
+  }
   // Never released on a guess: what this needs and was not given holds it.
   if (input.pathsPatchId === undefined) return held("held: the reserved paths' diff was not read; rerun the workflow");
   const status =

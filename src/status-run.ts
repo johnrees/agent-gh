@@ -153,9 +153,9 @@ const reservedNames = async (io: StatusIo, mergeBase: string, head: string, path
   return reservedFiles(files, paths).names;
 };
 
-/** The reserved files' patch id at `head` (null for none), from its diff from the merge base GitHub reports for it. */
-const reservedPatchId = async (io: StatusIo, pr: Pull, paths: readonly string[], head: string): Promise<string | null> => {
-  const mergeBase = await fetchedPull(io, pr.number, pr.base, head);
+/** The reserved files' patch id at `head` (null for none), from its diff from the merge base GitHub reports for it with `base`. */
+const reservedPatchId = async (io: StatusIo, pr: Pull, paths: readonly string[], head: string, base: string): Promise<string | null> => {
+  const mergeBase = await fetchedPull(io, pr.number, base, head);
   if (mergeBase === undefined) throw new Failure(STAGE, `could not fetch ${head.slice(0, 8)} and its merge base to compare #${pr.number}'s reserved paths`);
   const names = await reservedNames(io, mergeBase, head, paths);
   return names.length === 0 ? null : (await pullDiff(io, mergeBase, head, names)).patchId;
@@ -198,19 +198,23 @@ const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "age
   const files = author === "person" ? [] : await pullFiles(io, pr);
   // A comment edited since it was posted (its updated_at moved; a reaction leaves it) carries no trusted record.
   const comments = prComments.map((comment) => ({ author: comment.author, body: comment.body, edited: comment.updatedAt !== comment.createdAt }));
-  const input = { hold, author, number: pr.number, url: holdLink(slug(io.repo), pr.number, hold), threads, files, comments, head: pr.head, sharedWith: await sharingHead(io, pr.number, pr.head) };
+  const input = { hold, author, number: pr.number, url: holdLink(slug(io.repo), pr.number, hold, pr.base), threads, files, comments, head: pr.head, base: pr.base, sharedWith: await sharingHead(io, pr.number, pr.head) };
   const needs = holdNeeds(input);
   // Only the run of the release's own `labeled` event records it, at the head that event gave.
   const own = needs !== undefined && labeled !== undefined && releaseRunMatches(threads[0]?.events ?? [], hold.releaseLabel, needs.release, labeled.at);
-  const releaseHead = own ? labeled.head : undefined;
-  if (needs === undefined || needs.record === "edited" || (needs.record === undefined && releaseHead === undefined)) return holdStatus(input);
-  const pathsPatchId = await reservedPatchId(io, pr, hold.paths, pr.head);
-  const releaseRun = needs.record === undefined && releaseHead !== undefined ? { head: releaseHead, pathsPatchId: releaseHead === pr.head ? pathsPatchId : await reservedPatchId(io, pr, hold.paths, releaseHead) } : undefined;
+  const released = own ? { head: labeled.head, base: labeled.base } : undefined;
+  if (needs === undefined || needs.record === "edited" || (needs.record === undefined && released === undefined)) return holdStatus(input);
+  const pathsPatchId = await reservedPatchId(io, pr, hold.paths, pr.head, pr.base);
+  // The release's diff is the one its event showed: that head, against that event's base branch.
+  const releaseRun =
+    needs.record === undefined && released !== undefined
+      ? { ...released, pathsPatchId: released.head === pr.head && released.base === pr.base ? pathsPatchId : await reservedPatchId(io, pr, hold.paths, released.head, released.base) }
+      : undefined;
   return holdStatus({ ...input, pathsPatchId, ...(releaseRun === undefined ? {} : { releaseRun }) });
 };
 
-/** A pull request's `labeled` event, which this run handles: the label, the head GitHub gave the event, and when (the pull request's `updated_at` then). */
-export type LabeledEvent = { readonly label: string; readonly head: string; readonly at: string };
+/** A pull request's `labeled` event, which this run handles: the label, the head and base branch GitHub gave the event, and when (the pull request's `updated_at` then). */
+export type LabeledEvent = { readonly label: string; readonly head: string; readonly base: string; readonly at: string };
 
 /** What a run derives for a pull request: the statuses for its head, a release record to write first, and the hold it judged by. */
 export type Derived = { readonly head: string; readonly statuses: readonly Status[]; readonly record?: ReleaseRecord; readonly hold?: HoldConfig };
@@ -500,7 +504,8 @@ const labeledEvent = (payload: unknown): LabeledEvent | undefined => {
   const head = text(record(record(event.pull_request).head).sha);
   const label = text(record(event.label).name);
   const at = text(record(event.pull_request).updated_at);
-  return event.action === "labeled" && /^[0-9a-f]{40}$/.test(head) && label !== "" && !Number.isNaN(Date.parse(at)) ? { label, head, at } : undefined;
+  const base = text(record(record(event.pull_request).base).ref);
+  return event.action === "labeled" && /^[0-9a-f]{40}$/.test(head) && label !== "" && base !== "" && !Number.isNaN(Date.parse(at)) ? { label, head, base, at } : undefined;
 };
 
 /** The hold on an open pull request's base branch's config. */
