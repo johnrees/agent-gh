@@ -1,12 +1,12 @@
 import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { installClaudeHook, installInstructions } from "./agents.ts";
+import { claudeDir, installClaudeHook, installInstructions, instructionFiles } from "./agents.ts";
 import { READ_APP, readConfig, type Registry } from "./config.ts";
 import { PUSH_USER } from "./credential.ts";
 import { CHILD_MARKER } from "./env.ts";
 import { Failure } from "./failure.ts";
-import { writeAtomic } from "./files.ts";
+import { writeIfChanged } from "./files.ts";
 import { gitAuthor } from "./git.ts";
 import { type Env, HARNESSES, harnessNames } from "./harness.ts";
 import { loginUsable } from "./login.ts";
@@ -186,16 +186,13 @@ export const withBlock = (text: string, block: string): string => {
  */
 export const RC_FILES = [".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".profile"] as const;
 
-export const updateStartupFiles = (home: string, shims: string, bin: string): string[] => {
+/** The startup files that get the block, and those of them this run had to write. */
+export const updateStartupFiles = (home: string, shims: string, bin: string): { readonly files: string[]; readonly written: string[] } => {
   const present = RC_FILES.map((name) => join(home, name)).filter((path) => existsSync(path));
-  const targets = present.length > 0 ? present : [join(home, ".profile")];
+  const files = present.length > 0 ? present : [join(home, ".profile")];
   const block = rcBlock(shims, bin);
-  for (const path of targets) {
-    const text = existsSync(path) ? readFileSync(path, "utf8") : "";
-    const next = withBlock(text, block);
-    if (next !== text) writeAtomic(path, next);
-  }
-  return targets;
+  const written = files.filter((path) => writeIfChanged(path, withBlock(existsSync(path) ? readFileSync(path, "utf8") : "", block)));
+  return { files, written };
 };
 
 /** The first `name` on `path` outside `skip`, as the shims find it, that `accept` takes. */
@@ -360,10 +357,12 @@ export const holds = (deps: ShimDeps, setting: GitSetting): boolean => {
 export const personalGhLogin = (deps: ShimDeps): boolean =>
   real(deps, "gh", ["auth", "status", "--hostname", "github.com"]).code === 0;
 
-/** Writes global git settings that do not already hold, keeping a shared key's other values. */
-const setGit = (deps: ShimDeps, settings: readonly GitSetting[]): void => {
+/** Writes global git settings that do not already hold, keeping a shared key's other values; the keys it wrote. */
+const setGit = (deps: ShimDeps, settings: readonly GitSetting[]): string[] => {
+  const written: string[] = [];
   for (const setting of settings) {
     if (holds(deps, setting)) continue;
+    written.push(setting.key);
     // A shared key (the insteadOf rules) keeps its other values; agent-gh's own are rewritten whole.
     if (setting.exact) real(deps, "git", ["config", "--global", "--unset-all", setting.key]);
     const present = setting.exact ? [] : globalGit(deps, setting.key);
@@ -373,7 +372,12 @@ const setGit = (deps: ShimDeps, settings: readonly GitSetting[]): void => {
       }
     }
   }
+  return written;
 };
+
+/** The text of each file, or undefined when it is missing, to tell what a step changed. */
+const contents = (paths: readonly string[]): (string | undefined)[] =>
+  paths.map((path) => (existsSync(path) ? readFileSync(path, "utf8") : undefined));
 
 /**
  * `agent-gh install-shims [--agent-machine]`: writes the gh shim and puts it
@@ -394,42 +398,58 @@ export const installShims = (deps: ShimDeps, agentMachine: boolean, families: re
       );
     }
   }
+  // What this run changed, for its last line: a rerun on a set-up machine changes nothing and says so.
+  const changed: string[] = [];
   mkdirSync(deps.shims, { recursive: true, mode: 0o755 });
   const gh = join(deps.shims, "gh");
-  writeAtomic(gh, ghShim(deps.shims, deps.agentGh, agentMachine));
-  chmodSync(gh, 0o755);
+  if (writeIfChanged(gh, ghShim(deps.shims, deps.agentGh, agentMachine))) changed.push(gh);
+  if ((statSync(gh).mode & 0o777) !== 0o755) {
+    chmodSync(gh, 0o755);
+    if (!changed.includes(gh)) changed.push(gh);
+  }
   const git = join(deps.shims, "git");
   if (existsSync(git) && isShim(git)) {
     unlinkSync(git);
+    changed.push(`removed ${git}`);
     deps.print(`removed ${git}: git is plain git, and a repository's commit hook credits the App`);
   }
-  const files = updateStartupFiles(deps.home, deps.shims, deps.bin);
-  deps.print(`gh shim: ${gh}, first on PATH in ${files.join(", ")}; open a new shell to use it`);
+  const startup = updateStartupFiles(deps.home, deps.shims, deps.bin);
+  changed.push(...startup.written);
+  deps.print(`gh shim: ${gh}, first on PATH in ${startup.files.join(", ")}; open a new shell to use it`);
+  const harnessFiles = [join(claudeDir(deps.home), "settings.json"), ...instructionFiles(deps.home)];
+  const before = contents(harnessFiles);
   const claude = installClaudeHook(deps.home, deps.agentGh);
   if (claude !== undefined) deps.print(`Claude Code: a SessionStart hook in ${claude} puts the shim first on PATH before every command`);
   const instructions = installInstructions(deps.home);
   if (instructions.length > 0) deps.print(`agent instructions: how to reach GitHub through agent-gh, in ${instructions.join(", ")}`);
+  const after = contents(harnessFiles);
+  changed.push(...harnessFiles.filter((_, index) => before[index] !== after[index]));
   mkdirSync(deps.configDir, { recursive: true, mode: 0o700 });
   const machine: Machine = agentMachine
     ? { agent_machine: true, ...(families === undefined ? {} : { families }) }
     : { agent_machine: false };
-  writeAtomic(join(deps.configDir, "machine.json"), `${JSON.stringify(machine)}\n`);
+  const machinePath = join(deps.configDir, "machine.json");
+  if (writeIfChanged(machinePath, `${JSON.stringify(machine)}\n`)) changed.push(machinePath);
+  const summary = () =>
+    deps.print(changed.length === 0 ? "install-shims: already set up; nothing changed" : `install-shims: changed ${changed.join(", ")}`);
   if (configHooks(deps)) {
-    setGit(deps, commitHook(deps.agentGh));
+    changed.push(...setGit(deps, commitHook(deps.agentGh)).map((key) => `git config --global ${key}`));
     deps.print("commits: a global commit-msg hook credits an agent session's commits in every repository");
   } else {
     deps.print(`commits: ${gitVersion(deps)} has no config-based hooks, so only repositories with agent-gh's commit-msg hook credit agent sessions; a newer git credits every repository`);
   }
-  if (!agentMachine) return;
-  setGit(deps, agentMachineGit(deps.agentGh));
+  if (!agentMachine) return summary();
+  changed.push(...setGit(deps, agentMachineGit(deps.agentGh)).map((key) => `git config --global ${key}`));
   deps.print("git: an agent session uses its family App where installed, and anyone else the read App");
   if (personalGhLogin(deps)) {
     const out = real(deps, "gh", ["auth", "logout", "--hostname", "github.com"], "inherit");
     if (out.code !== 0 || personalGhLogin(deps)) {
       throw new Failure("installing the shims", "gh is still logged in to your personal account; run `gh auth logout --hostname github.com` yourself");
     }
+    changed.push("gh's personal login");
     deps.print("gh: logged out of your personal login; a person's gh reads with the read App, and an agent's writes with its family App");
   } else {
     deps.print("gh: no personal login on this machine");
   }
+  summary();
 };

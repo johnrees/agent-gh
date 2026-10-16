@@ -5,7 +5,7 @@
  * that App on the session's commits. GitHub shows each action as John with
  * the App's badge. The usage below lists every command.
  */
-import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { allowRelease, parseAllowArgs } from "./allow.ts";
@@ -385,7 +385,10 @@ const main = async (argv: readonly string[]): Promise<number> => {
     const file = env.CLAUDE_ENV_FILE;
     if (file !== undefined && file !== "") {
       try {
-        appendFileSync(file, `${rcBlock(defaultShimDir(), defaultBinDir())}\n`);
+        // SessionStart runs again on resume and compaction: one block is enough. Other hooks append to the
+        // same file, so it is appended to, never rewritten.
+        const block = rcBlock(defaultShimDir(), defaultBinDir());
+        if (!existsSync(file) || !readFileSync(file, "utf8").includes(block)) appendFileSync(file, `${block}\n`);
       } catch (error) {
         console.error(`agent-gh session-env: could not write ${file}: ${error instanceof Error ? error.message : String(error)}`);
       }

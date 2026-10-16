@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -74,10 +74,26 @@ test("the install line installs the checked agent-gh and gitleaks, then logs in,
   expect(readFileSync(join(bin, "gitleaks"), "utf8")).toContain("gitleaks 8.30.1");
   expect(existsSync(join(bin, "LICENSE"))).toBe(false);
 
+  // A rerun of the same release leaves both binaries alone and says so.
+  const installed = statSync(join(bin, "agent-gh")).ino;
   const again = run(["--agent-machine"]);
   expect(again.code).toBe(0);
-  expect(again.calls.slice(2)).toEqual(["login --all", "install-shims --agent-machine", "doctor --machine"]);
+  expect(again.calls).toEqual(["--version", "login --all", "install-shims --agent-machine", "doctor --machine"]);
+  expect(again.stderr).toContain(`agent-gh v0.1.0 at ${bin}/agent-gh: already installed`);
   expect(again.stderr).toContain("gitleaks: already installed");
+  expect(statSync(join(bin, "agent-gh")).ino).toBe(installed);
+  expect(readdirSync(bin).sort()).toEqual(["agent-gh", "gitleaks"]);
+});
+
+test("a new release replaces agent-gh by a rename, leaving no temporary file", () => {
+  const { bin, download, run } = release();
+  expect(run().code).toBe(0);
+  writeFileSync(join(download, ASSET), readFileSync(join(download, ASSET), "utf8").replace("v0.1.0", "v0.2.0"));
+  writeFileSync(join(download, "SHA256SUMS"), `${sha256(join(download, ASSET))}  ${ASSET}\n`);
+  const update = run();
+  expect(update.code).toBe(0);
+  expect(update.stderr).toContain(`installed agent-gh v0.2.0 at ${bin}/agent-gh`);
+  expect(readdirSync(bin).sort()).toEqual(["agent-gh", "gitleaks"]);
 });
 
 test("a binary or gitleaks tarball that does not match its checksum is never installed", () => {

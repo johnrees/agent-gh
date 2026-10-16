@@ -2,7 +2,7 @@
  * bun run install-local: check the Bun version, install exactly the locked
  * dependencies, build, and install ~/.local/bin/agent-gh.
  */
-import { readFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { bunVersionProblem } from "./bun-version.ts";
@@ -19,4 +19,15 @@ const run = (command: string[]) => {
 };
 run([process.execPath, "install", "--frozen-lockfile"]);
 run([process.execPath, "run", "build"]);
-run(["install", "-m", "755", join(root, "dist", "agent-gh"), join(homedir(), ".local", "bin", "agent-gh")]);
+// A copy beside the target, then a rename: an interrupted install never leaves a partial agent-gh, and a
+// running one keeps its file.
+const bin = join(homedir(), ".local", "bin");
+const staged = join(bin, `.agent-gh.${process.pid}.tmp`);
+mkdirSync(bin, { recursive: true });
+try {
+  copyFileSync(join(root, "dist", "agent-gh"), staged);
+  chmodSync(staged, 0o755);
+  renameSync(staged, join(bin, "agent-gh"));
+} finally {
+  rmSync(staged, { force: true });
+}
