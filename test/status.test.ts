@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentApps } from "../src/config.ts";
@@ -505,7 +505,7 @@ test("the reusable workflow is a workflow_call that sets the statuses with GITHU
   const steps = JSON.stringify(job.steps);
   expect(steps).not.toContain("actions/checkout");
   expect(steps).toContain("sha256sum -c");
-  expect(job.steps.at(-1).run).toBe("./agent-gh-linux-x64 status");
+  expect(job.steps.at(-1).run).toBe("./agent-gh status");
   expect(job.steps.at(-1).env.GITHUB_TOKEN).toBe("${{ github.token }}");
 });
 
@@ -519,4 +519,62 @@ test("the README's caller template grants the reusable workflow every scope it d
   expect(Object.keys(caller.on)).toEqual(["pull_request_target", "pull_request_review", "issue_comment"]);
   // `edited`: a description that adds a closing issue brings that issue's comments into agent-threads.
   expect(caller.on.pull_request_target.types).toEqual(["opened", "edited", "synchronize", "reopened", "ready_for_review", "labeled", "unlabeled"]);
+});
+
+const WORKFLOWS = ["agent-review", "agent-claims"] as const;
+const workflow = (name: string): Record<string, any> =>
+  Bun.YAML.parse(readFileSync(join(import.meta.dir, "..", ".github", "workflows", `${name}.yml`), "utf8")) as Record<string, any>;
+const jobOf = (name: string): Record<string, any> => Object.values(workflow(name).jobs)[0] as Record<string, any>;
+const downloadScript = (name: string): string => jobOf(name).steps[0].run;
+/** The shell function that picks the release asset, as written in the workflow. */
+const assetFunction = (name: string): string => /^agent_gh_asset\(\) \{\n[\s\S]*?^\}$/m.exec(downloadScript(name))?.[0] ?? "";
+
+test("each reusable workflow takes a runs-on input, defaulting to ubuntu-latest, that is a label or a JSON list", () => {
+  for (const name of WORKFLOWS) {
+    const input = workflow(name).on.workflow_call.inputs["runs-on"];
+    expect(input.type).toBe("string");
+    expect(input.default).toBe("ubuntu-latest");
+    expect(jobOf(name)["runs-on"]).toBe("${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}");
+  }
+});
+
+test("the download step picks the release asset from the runner's OS and architecture, checks it, and refuses any other runner", () => {
+  expect(assetFunction("agent-review")).not.toBe("");
+  expect(assetFunction("agent-claims")).toBe(assetFunction("agent-review"));
+  for (const name of WORKFLOWS) {
+    const script = downloadScript(name);
+    expect(script).toContain('asset=$(agent_gh_asset)');
+    expect(script).toContain('grep " $asset\\$" SHA256SUMS | sha256sum -c -');
+    expect(script).not.toContain("-o agent-gh-linux-x64");
+  }
+  const bin = mkdtempSync(join(tmpdir(), "agent-gh-uname-"));
+  const uname = join(bin, "uname");
+  writeFileSync(uname, '#!/bin/sh\ncase "$1" in -s) echo "$FAKE_OS" ;; -m) echo "$FAKE_ARCH" ;; esac\n');
+  chmodSync(uname, 0o755);
+  const pick = (os: string, arch: string) => {
+    const run = Bun.spawnSync(["bash", "-c", `set -eu\n${assetFunction("agent-review")}\nasset=$(agent_gh_asset)\necho "$asset"`], {
+      env: { PATH: `${bin}:${process.env.PATH ?? ""}`, FAKE_OS: os, FAKE_ARCH: arch },
+      stdout: "pipe", stderr: "pipe",
+    });
+    return { code: run.exitCode, out: run.stdout.toString().trim(), err: run.stderr.toString() };
+  };
+  expect(pick("Linux", "x86_64")).toMatchObject({ code: 0, out: "agent-gh-linux-x64" });
+  expect(pick("Linux", "aarch64")).toMatchObject({ code: 0, out: "agent-gh-linux-arm64" });
+  expect(pick("Linux", "arm64")).toMatchObject({ code: 0, out: "agent-gh-linux-arm64" });
+  for (const [os, arch] of [["Linux", "riscv64"], ["Darwin", "arm64"]] as const) {
+    const refused = pick(os, arch);
+    expect(refused.code).not.toBe(0);
+    expect(refused.out).toBe("");
+    expect(refused.err).toContain(`${os} ${arch}`);
+    expect(refused.err).toContain("runs-on");
+  }
+});
+
+test("the README's caller templates show the runs-on input, commented out", () => {
+  const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
+  for (const name of WORKFLOWS) {
+    const template = new RegExp(`\`\`\`yaml\\n(# \\.github/workflows/${name}\\.yml[\\s\\S]*?)\`\`\``).exec(readme)?.[1] ?? "";
+    expect(template).toContain("      # runs-on: ubicloud-standard-2\n");
+    expect((Bun.YAML.parse(template) as Record<string, any>).jobs[name].with).not.toHaveProperty("runs-on");
+  }
 });

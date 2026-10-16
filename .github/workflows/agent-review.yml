@@ -13,10 +13,14 @@ on:
         description: The agent-gh release that sets the statuses (a tag such as v0.7.0, or latest).
         type: string
         default: latest
+      runs-on:
+        description: The runner, as a label (ubuntu-latest, ubicloud-standard-2) or a JSON list of labels (["self-hosted","linux"]). Linux only.
+        type: string
+        default: ubuntu-latest
 permissions: {}
 jobs:
   status:
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     timeout-minutes: 10
     # Declaring permissions drops the defaults, so every read the run makes is
     # named here: contents (the config, compare, fetching commits),
@@ -42,14 +46,24 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -eu
+          # The release asset for this runner: Linux only, x86_64 or arm64.
+          agent_gh_asset() {
+            case "$(uname -s)/$(uname -m)" in
+              Linux/x86_64) echo agent-gh-linux-x64 ;;
+              Linux/aarch64 | Linux/arm64) echo agent-gh-linux-arm64 ;;
+              *) echo "agent-gh: this runner is $(uname -s) $(uname -m); the runs-on input must name a Linux x86_64 or arm64 runner" >&2; return 1 ;;
+            esac
+          }
+          asset=$(agent_gh_asset)
           if [ "$VERSION" = latest ]; then base=https://github.com/johnrees/agent-gh/releases/latest/download
           else base="https://github.com/johnrees/agent-gh/releases/download/$VERSION"; fi
-          curl -fsSL --retry 3 -o agent-gh-linux-x64 "$base/agent-gh-linux-x64"
+          curl -fsSL --retry 3 -o "$asset" "$base/$asset"
           curl -fsSL --retry 3 -o SHA256SUMS "$base/SHA256SUMS"
-          grep ' agent-gh-linux-x64$' SHA256SUMS | sha256sum -c -
-          chmod +x agent-gh-linux-x64
-          ./agent-gh-linux-x64 --version
+          grep " $asset\$" SHA256SUMS | sha256sum -c -
+          mv "$asset" agent-gh
+          chmod +x agent-gh
+          ./agent-gh --version
       - name: Set agent-review and agent-threads
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: ./agent-gh-linux-x64 status
+        run: ./agent-gh status
