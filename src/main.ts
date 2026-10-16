@@ -385,10 +385,11 @@ const main = async (argv: readonly string[]): Promise<number> => {
     const file = env.CLAUDE_ENV_FILE;
     if (file !== undefined && file !== "") {
       try {
-        // SessionStart runs again on resume and compaction: one block is enough. Other hooks append to the
-        // same file, so it is appended to, never rewritten.
-        const block = rcBlock(defaultShimDir(), defaultBinDir());
-        if (!existsSync(file) || !readFileSync(file, "utf8").includes(block)) appendFileSync(file, `${block}\n`);
+        // SessionStart runs again on resume and compaction. The block must come last, so that nothing another
+        // hook appended puts its PATH ahead of the shim; when it already does, a rerun adds nothing. Other hooks
+        // write the same file, so it is appended to, never rewritten.
+        const block = `${rcBlock(defaultShimDir(), defaultBinDir())}\n`;
+        if (!existsSync(file) || !readFileSync(file, "utf8").endsWith(block)) appendFileSync(file, block);
       } catch (error) {
         console.error(`agent-gh session-env: could not write ${file}: ${error instanceof Error ? error.message : String(error)}`);
       }

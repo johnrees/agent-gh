@@ -101,11 +101,18 @@ test("session-env writes a PATH block that puts the shim first when sourced, and
   const sourced = Bun.spawnSync(["sh", "-c", `PATH=/first:/usr/bin:${shims}; . '${envFile}'; echo "$PATH"`], { stdout: "pipe" });
   expect(sourced.stdout.toString().trim()).toBe(`${shims}:${join(dir, ".local", "bin")}:/first:/usr/bin`);
 
-  // SessionStart again (a resume, a compaction): another hook's line stays, and the block is not repeated.
-  appendFileSync(envFile, "export OTHER=1\n");
+  // SessionStart again (a resume, a compaction) adds nothing while the block is last.
   const once = readFileSync(envFile, "utf8");
   expect(run().exitCode).toBe(0);
   expect(readFileSync(envFile, "utf8")).toBe(once);
+  // Another hook's PATH after it is kept, and the shim is put back first.
+  appendFileSync(envFile, "export PATH=/opt/homebrew/bin:$PATH\n");
+  expect(run().exitCode).toBe(0);
+  const again = Bun.spawnSync(["sh", "-c", `PATH=/usr/bin; . '${envFile}'; echo "$PATH"`], { stdout: "pipe" });
+  expect(again.stdout.toString().trim()).toBe(`${shims}:${join(dir, ".local", "bin")}:/opt/homebrew/bin:/usr/bin`);
+  const twice = readFileSync(envFile, "utf8");
+  expect(run().exitCode).toBe(0);
+  expect(readFileSync(envFile, "utf8")).toBe(twice);
 
   expect(run({ CLAUDE_ENV_FILE: join(dir, "missing", "dir", "file") }).exitCode).toBe(0);
   expect(run({ CLAUDE_ENV_FILE: "" }).exitCode).toBe(0);
