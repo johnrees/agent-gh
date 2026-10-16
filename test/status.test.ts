@@ -295,6 +295,10 @@ type Scenario = {
   issueComments?: unknown[];
   /** How many issues GitHub says the pull request closes, when more than it lists. */
   closingTotal?: number;
+  /** Pages of the pull requests that close issue #7 (#12 is on the last). */
+  closingPages?: number;
+  /** When the run judges it (two minutes after LABELED unless given). */
+  now?: string;
 };
 
 /** The secret part of the NTFY_URL secret, which no printed line may show. */
@@ -306,7 +310,7 @@ const statusWorld = (scenario: Scenario) => {
   const issueComments = [...(scenario.issueComments ?? [])];
   const configRefs: string[] = [];
   const posting = (thread: unknown[], number: number) => (body: string) => {
-    thread.push({ id: 5000 + thread.length, user: { login: "github-actions[bot]", type: "Bot" }, performed_via_github_app: { id: 15368 }, created_at: "2026-10-12T00:00:00Z", html_url: `https://github.com/johnrees/widget/issues/${number}#c`, body: (JSON.parse(body) as { body: string }).body });
+    thread.push({ id: 5000 + thread.length, user: { login: "github-actions[bot]", type: "Bot" }, performed_via_github_app: { id: 15368 }, created_at: "2026-10-11T12:01:00Z", updated_at: "2026-10-11T12:01:00Z", html_url: `https://github.com/johnrees/widget/issues/${number}#c`, body: (JSON.parse(body) as { body: string }).body });
     return reply(201, {});
   };
   const config = (ref: string | null) => ({
@@ -350,7 +354,9 @@ const statusWorld = (scenario: Scenario) => {
       scenario.graphqlStatus !== undefined
         ? reply(scenario.graphqlStatus, {})
         : body.includes("closedByPullRequestsReferences")
-        ? reply(200, { data: { repository: { issue: { closedByPullRequestsReferences: { nodes: [{ number: 12, repository: { nameWithOwner: "johnrees/widget" } }, { number: 99, repository: { nameWithOwner: "other/repo" } }] } } } } })
+        ? (JSON.parse(body).variables.after === null && scenario.closingPages === 2
+            ? reply(200, { data: { repository: { issue: { closedByPullRequestsReferences: { pageInfo: { hasNextPage: true, endCursor: "c1" }, nodes: [{ number: 99, repository: { nameWithOwner: "other/repo" } }] } } } } })
+            : reply(200, { data: { repository: { issue: { closedByPullRequestsReferences: { pageInfo: { hasNextPage: false, endCursor: "c2" }, nodes: [{ number: 12, repository: { nameWithOwner: "johnrees/widget" } }, { number: 99, repository: { nameWithOwner: "other/repo" } }] } } } } }))
         : reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { totalCount: scenario.closingTotal ?? 1, nodes: [{ number: 7, repository: { nameWithOwner: "johnrees/widget" } }] } } } } }),
   });
   stops.push(fake.stop);
@@ -363,6 +369,7 @@ const statusWorld = (scenario: Scenario) => {
     token: "ghs_actions",
     repo: { owner: "johnrees", name: "widget" },
     remote: scenario.remote ?? "file:///nowhere",
+    now: () => Date.parse(scenario.now ?? "2026-10-11T12:02:00Z"),
     ntfyUrl: scenario.ntfy === undefined ? undefined : scenario.ntfy === "unreachable" ? `http://127.0.0.1:1/${TOPIC}` : `${fake.api.base}/ntfy/${TOPIC}`,
     git: async (args, input) => {
       gitCalls.push(args.join(" "));
@@ -608,7 +615,7 @@ const labelEvent = (id: number, event: "labeled" | "unlabeled", name: string, ap
 });
 const thread = (ref: string, labels: string[], events: unknown[], ask?: string): HoldThread => ({ ref, labels, events: labelEvents(events), ...(ask === undefined ? {} : { ask }) });
 const holdInput = (overrides: Partial<Parameters<typeof holdStatus>[0]> = {}): Parameters<typeof holdStatus>[0] => ({
-  hold: HOLD, author: "agent", threads: [thread("#12", [], [])], files: [{ name: "src/a.ts", previous: undefined }], comments: [], head: A, ...overrides,
+  hold: HOLD, author: "agent", threads: [thread("#12", [], [])], files: [{ name: "src/a.ts", previous: undefined }], comments: [], head: A, now: minutes(2), ...overrides,
 });
 const description = (overrides: Partial<Parameters<typeof holdStatus>[0]>) => {
   const { status } = holdStatus(holdInput(overrides));
@@ -682,7 +689,13 @@ test("a person's path release binds to the reserved files' diff at the head: the
   const forged = (author: string) => ({ author, body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: B, paths_patch_id: P2 }) });
   expect(description({ files, threads: [released], comments: [record, forged("github-actions[bot]")], head: B, pathsPatchId: P2 })).toContain("reserved paths changed since");
   expect(holdNeeds(holdInput({ files, threads: [released], comments: [forged("johnrees")] }))?.record).toBeUndefined();
-  expect(holdNeeds(holdInput({ files, threads: [released], comments: [forged("github-actions[bot]")] }))?.record?.head).toBe(B);
+  expect(holdNeeds(holdInput({ files, threads: [released], comments: [forged("github-actions[bot]")] }))?.record).toMatchObject({ head: B });
+  // Anyone with write access can edit the bot's comment, its author unchanged (checked live): an edited record holds it.
+  expect(description({ files, threads: [released], comments: [{ ...record, edited: true }], head: B, pathsPatchId: P1 })).toBe("failure: held: the record of johnrees's release was edited; John adds `human-approved` again");
+  expect(description({ files, threads: [released], comments: [record, { ...forged("github-actions[bot]"), edited: true }], head: B, pathsPatchId: P1 })).toContain("was edited");
+  // A record missing well after the release (deleted, or never written) is not written afresh on whatever head is there now.
+  expect(description({ files, threads: [released], pathsPatchId: P1, headBeforeRelease: true, now: minutes(16) })).toBe("failure: held: no record of johnrees's release; John adds `human-approved` again");
+  expect(holdStatus(holdInput({ files, threads: [released], pathsPatchId: P1, headBeforeRelease: true, now: minutes(14) })).record).toBeDefined();
   // A head first seen after the release is not one the person released.
   expect(description({ files, threads: [released], pathsPatchId: P1, headBeforeRelease: false })).toBe("failure: held: aaaaaaaa was pushed after johnrees's release; John adds `human-approved` again");
   // What was not read is never taken as released.
@@ -782,11 +795,14 @@ test("against real git, a person's release survives a rebase that leaves the res
   // A rebase over base changes to other files, or a new commit to an unreserved file: the reserved diff is the same, so still released.
   expect(await hold(world(repo.head2, repo.mb2, { comments: recorded }))).toMatchObject({ state: "success", description: `released by johnrees at ${repo.head1.slice(0, 8)}` });
   expect(await hold(world(head5, repo.mb2, { comments: recorded, files: [{ filename: "a.txt" }, { filename: "b.txt" }] }))).toMatchObject({ state: "success" });
+  // The record's comment edited since (its updated_at moves; a reaction's does not): never trusted.
+  const edited = (recorded as Record<string, unknown>[]).map((comment) => ({ ...comment, updated_at: minutes(20) }));
+  expect(await hold(world(repo.head2, repo.mb2, { comments: edited }))).toMatchObject({ state: "failure", description: "held: the record of johnrees's release was edited; John adds `human-approved` again" });
   // A change to the reserved file holds it again, whatever a later record says.
   const changed = await hold(world(head4, repo.mb2, { comments: recorded }));
   expect(changed).toMatchObject({ state: "failure", description: `held: reserved paths changed since johnrees released at ${repo.head1.slice(0, 8)}; John adds \`human-approved\` again` });
   const { patchId: changedId } = await pullDiff(repo.io, repo.mb2, head4, ["a.txt"]);
-  const forge = (login: string) => ({ id: 9000, user: { login }, created_at: minutes(10), body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: head4, paths_patch_id: changedId }) });
+  const forge = (login: string) => ({ id: 9000, user: { login }, created_at: minutes(10), updated_at: minutes(10), body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: head4, paths_patch_id: changedId }) });
   expect(await hold(world(head4, repo.mb2, { comments: [...recorded, forge("github-actions[bot]")] }))).toMatchObject({ state: "failure" });
   // A record anyone else posts counts for nothing; and a head GitHub Actions had not seen before the release is not released.
   expect(await hold(world(head4, repo.mb2, { comments: [forge("johnrees")] }))).toMatchObject({ state: "failure", description: `held: ${head4.slice(0, 8)} was pushed after johnrees's release; John adds \`human-approved\` again` });
@@ -847,6 +863,20 @@ test("with no ask in the window the call says so; a label the owner adds himself
   }
 });
 
+test("a label added and removed before a run read it still holds, so the call is still made; once a person releases it, none is", async () => {
+  const added = labelEvent(900, "labeled", "needs-human", CLAUDE, LABELED);
+  const removed = labelEvent(901, "unlabeled", "needs-human", null, minutes(0.1));
+  const gone = statusWorld({ head: A, mergeBase: B, hold: {}, events: [added, removed], comments: [agentSays(2, -1, "Which way?")] });
+  await statusCommand(gone.io, { name: "pull_request_target", payload: { action: "unlabeled", pull_request: { number: 12 } } }, undefined);
+  expect(gone.commented(12)).toHaveLength(1);
+  expect(gone.commented(12)[0]?.split("\n")[0]).toBe("@johnrees, an agent needs you on #12: Which way?");
+  expect(gone.posted().find((status) => status.context === "agent-hold")).toMatchObject({ description: "held: `needs-human` came off #12, which releases nothing; a person adds `human-approved`" });
+  const released = statusWorld({ head: A, mergeBase: B, hold: {}, labels: ["human-approved"], events: [added, removed, labelEvent(902, "labeled", "human-approved", null, minutes(5))] });
+  await statusCommand(released.io, LABELED_EVENT, undefined);
+  expect(released.commented(12)).toEqual([]);
+  expect(released.posted().find((status) => status.context === "agent-hold")).toMatchObject({ state: "success", description: "not held" });
+});
+
 test("a label on a plain issue calls the owner in there and holds every open pull request here that closes it", async () => {
   const w = statusWorld({
     head: A, mergeBase: B, hold: {}, issueLabels: ["needs-human"], issueEvents: [labelEvent(80, "labeled", "needs-human", CLAUDE, LABELED)], ntfy: "ok",
@@ -858,6 +888,11 @@ test("a label on a plain issue calls the owner in there and holds every open pul
   expect(w.commented(7)[0]?.split("\n")[0]).toBe("@johnrees, an agent needs you on #7: Which API version?");
   expect(w.commented(12)).toEqual([]);
   expect(w.pushes()[0]?.headers).toMatchObject({ title: "johnrees/widget#7 needs you", click: "https://github.com/johnrees/widget/issues/7" });
+  // Every page of the pull requests that close it is read: one on the second page is held too.
+  const paged = statusWorld({ head: A, mergeBase: B, hold: {}, closingPages: 2, issueLabels: ["needs-human"], issueEvents: [labelEvent(80, "labeled", "needs-human", CLAUDE, LABELED)] });
+  await statusCommand(paged.io, { name: "issues", payload: { action: "labeled", issue: { number: 7 } } }, undefined);
+  expect(paged.posted().find((status) => status.context === "agent-hold")).toMatchObject({ state: "failure" });
+  expect(paged.fake.log.filter((entry) => entry.body.includes("closedByPullRequestsReferences")).map((entry) => JSON.parse(entry.body).variables.after)).toEqual([null, "c1"]);
 });
 
 test("a run that cannot derive agent-hold sets it to error with the others, and a pull request closing more issues than GitHub lists cannot be read", async () => {

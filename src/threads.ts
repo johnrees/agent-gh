@@ -69,6 +69,8 @@ export type ThreadComment = {
   /** The App it was posted through (`performed_via_github_app.id`), if any. */
   readonly appId: number | undefined;
   readonly createdAt: string;
+  /** When it was last edited (`createdAt` if never; a reaction does not change it). */
+  readonly updatedAt?: string;
   readonly body: string;
   /** Its 👍 reactions, from anyone. */
   readonly thumbsUp: number;

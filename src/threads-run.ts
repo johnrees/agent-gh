@@ -71,6 +71,7 @@ const comment = (value: unknown, thread: string): ThreadComment => {
     author: text(record(item.user).login),
     appId: Number.isSafeInteger(app) ? (app as number) : undefined,
     createdAt: text(item.created_at),
+    updatedAt: text(item.updated_at),
     body: text(item.body),
     thumbsUp: Number.isSafeInteger(thumbsUp) ? (thumbsUp as number) : 0,
   };

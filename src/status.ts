@@ -288,12 +288,31 @@ export const parseRelease = (body: string): ReleaseRecord | undefined => {
   }
 };
 
-/** A comment on the pull request, as the release records are read from them. */
-export type PostedBy = { readonly author: string; readonly body: string };
+/** A comment on the pull request, as the release records are read from them; `edited` once its body was changed after it was posted. */
+export type PostedBy = { readonly author: string; readonly body: string; readonly edited?: boolean };
 
-/** The record that binds release `event`: the first `github-actions[bot]` posted for it, so a later one cannot rebind it. */
-export const recordFor = (comments: readonly PostedBy[], event: number): ReleaseRecord | undefined =>
-  comments.filter((comment) => comment.author === ACTIONS_BOT).map((comment) => parseRelease(comment.body)).find((value) => value?.event === event);
+/**
+ * The record that binds release `event`: the first `github-actions[bot]`
+ * posted for it, so a later one cannot rebind it; `edited` when any of its
+ * comments carrying one was edited since. Anyone with write access may edit
+ * the bot's comment, its author unchanged (checked live), so an edited
+ * record is never trusted.
+ */
+export const recordFor = (comments: readonly PostedBy[], event: number): ReleaseRecord | "edited" | undefined => {
+  const records = comments.filter((comment) => comment.author === ACTIONS_BOT).flatMap((comment) => {
+    const value = parseRelease(comment.body);
+    return value?.event === event ? [{ value, edited: comment.edited === true }] : [];
+  });
+  return records.some((entry) => entry.edited) ? "edited" : records[0]?.value;
+};
+
+/**
+ * How long after a release its record may first be written: the runs its own
+ * event starts write it within a minute or two. A record missing past that
+ * (deleted, or never written) is not written afresh, so it cannot be dropped
+ * to bind the release to another head.
+ */
+export const RECORD_WINDOW_MS = 15 * 60_000;
 
 /** The longest list GitHub gives of a pull request's files; one with more cannot be checked. */
 export const FILES_LISTED = 3000;
@@ -309,6 +328,8 @@ export type HoldInput = {
   /** The pull request's comments, which carry the release records. */
   readonly comments: readonly PostedBy[];
   readonly head: string;
+  /** When this run judges it. */
+  readonly now: string;
   /** The reserved files' patch id at the head now (`ReleaseRecord.paths_patch_id`); undefined when it was not needed. */
   readonly pathsPatchId?: string | null;
   /**
@@ -319,8 +340,8 @@ export type HoldInput = {
   readonly headBeforeRelease?: boolean;
 };
 
-/** What a release must be checked against: the release, its files, and the record if one binds it. */
-export type HoldNeeds = { readonly release: LabelEvent; readonly names: readonly string[]; readonly record: ReleaseRecord | undefined };
+/** What a release must be checked against: the release, its files, and the record if one binds it (`edited` if one was tampered with). */
+export type HoldNeeds = { readonly release: LabelEvent; readonly names: readonly string[]; readonly record: ReleaseRecord | "edited" | undefined };
 
 /** What holdStatus needs read from git and the head's statuses: undefined when nothing reserved has a release to check. */
 export const holdNeeds = (input: Omit<HoldInput, "pathsPatchId" | "headBeforeRelease">): HoldNeeds | undefined => {
@@ -345,7 +366,8 @@ const holdStatusOf = (state: Status["state"], description: string): Status => ({
  * - held while it touches a reserved file, until a person adds the release
  *   label, which binds to the reserved files' diff at the head then: a
  *   change to that diff holds it again. A release first seen on a head
- *   pushed after it (no agent-hold set on it before) binds nothing.
+ *   pushed after it (no agent-hold set on it before), or more than
+ *   RECORD_WINDOW_MS after it, binds nothing, nor does an edited record.
  */
 export const holdStatus = (input: HoldInput): { readonly status: Status; readonly record?: ReleaseRecord } => {
   const { hold } = input;
@@ -367,6 +389,9 @@ export const holdStatus = (input: HoldInput): { readonly status: Status; readonl
     return { status: holdStatusOf("failure", `held: touches ${patterns} (${first}${rest.length === 0 ? "" : ` and ${rest.length} more`}); John adds \`${hold.releaseLabel}\``) };
   }
   const { release, record: bound } = needs;
+  const again = `John adds \`${hold.releaseLabel}\` again`;
+  if (bound === "edited") return { status: holdStatusOf("failure", `held: the record of ${release.actor}'s release was edited; ${again}`) };
+  if (bound === undefined && Date.parse(input.now) - Date.parse(release.at) > RECORD_WINDOW_MS) return { status: holdStatusOf("failure", `held: no record of ${release.actor}'s release; ${again}`) };
   // Never released on a guess: what this needs and was not given holds it.
   if (input.pathsPatchId === undefined) return { status: holdStatusOf("failure", "held: the reserved paths' diff was not read; rerun the workflow") };
   if (bound !== undefined) {

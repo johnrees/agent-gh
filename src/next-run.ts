@@ -70,8 +70,11 @@ export const queueConfig = async (repo: Repo, read: Read): Promise<QueueConfig> 
   } catch {
     throw new Failure(STAGE, `${CONFIG_PATH} on ${base} is not valid JSON`);
   }
+  // An issue carrying the hold's label waits for John: every picker skips it. parseReviewConfig checks `hold`; this reads its label, defaulting as it does.
+  const hold = record(config).hold;
+  const held = hold === undefined ? [] : [typeof record(hold).label === "string" ? (record(hold).label as string) : "needs-human"];
   const queue = record(config).queue;
-  if (queue === undefined) return { issue: undefined, label: "ready", priorityLabels: DEFAULT_PRIORITY_LABELS, skipLabels: [] };
+  if (queue === undefined) return { issue: undefined, label: "ready", priorityLabels: DEFAULT_PRIORITY_LABELS, skipLabels: held };
   const value = record(queue);
   if (typeof queue !== "object" || queue === null || Array.isArray(queue) || Object.keys(value).some((key) => !["issue", "label", "priority_labels", "skip_labels"].includes(key))) {
     throw new Failure(STAGE, `${CONFIG_PATH}: queue takes issue, label, priority_labels, and skip_labels`);
@@ -90,7 +93,7 @@ export const queueConfig = async (repo: Repo, read: Read): Promise<QueueConfig> 
     issue: value.issue as number | undefined,
     label: (value.label as string | undefined) ?? "ready",
     priorityLabels: (priority as string[] | undefined) ?? DEFAULT_PRIORITY_LABELS,
-    skipLabels: (skip as string[] | undefined) ?? [],
+    skipLabels: [...held, ...((skip as string[] | undefined) ?? [])],
   };
 };
 

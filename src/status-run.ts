@@ -15,6 +15,7 @@ import {
   FILES_LISTED,
   type FoundMarker,
   HOLD_CONTEXT,
+  labelHold,
   holdNeeds,
   holdStatus,
   type HoldThread,
@@ -43,6 +44,8 @@ export type StatusIo = ApiIo &
     readonly remote: string;
     /** Where a hold's call is also pushed (the NTFY_URL secret), if anywhere; never printed. */
     readonly ntfyUrl: string | undefined;
+    /** The time now, in milliseconds. */
+    readonly now: () => number;
   };
 
 const STAGE = "deriving the statuses";
@@ -161,7 +164,8 @@ const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "age
     threads[index] = { ...thread, ask: askFor(comments, added.at, owner, agentApps().map((app) => app.id)).line };
   }
   const files = author === "person" ? [] : await pullFiles(io, pr);
-  const input = { hold, author, threads, files, comments: prComments, head: pr.head };
+  const comments = prComments.map((comment) => ({ author: comment.author, body: comment.body, edited: comment.updatedAt !== comment.createdAt }));
+  const input = { hold, author, threads, files, comments, head: pr.head, now: new Date(io.now()).toISOString() };
   const needs = holdNeeds(input);
   if (needs === undefined) return holdStatus(input);
   const mergeBase = await fetchedPull(io, pr.number, pr.base, pr.head);
@@ -339,7 +343,7 @@ const push = async (io: StatusIo, title: string, click: string, line: string): P
 
 /**
  * Calls the repository owner in on issue or pull request `number`, here,
- * when the hold's label is on it: once for the event that last added the
+ * while the hold's label holds it (`labelHold`): once for the event that last added the
  * label (marked in the comment, so a rerun, or any later run, never posts
  * it twice), and never for a label the owner added himself. The comment, as
  * `github-actions[bot]`, mentions him, which notifies him where an agent's
@@ -348,8 +352,10 @@ const push = async (io: StatusIo, title: string, click: string, line: string): P
  */
 const callOwner = async (io: StatusIo, number: number, hold: HoldConfig): Promise<void> => {
   const issue = record(await get(io, STAGE, `${repoPath(io)}/issues/${number}`));
-  if (!labelNames(issue.labels).some((label) => sameLabel(label, hold.label))) return;
-  const added = labelEvents(await issueEvents(io, io.repo, number)).findLast((event) => event.event === "labeled" && sameLabel(event.label, hold.label));
+  const events = labelEvents(await issueEvents(io, io.repo, number));
+  // Whether or not the label is still on: one added and removed before any run read it holds all the same, so it calls all the same.
+  if (labelHold({ ref: `#${number}`, labels: labelNames(issue.labels), events }, hold, undefined) === undefined) return;
+  const added = events.findLast((event) => event.event === "labeled" && sameLabel(event.label, hold.label));
   if (added === undefined) {
     io.print(`agent-gh: #${number} has \`${hold.label}\` but GitHub lists no event that added it; no call`);
     return;
@@ -373,16 +379,31 @@ const callOwner = async (io: StatusIo, number: number, hold: HoldConfig): Promis
   await push(io, `${slug(io.repo)}#${number} needs you`, text(issue.html_url), ask.line);
 };
 
-/** The open pull requests in this repository that close `issue`. */
+/**
+ * Every open pull request in this repository that closes `issue`, from every
+ * page: one left unread would keep a status the issue's label now holds.
+ */
 const closingPulls = async (io: ApiIo, issue: number): Promise<number[]> => {
-  const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){closedByPullRequestsReferences(first:25,includeClosedPrs:false){nodes{number repository{nameWithOwner}}}}}}`;
-  const value = await get(io, STAGE, "/graphql", "POST", { query, variables: { owner: io.repo.owner, name: io.repo.name, number: issue } });
-  const nodes = record(record(record(record(record(value).data).repository).issue).closedByPullRequestsReferences).nodes;
-  if (!Array.isArray(nodes)) return [];
-  return nodes
-    .map(record)
-    .filter((node) => text(record(node.repository).nameWithOwner).toLowerCase() === slug(io.repo).toLowerCase() && Number.isSafeInteger(node.number))
-    .map((node) => node.number as number);
+  const query = `query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){closedByPullRequestsReferences(first:100,after:$after,includeClosedPrs:false){pageInfo{hasNextPage endCursor} nodes{number repository{nameWithOwner}}}}}}`;
+  const numbers: number[] = [];
+  let after: string | null = null;
+  for (let page = 1; page <= 10; page++) {
+    const value = await get(io, STAGE, "/graphql", "POST", { query, variables: { owner: io.repo.owner, name: io.repo.name, number: issue, after } });
+    const references = record(record(record(record(value).data).repository).issue).closedByPullRequestsReferences;
+    const nodes = record(references).nodes;
+    if (!Array.isArray(nodes)) throw new Failure(STAGE, `the pull requests that close #${issue}: invalid response`);
+    numbers.push(
+      ...nodes
+        .map(record)
+        .filter((node) => text(record(node.repository).nameWithOwner).toLowerCase() === slug(io.repo).toLowerCase() && Number.isSafeInteger(node.number))
+        .map((node) => node.number as number),
+    );
+    const info = record(record(references).pageInfo);
+    if (info.hasNextPage !== true) return numbers;
+    after = text(info.endCursor);
+    if (after === "") throw new Failure(STAGE, `the pull requests that close #${issue}: invalid response`);
+  }
+  throw new Failure(STAGE, `over 1,000 open pull requests close #${issue}, too many to read`);
 };
 
 /** The hold on the default branch's config, which judges an issue no pull request's base names. */
