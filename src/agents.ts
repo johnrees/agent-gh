@@ -103,6 +103,7 @@ export const instructionsBlock = (): string =>
     "- In a repository with `.github/agent-review.json`, before marking a pull request ready, run `agent-gh review full` from its pushed head, and review again after any push.",
     '- Answer each review finding, and each `agent-notify` on your pull request, with `agent-gh reply <id> --applied <sha>` (the fix, pushed to the pull request) or `agent-gh reply <id> --declined "<why>"`; a finding\'s review thread is then resolved.',
     "- Never push a tag or create or edit a release unless John has run `agent-gh allow release <tag>` for it; ask him.",
+    "- To call John in, post the question as one comment whose first line is the ask, then add `needs-human`; never remove it or add the release label yourself.",
     END,
   ].join("\n");
 

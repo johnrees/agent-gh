@@ -8,9 +8,9 @@ import { familyNames } from "./family.ts";
 import { type Api, request } from "./github.ts";
 import { HARNESSES, type Env } from "./harness.ts";
 import { parseRemoteUrl, parseRepo, type Repo, slug } from "./repo.ts";
-import { absent, checkState, type PushedTag, pushedRefs, requiredChecks } from "./merge.ts";
+import { absent, checkState, type PushedTag, pushedRefs, type RequiredCheck, requiredChecks } from "./merge.ts";
 import { type ApiIo, describeRequired, everyPage, pullThreads, repoOwner } from "./threads-run.ts";
-import { type MarkerPost, validMarkers } from "./status.ts";
+import { HOLD_CONTEXT, type MarkerPost, validMarkers } from "./status.ts";
 import {
   agentReviewStatus,
   type ApiCall,
@@ -27,6 +27,7 @@ import {
   effortFor,
   type Finding,
   fullPrompt,
+  type HoldConfig,
   graphqlMerges,
   graphqlRefWrites,
   graphqlReleaseRefusal,
@@ -116,6 +117,8 @@ export type Pull = PullRequest & {
   readonly author: string;
   /** GitHub's account type for the author: `User`, `Bot`, or `Organization`. */
   readonly authorType: string;
+  /** How many files it changes, as GitHub counts them; undefined when GitHub does not say. */
+  readonly changedFiles?: number;
 };
 
 export const pull = async (io: ApiIo, stage: Stage, number: number): Promise<Pull> => {
@@ -127,6 +130,7 @@ export const pull = async (io: ApiIo, stage: Stage, number: number): Promise<Pul
   return {
     number, title: text(value.title), body: text(value.body), head, base, labels: labelNames(value.labels), open: value.state === "open",
     createdAt: text(value.created_at), author: text(user.login), authorType: text(user.type),
+    ...(Number.isSafeInteger(value.changed_files) ? { changedFiles: value.changed_files as number } : {}),
   };
 };
 
@@ -276,7 +280,8 @@ export const gateReady = async (io: ReviewIo, target: ReadyTarget): Promise<void
   const pr = await pull(io, stage, number);
   const config = await readReviewConfig(io, stage, pr.base);
   if (config === undefined) return;
-  const status = agentReviewStatus(record((await call(io, stage, "GET", `${repoPath(io)}/commits/${pr.head}/status`)).value));
+  const combined = record((await call(io, stage, "GET", `${repoPath(io)}/commits/${pr.head}/status`)).value);
+  const status = agentReviewStatus(combined);
   if (status?.state !== "success") await gateUnreviewed(io, stage, pr, config, status);
   const required = await pullThreads(io, stage, pr, await repoOwner(io, stage));
   if (required.length > 0) {
@@ -285,6 +290,15 @@ export const gateReady = async (io: ReviewIo, target: ReadyTarget): Promise<void
       `pull request #${number} has ${required.length} comment(s) waiting for an agent's answer: ${describeRequired(required)}; answer each on its thread, or John gives his own comment a 👍 when it needs no answer`,
     );
   }
+  // A hold blocks the merge, not readiness: CI has to run on a held pull request.
+  if (config.hold === undefined) return;
+  const held = agentReviewStatus(combined, HOLD_CONTEXT);
+  if (held?.state === "success") return;
+  io.print(
+    held?.state === "failure"
+      ? `agent-gh: ${held.description}; John releases it before it can merge`
+      : `agent-gh: ${HOLD_CONTEXT} on ${pr.head.slice(0, 8)} ${held === undefined ? "is not set yet" : `reads ${held.state} (${held.description})`}; the merge waits for it, and only John releases a hold`,
+  );
 };
 
 /** Passes only for a person's waiver; otherwise refuses, naming the verdict or the missing review. */
@@ -323,6 +337,30 @@ const MERGE_STAGE = "checking the merge";
 
 const branchPath = (branch: string) => branch.split("/").map(encodeURIComponent).join("/");
 
+/** GitHub Actions' App, whose bot (`github-actions[bot]`) sets the agent-review workflow's statuses. */
+export const ACTIONS_APP = 15368;
+
+/**
+ * Why the hold refuses a merge of `pr`, if it does: where the base branch's
+ * config has `hold`, agent-hold must be `success` on the head, set by GitHub
+ * Actions, whether or not a ruleset requires it. Auto-merge (`auto`) waits
+ * only for the checks a ruleset requires, so it is let through a hold only
+ * when one requires agent-hold from GitHub Actions.
+ */
+const holdRefusal = async (pr: Pull, hold: HoldConfig, required: readonly RequiredCheck[], auto: boolean, byApps: () => Promise<Record<string, unknown>[]>): Promise<string | undefined> => {
+  const check: RequiredCheck = { context: HOLD_CONTEXT, app: ACTIONS_APP };
+  const statuses = await byApps();
+  const state = checkState(check, statuses, []);
+  if (state === "passed") return undefined;
+  if (auto && required.some((entry) => entry.context === HOLD_CONTEXT && entry.app === ACTIONS_APP)) return undefined;
+  const shown = statuses.find((status) => status.context === HOLD_CONTEXT && status.app_id === ACTIONS_APP);
+  const why = shown === undefined ? `no ${HOLD_CONTEXT} status from GitHub Actions` : `${HOLD_CONTEXT} ${state}: ${text(shown.description)}`;
+  const release = `only a person releases a hold: John removes \`${hold.label}\` himself, or adds \`${hold.releaseLabel}\` for reserved paths`;
+  return auto
+    ? `pull request #${pr.number}'s head ${pr.head.slice(0, 8)} is not cleared by ${HOLD_CONTEXT} (${why}), and \`--auto\` would not wait for it: ${pr.base}'s rules do not require ${HOLD_CONTEXT} from GitHub Actions; ${release}`
+    : `pull request #${pr.number}'s head ${pr.head.slice(0, 8)} is not cleared by ${HOLD_CONTEXT} (${why}); ${release}, and an agent merges once ${HOLD_CONTEXT} passes`;
+};
+
 /**
  * The guard on `gh pr merge` in an agent session: agents act as John, who may
  * bypass the base branch's rules, so every check the branch requires (its
@@ -331,9 +369,10 @@ const branchPath = (branch: string) => branch.split("/").map(encodeURIComponent)
  * merges it only once they pass, even for a bypass actor (checked live on
  * a ruleset with John as an always-bypass actor). `--admin` is always
  * refused, and so is a pull request the guard cannot find. A branch that
- * requires no checks is not held. Returns the head it checked, which the
- * merge must then require, so a commit pushed meanwhile is not merged in its
- * place.
+ * requires no checks is not held. Where the base branch's config has
+ * `hold`, agent-hold must also pass (`holdRefusal`). Returns the head it
+ * checked, which the merge must then require, so a commit pushed meanwhile
+ * is not merged in its place.
  */
 export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolean, auto = false): Promise<string> => {
   const stage = MERGE_STAGE;
@@ -341,14 +380,21 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
   const number = await pullNumber(io, stage, target);
   if (number === undefined) throw new Failure(stage, "cannot find the pull request `gh pr merge` names; name it by number");
   const pr = await pull(io, stage, number);
-  if (auto) return pr.head;
+  const hold = (await readReviewConfig(io, stage, pr.base))?.hold;
+  if (auto && hold === undefined) return pr.head;
   const base = branchPath(pr.base);
   const rules = await pages(io, stage, `${repoPath(io)}/rules/branches/${base}`);
   const branch = (await call(io, stage, "GET", `${repoPath(io)}/branches/${base}`)).value;
   const required = requiredChecks(rules, branch);
-  if (required.length === 0) return pr.head;
+  let byApp: Promise<Record<string, unknown>[]> | undefined;
+  const byApps = () => (byApp ??= appStatuses(io, stage, pr.head));
+  if (hold !== undefined) {
+    const refused = await holdRefusal(pr, hold, required, auto, byApps);
+    if (refused !== undefined) throw new Failure(stage, refused);
+  }
+  if (auto || required.length === 0) return pr.head;
   const statuses = await counted(io, stage, `${repoPath(io)}/commits/${pr.head}/status?`, "statuses");
-  const bySomeApp = required.some((check) => check.app !== undefined) ? await appStatuses(io, stage, pr.head) : [];
+  const bySomeApp = required.some((check) => check.app !== undefined) ? await byApps() : [];
   let workflows: Map<number, number> | undefined;
   const unmet: string[] = [];
   for (const check of required) {
@@ -1153,12 +1199,20 @@ export const authoredBy = async (io: ReviewIo, mergeBase: string, head: string):
 };
 
 /**
- * The pull request's diff, as `git diff` prints it with fixed options so its
- * patch id does not depend on local config, and that patch id. git patch-id
- * ignores whitespace, so the trimmed output gives the same id.
+ * The pull request's diff (or only some files'), as `git diff` prints it
+ * with fixed options so its patch id does not depend on local config, and
+ * that patch id. git patch-id ignores whitespace, so the trimmed output
+ * gives the same id.
  */
-export const pullDiff = async (io: Pick<ReviewIo, "git">, mergeBase: string, head: string): Promise<{ readonly diff: string; readonly patchId: string | null }> => {
-  const diff = await io.git(["diff", "--no-color", "--no-ext-diff", "-M", "--src-prefix=a/", "--dst-prefix=b/", mergeBase, head]);
+export const pullDiff = async (
+  io: Pick<ReviewIo, "git">,
+  mergeBase: string,
+  head: string,
+  /** Only these files, named as they are (no pathspec magic), when given. */
+  paths?: readonly string[],
+): Promise<{ readonly diff: string; readonly patchId: string | null }> => {
+  const only = paths === undefined ? [] : ["--", ...paths.map((path) => `:(literal)${path}`)];
+  const diff = await io.git(["diff", "--no-color", "--no-ext-diff", "-M", "--src-prefix=a/", "--dst-prefix=b/", mergeBase, head, ...only]);
   if (diff === undefined) throw new Failure("reviewing", `could not diff ${mergeBase.slice(0, 8)}..${head.slice(0, 8)}`);
   if (diff === "") return { diff, patchId: null };
   const id = (await io.git(["patch-id", "--stable"], `${diff}\n`))?.split(" ")[0];

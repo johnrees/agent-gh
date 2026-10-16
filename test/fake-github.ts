@@ -10,7 +10,7 @@ import type { Login } from "../src/login.ts";
 export const SECRET_BODY = "SECRET-BODY-3f1c";
 export const SECRET_HEADER = "SECRET-HEADER-9a2e";
 
-export type Logged = { method: string; path: string; auth: string; body: string };
+export type Logged = { method: string; path: string; auth: string; body: string; headers: Record<string, string> };
 type Route = (body: string, url: URL) => Response | Promise<Response>;
 
 export const reply = (status: number, value: unknown): Response =>
@@ -31,7 +31,7 @@ export const fakeGitHub = (routes: Record<string, Route>) => {
     fetch: async (request) => {
       const url = new URL(request.url);
       const body = await request.text();
-      log.push({ method: request.method, path: url.pathname, auth: request.headers.get("authorization") ?? "", body });
+      log.push({ method: request.method, path: url.pathname, auth: request.headers.get("authorization") ?? "", body, headers: Object.fromEntries(request.headers.entries()) });
       const route = routes[`${request.method} ${url.pathname}`];
       return route ? route(body, url) : reply(404, { message: SECRET_BODY });
     },

@@ -21,7 +21,7 @@ It installs the checked release and gitleaks in `~/.local/bin`, logs in each App
 Shell startup files are not enough on their own: a harness may start its tools from a snapshot of the environment it was launched in, and a version manager (mise, asdf, Homebrew's shellenv, Nix) can put its own gh back ahead of the shim after the startup files run. So `install-shims` also, for each harness that has run on the machine (its directory exists):
 
 - **Claude Code**: adds a SessionStart hook to `~/.claude/settings.json`, `agent-gh session-env`, which writes the PATH block to `CLAUDE_ENV_FILE`; Claude Code sources it before every command.
-- **Instructions**: adds a managed block to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.pi/agent/AGENTS.md`: run plain `gh`; if it says it is not logged in, run `agent-gh <gh arguments>`, or read with `GH_TOKEN=$(agent-gh read-token) gh ...`; never ask for `gh auth login`; where a repository opts in to reviews, run `agent-gh review full` before marking a pull request ready; answer each finding and notify with `agent-gh reply`; and never push a tag or write a release unless John has run `agent-gh allow release <tag>` for it.
+- **Instructions**: adds a managed block to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.pi/agent/AGENTS.md`: run plain `gh`; if it says it is not logged in, run `agent-gh <gh arguments>`, or read with `GH_TOKEN=$(agent-gh read-token) gh ...`; never ask for `gh auth login`; where a repository opts in to reviews, run `agent-gh review full` before marking a pull request ready; answer each finding and notify with `agent-gh reply`; never push a tag or write a release unless John has run `agent-gh allow release <tag>` for it; and, to call John in, post the question as one comment whose first line is the ask, then add `needs-human`, never removing it or adding the release label.
 
 `doctor --machine` checks both, and when another gh comes first it names the version manager responsible.
 
@@ -71,7 +71,7 @@ A repository opts in to cross-family review by committing `.github/agent-review.
 - Effort comes from the ticket's labels through the config's rules (`--effort` overrides). Reviewers are the `codex` and `claude` CLIs on PATH.
 - John waives the review of one pull request by adding the waiver label himself. A label an agent adds, through its App, waives nothing; `review full` then records "waived by" on the status, and reads the label again before it sets the status, so a waiver added while it ran stands.
 
-In any repository, an agent session's `gh pr merge`, and a `gh api` call that merges a pull request (a REST merge, or the GraphQL `mergePullRequest`, `enablePullRequestAutoMerge`, or `enqueuePullRequest`), runs only when every status check its base branch requires, by ruleset or classic branch protection, has passed on the pull request's head; `--admin`, merges outside a pull request, and a `gh api` call the guard cannot read are refused. Auto-merge (`gh pr merge --auto`, or GraphQL `enablePullRequestAutoMerge`) is let through while checks are pending or failing, since GitHub completes it only once they pass, even for a bypass actor. The merge then requires the head whose checks passed (gh's `--match-head-commit`, REST's `sha`, or, which a GraphQL merge must give itself, `expectedHeadOid`), so a commit pushed meanwhile is not merged in its place. Agents act as John, who may bypass those rules, so without this an agent's merge would skip them. A check a rule ties to one App counts only that App's check runs, and the statuses its bot set (GitHub Actions' `github-actions[bot]` for the workflow's).
+In any repository, an agent session's `gh pr merge`, and a `gh api` call that merges a pull request (a REST merge, or the GraphQL `mergePullRequest`, `enablePullRequestAutoMerge`, or `enqueuePullRequest`), runs only when every status check its base branch requires, by ruleset or classic branch protection, has passed on the pull request's head; `--admin`, merges outside a pull request, and a `gh api` call the guard cannot read are refused. Auto-merge (`gh pr merge --auto`, or GraphQL `enablePullRequestAutoMerge`) is let through while checks are pending or failing, since GitHub completes it only once they pass, even for a bypass actor. The merge then requires the head whose checks passed (gh's `--match-head-commit`, REST's `sha`, or, which a GraphQL merge must give itself, `expectedHeadOid`), so a commit pushed meanwhile is not merged in its place. Agents act as John, who may bypass those rules, so without this an agent's merge would skip them. A check a rule ties to one App counts only that App's check runs, and the statuses its bot set (GitHub Actions' `github-actions[bot]` for the workflow's). Where the base branch's config has `hold`, the merge also needs `agent-hold` to pass ([Holds](#holds)).
 
 ```json
 {
@@ -89,7 +89,9 @@ In any repository, an agent session's `gh pr merge`, and a `gh api` call that me
   "checks_timeout_minutes": 30,
   "post_checks_output": false,
   "waiver_label": "review-waived",
-  "block_on": "changes_requested"
+  "block_on": "changes_requested",
+  "status_writer": "actions",
+  "hold": { "label": "needs-human", "release_label": "human-approved", "paths": ["docs/security-claims.md", "schema/**", ".github/**"] }
 }
 ```
 
@@ -97,13 +99,15 @@ In any repository, an agent session's `gh pr merge`, and a `gh api` call that me
 
 `block_on` says what fails the status. `"changes_requested"`, the default, fails a review whose verdict requested changes. `"P0"`, `"P1"`, `"P2"`, or `"P3"` fails one with any finding at that priority or above, whatever the verdict, so at `"P2"` a review with only P3 findings passes; a marker from a release before priorities were recorded has none, and fails. Releases before a value refuse it, so they refuse to review or to pass `gh pr ready`, and the workflow sets an error status, rather than pass a review they cannot judge. `checks_output_lines` (default 60) is how much of the checks' output the reviewer sees; `post_checks_output` (default false) also shows it on the review, which suits only checks that print nothing private. `checks_timeout_minutes` defaults to 30.
 
+`hold` holds a pull request for a person: while `label` (default `needs-human`) is on it or on an issue it closes, or while its diff touches a file `paths` names (default none), the workflow fails `agent-hold`, and an agent's merge waits until a person releases it ([Holds](#holds)). `release_label` (default `human-approved`) is how a person releases a reserved path; it must differ from `label` and `waiver_label`. It needs `"status_writer": "actions"`, since otherwise the agent would set the status that holds it. Releases before v0.10.0 refuse the key, so a repository moves its agent-review workflow's pin to v0.10.0 or later, with the template's new events and `issues: write`, before adding it.
+
 The family Apps need the Commit statuses permission (write; the read App, read). An App created before it needs it added on its permissions page (`agent-gh settings <family>` prints the link), and each installation must accept the change; until then `review full` posts its review but cannot set the status.
 
 The first rule whose label patterns (`*` matches anything) all match one of the ticket's labels sets the effort. The config is read from the pull request's base branch, so a branch cannot switch off its own review. Without the workflow, the status is set by the agent that asked for the review: it shows that a review was recorded, not that nobody could forge one. With it, a ruleset can require the status from GitHub Actions alone.
 
 ### Statuses from GitHub Actions
 
-A repository adds this workflow (and `"status_writer": "actions"` in its config) to have GitHub Actions set two statuses on each pull request's head with the run's `GITHUB_TOKEN`. Each run derives both from GitHub as it stands, so it needs no state of its own.
+A repository adds this workflow (and `"status_writer": "actions"` in its config) to have GitHub Actions set two statuses on each pull request's head with the run's `GITHUB_TOKEN`, and a third, `agent-hold`, where the config has `hold` ([Holds](#holds)). Each run derives them from GitHub as it stands, so it needs no state of its own.
 
 ```yaml
 # .github/workflows/agent-review.yml
@@ -113,19 +117,24 @@ on:
     types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled] # edited: a new closing issue
   pull_request_review:
   issue_comment:
+  issues:
+    types: [labeled, unlabeled] # a hold's label on an issue holds the pull requests that close it
 permissions: {}
 jobs:
   agent-review:
-    uses: johnrees/agent-gh/.github/workflows/agent-review.yml@v0.8.0
+    uses: johnrees/agent-gh/.github/workflows/agent-review.yml@v0.10.0
     with:
-      version: v0.8.0 # the agent-gh release that sets the statuses
+      version: v0.10.0 # the agent-gh release that sets the statuses
       # runs-on: ubicloud-standard-2 # only once this pin is a release that has the input
-    # Declaring permissions drops the defaults, so each read is named, though nothing is checked out:
-    # contents (the config, compare, fetching commits), pull-requests (the PR, its commits and reviews),
-    # issues (comments, labels' events, reactions, closing issues), statuses (read and set them).
+    secrets:
+      NTFY_URL: ${{ secrets.NTFY_URL }} # optional: a hold's call is also pushed there
+    # Declaring permissions drops the defaults, so each scope is named, though nothing is checked out:
+    # contents (the config, compare, fetching commits), pull-requests (the PR, its commits, files, and reviews),
+    # issues (comments, labels' events, reactions, closing issues; and posting a hold's call and release record),
+    # statuses (read and set them).
     permissions:
       contents: read
-      issues: read
+      issues: write
       pull-requests: read
       statuses: write
 ```
@@ -134,12 +143,26 @@ Both reusable workflows (`agent-review.yml` and `agent-claims.yml`) take a `runs
 
 - **`agent-review`**: success "not an agent PR" when the author is a bot that is not a family App (Dependabot), or no commit has an `Agent-*` trailer or credits a family App or Claude as co-author (and the pull request was not opened through a family App). Else success "waived by <login>" when a person, not an App, added the waiver label. Else the latest valid marker for the current head, judged by `block_on` and its checks' result, as `review full` judges it. A marker is valid in a review or comment by the repository's owner; a comment must come through a family App in `apps.json`, and a review must only be the owner's, since GitHub records no App for a review. With no marker for the head, a review carries forward from the latest marker for the same patch id, when that review passes `block_on` and its checks (so a carried review never reads better than it did) and `git diff --name-only <its merge base> <the new merge base>` touches none of the patch's files. Otherwise it is pending: "needs a review: run `gh pr checkout N && agent-gh review full --pr N`".
 - **`agent-threads`**: success unless a comment waits for an agent's answer: an agent's P0 to P2 notify (`<!-- agent-notify {"v":1,"id":"<hex>","severity":"P1"} -->`) with no agent reply (`<!-- agent-reply {"v":1,"to":"<hex>"} -->`), or the owner's own comment, posted after the pull request was opened, on its conversation or an issue it closes, that is newer than the last comment an agent posted on that thread. The owner's 👍 on his own comment clears it. Only conversation comments count: GitHub records no App for inline review comments, so the ruleset's conversation resolution covers those. `gh pr ready` uses the same rule. A 👍 starts no workflow run, so the status catches up on the next event.
-- **Events and runs**: a pull request's events, a review, or a comment (on the pull request, or on an issue it closes) start a run. Runs are grouped per pull request (per issue for an issue's comment, whose group cannot name its pull requests) and cancel in progress, so the newest replaces an older one; and each run derives the statuses again after writing them, and rewrites them if the pull request changed meanwhile, so an older run in another group never leaves its result over a newer one. A status GitHub Actions already set the same is not set again; one an agent set is replaced. A pull request with GitHub's limit of 250 listed commits counts as an agent's.
-- **Scopes**: the job's token reads the config and compares commits (`contents`), the pull request, its commits and reviews (`pull-requests`), comments, label events, reactions, and closing issues (`issues`), and reads and sets statuses (`statuses`). An issue a pull request closes in another private repository is beyond that token, and the run fails rather than pass without it.
+- **Events and runs**: a pull request's events, a review, a comment (on the pull request, or on an issue it closes), or a label added to or removed from an issue start a run. Runs are grouped per pull request (per issue for an issue's comment or label, whose group cannot name its pull requests) and cancel in progress, so the newest replaces an older one; and each run derives the statuses again after writing them, and rewrites them if the pull request changed meanwhile, so an older run in another group never leaves its result over a newer one. A status GitHub Actions already set the same is not set again; one an agent set is replaced. A pull request with GitHub's limit of 250 listed commits counts as an agent's.
+- **Scopes**: the job's token reads the config and compares commits (`contents`), the pull request, its commits, files, and reviews (`pull-requests`), and comments, label events, reactions, and closing issues (`issues`), and reads and sets statuses (`statuses`). It writes issues only to post a hold's call and release record, as `github-actions[bot]`. An issue a pull request closes in another private repository is beyond that token, and the run fails rather than pass without it.
 - **What it runs**: a released agent-gh checked against the release's `SHA256SUMS`, never the pull request's code. Carry-forward fetches the commits it compares, one deep, into a scratch repository, and only diffs them.
 - **Forks**: supported. `pull_request_target` runs the base branch's workflow with a token that can set statuses, so a pull request cannot rewrite the workflow that judges it either. `pull_request_review` runs the pull request's own copy of the workflow, read-only for a fork; that run reports it cannot set statuses, and the next `pull_request_target` or `issue_comment` run sets them. Review a change to `.github/workflows/` itself by hand.
 
-To make both required: in the repository's settings, Rules, Rulesets, edit the default branch's ruleset, turn on "Require status checks to pass", add `agent-review` and `agent-threads`, and choose GitHub Actions as each one's source (its `integration_id` is 15368). An agent's App token then cannot set a status that satisfies them, and an agent's `gh pr merge` waits for those GitHub Actions statuses too.
+To make them required: in the repository's settings, Rules, Rulesets, edit the default branch's ruleset, turn on "Require status checks to pass", add `agent-review` and `agent-threads` (and `agent-hold`, where the config has `hold`), and choose GitHub Actions as each one's source (its `integration_id` is 15368). An agent's App token then cannot set a status that satisfies them, and an agent's `gh pr merge` waits for those GitHub Actions statuses too.
+
+### Holds
+
+A pull request that needs John cannot be merged by an agent until a person releases it. Two things hold it, where the base branch's config has `hold`:
+
+- **The label**, `needs-human`, on the pull request or on an issue it closes. An agent calls John in by posting its question as one comment whose first line is the ask, then adding the label. It holds while it is on; once it is gone, until the last change to it is a person's removal, or a person adds `human-approved` after it last went on.
+- **A reserved path**: the diff touches a file `hold.paths` names (a `Bun.Glob` pattern, matched against each changed file's name and, for a rename, its old name). A person releases it by adding `human-approved` to the pull request; the release binds to the reserved files' diff at that head (`git patch-id --stable` of `git diff <merge base> <head> -- <reserved files>`), recorded by the workflow as `github-actions[bot]` in `<!-- agent-hold-release {"v":1,"event":…,"by":…,"head":…,"paths_patch_id":…} -->`. A rebase that leaves that diff as it was keeps the release; any change to it holds the pull request again, and John removes and adds the label again to release the new diff. A head first seen after the release (one GitHub Actions had set no `agent-hold` on before it) is not released. A pull request with more files than GitHub lists (3,000) is held, since it cannot be checked. A person's own pull request with no agent commits is never held by its paths; Dependabot's is.
+
+Only a person releases a hold: an event GitHub records with no App (`performed_via_github_app` null) and no bot as its actor, the same test as the waiver's. An agent removing the label, or adding the release label, releases nothing, and only records `github-actions[bot]` wrote count. A person's waiver waives the review, never the hold.
+
+- **`agent-hold`**: success "not held", "released by <login> at <sha>", or "not an agent PR"; else failure naming the hold: "held: `needs-human` on #N: <the ask's first line>", "was removed by an agent on #N", "touches `schema/**` (… and 2 more); John adds `human-approved`", "reserved paths changed since <login> released at <sha>", or "lists over 3,000 files". It is a status apart from `agent-review`, so a hold blocks the merge but not `gh pr ready`: CI runs on a held pull request.
+- **Calling John in**: when the label goes on a pull request or an issue (not when John adds it himself), the workflow posts a comment as `github-actions[bot]` that mentions the repository owner, as the API names him (a bot's mention notifies him; an agent's, posted as him, would not), with the ask's first line (the newest comment an agent posted on that thread in the 15 minutes before the label, markers stripped, at most 200 characters; else "(no ask posted; read the thread)"), a link to it, and how to release the hold. Its `<!-- agent-hold-call {"v":1,"event":…} -->` marker names the label's event, so a rerun or a later run never posts it twice. A newly posted call is also pushed to the repository secret `NTFY_URL`, if set (`Title: <owner/repo>#<n> needs you`, `Click:` the thread, `Tags: raised_hand`); a failed push only warns, and the URL is never printed.
+- **`gh pr ready`** prints the hold ("held: …; John releases it before it can merge") and lets the pull request go ready.
+- **The merge guard** (`gh pr merge`, a REST or GraphQL merge, and `enablePullRequestAutoMerge`) requires `agent-hold` to be success on the head, set by GitHub Actions, even where the ruleset does not list it, and names the hold and how it is released. It refuses `--auto` while `agent-hold` is not success, unless the ruleset requires `agent-hold` from GitHub Actions, since auto-merge waits only for the checks a ruleset requires.
 
 ## Notify and reply
 
