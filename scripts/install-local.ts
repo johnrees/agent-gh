@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { bunVersionProblem } from "./bun-version.ts";
+import { installBinary } from "./install-binary.ts";
 
 const root = join(import.meta.dir, "..");
 const problem = bunVersionProblem(Bun.version, readFileSync(join(root, ".bun-version"), "utf8").trim());
@@ -19,4 +20,5 @@ const run = (command: string[]) => {
 };
 run([process.execPath, "install", "--frozen-lockfile"]);
 run([process.execPath, "run", "build"]);
-run(["install", "-m", "755", join(root, "dist", "agent-gh"), join(homedir(), ".local", "bin", "agent-gh")]);
+const target = join(homedir(), ".local", "bin", "agent-gh");
+console.log(installBinary(join(root, "dist", "agent-gh"), target) ? `installed ${target}` : `${target}: already this build`);

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AppConfig, Registry } from "../src/config.ts";
@@ -287,15 +287,23 @@ test("install-shims --agent-machine: git reads with the read App and pushes with
   // A rerun changes nothing, and a shared key keeps its other values.
   git(["config", "--global", "--add", "url.https://github.com/.insteadOf", "gh:"]);
   const gitconfig = readFileSync(join(home, ".gitconfig"), "utf8");
+  const managed = [join(shims, "gh"), join(home, ".zshrc"), join(home, ".bashrc"), join(configDir, "machine.json")];
+  const stamps = managed.map((path) => statSync(path).mtimeMs);
+  expect(printed.at(-1)).toStartWith("install-shims: changed ");
   installShims(deps, true, ["claude"]);
   expect(readFileSync(join(home, ".gitconfig"), "utf8")).toBe(gitconfig);
+  expect(managed.map((path) => statSync(path).mtimeMs)).toEqual(stamps);
+  expect(printed.at(-1)).toBe("install-shims: already set up; nothing changed");
+  expect(readdirSync(shims)).toEqual(["gh"]);
+  expect(readdirSync(home).filter((name) => name.includes(".tmp"))).toEqual([]);
   git(["config", "--global", "--unset", "url.https://github.com/.insteadOf", "^git@"]);
   installShims(deps, true, ["claude"]);
   expect(git(["config", "--global", "--get-all", "url.https://github.com/.insteadOf"]).stdout).toBe(
     "ssh://git@github.com/\ngit+ssh://git@github.com/\nssh+git://git@github.com/\nssh://git@ssh.github.com:443/\ngh:\ngit@github.com:\n",
   );
   expect(readFileSync(join(home, ".zshrc"), "utf8")).toBe(zshrc);
-  expect(printed.at(-1)).toBe("gh: no personal login on this machine");
+  expect(printed.at(-2)).toBe("gh: no personal login on this machine");
+  expect(printed.at(-1)).toBe("install-shims: changed git config --global url.https://github.com/.insteadOf");
 
   // A person's git, and an agent's reads, get the read App's token from agent-gh itself.
   const fill = git(["credential", "fill"], GITHUB_FILL);
@@ -357,13 +365,17 @@ test("install-shims --agent-machine refuses, changing nothing, until the read Ap
 });
 
 test("install-shims on a person's own machine leaves git credentials and gh's login alone, and writes .profile when no startup file exists", () => {
-  const { home, deps, git, ghLog, configDir } = machine({ read: false, rc: [] });
+  const { home, deps, git, ghLog, configDir, printed } = machine({ read: false, rc: [] });
   installShims(deps, false, undefined);
   expect(JSON.parse(readFileSync(join(configDir, "machine.json"), "utf8"))).toEqual({ agent_machine: false });
   expect(git(["config", "--global", "--get-all", "credential.https://github.com.helper"]).code).not.toBe(0);
   expect(ghLog()).toBe("");
   expect(existsSync(join(home, "gh-login"))).toBe(true);
   expect(RC_FILES.filter((name) => existsSync(join(home, name)))).toEqual([".profile"]);
+  const profile = readFileSync(join(home, ".profile"), "utf8");
+  installShims(deps, false, undefined);
+  expect(readFileSync(join(home, ".profile"), "utf8")).toBe(profile);
+  expect(printed.at(-1)).toBe("install-shims: already set up; nothing changed");
 });
 
 test("doctor --machine passes a set-up agent machine and names the fix for each failure", async () => {

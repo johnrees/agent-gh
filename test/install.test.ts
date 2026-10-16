@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -46,12 +46,22 @@ const release = ({ loginFails = false, doctorFails = false } = {}) => {
   writeFileSync(join(gitleaks, "gitleaks_8.30.1_checksums.txt"), `${sha256(join(gitleaks, GITLEAKS))}  ${GITLEAKS}\n`);
 
   // As `curl ... | bash -s -- <args>`: the script arrives on stdin.
+  // A cp that, while `cut` names a part of its destination's name, writes half the file there and fails: an
+  // interrupted copy.
+  const stubs = join(root, "stubs");
+  mkdirSync(stubs);
+  writeFileSync(
+    join(stubs, "cp"),
+    `#!/bin/sh\nfor last; do :; done\nif [ -f '${root}/cut' ]; then case \${last##*/} in *$(cat '${root}/cut')*) head -c 4 "$1" > "$last"; exit 1 ;; esac; fi\nexec /bin/cp "$@"\n`,
+  );
+  chmodSync(join(stubs, "cp"), 0o755);
+  const cut = (name: string | undefined) => (name === undefined ? rmSync(join(root, "cut"), { force: true }) : writeFileSync(join(root, "cut"), name));
   const run = (args: string[] = []) => {
     writeFileSync(log, "");
     const result = Bun.spawnSync(["bash", "-s", "--", ...args], {
       env: {
         HOME: home,
-        PATH: "/usr/bin:/bin",
+        PATH: `${stubs}:/usr/bin:/bin`,
         AGENT_GH_RELEASES: `file://${join(root, "agent-gh")}`,
         AGENT_GH_GITLEAKS_RELEASES: `file://${join(root, "gitleaks")}`,
       },
@@ -61,7 +71,7 @@ const release = ({ loginFails = false, doctorFails = false } = {}) => {
     });
     return { code: result.exitCode, stderr: result.stderr.toString(), calls: readFileSync(log, "utf8").trim().split("\n") };
   };
-  return { root, home, download, gitleaks, run, bin: join(home, ".local", "bin") };
+  return { root, home, download, gitleaks, run, cut, bin: join(home, ".local", "bin") };
 };
 
 test("the install line installs the checked agent-gh and gitleaks, then logs in, shims, and checks, and reruns cleanly", () => {
@@ -74,10 +84,52 @@ test("the install line installs the checked agent-gh and gitleaks, then logs in,
   expect(readFileSync(join(bin, "gitleaks"), "utf8")).toContain("gitleaks 8.30.1");
   expect(existsSync(join(bin, "LICENSE"))).toBe(false);
 
+  // A rerun of the same release leaves both binaries alone and says so.
+  const installed = statSync(join(bin, "agent-gh")).ino;
   const again = run(["--agent-machine"]);
   expect(again.code).toBe(0);
-  expect(again.calls.slice(2)).toEqual(["login --all", "install-shims --agent-machine", "doctor --machine"]);
+  expect(again.calls).toEqual(["--version", "login --all", "install-shims --agent-machine", "doctor --machine"]);
+  expect(again.stderr).toContain(`agent-gh v0.1.0 at ${bin}/agent-gh: already installed`);
   expect(again.stderr).toContain("gitleaks: already installed");
+  expect(statSync(join(bin, "agent-gh")).ino).toBe(installed);
+  expect(readdirSync(bin).sort()).toEqual(["agent-gh", "gitleaks"]);
+});
+
+test("a new release replaces agent-gh by a rename, leaving no temporary file", () => {
+  const { bin, download, run } = release();
+  expect(run().code).toBe(0);
+  writeFileSync(join(download, ASSET), readFileSync(join(download, ASSET), "utf8").replace("v0.1.0", "v0.2.0"));
+  writeFileSync(join(download, "SHA256SUMS"), `${sha256(join(download, ASSET))}  ${ASSET}\n`);
+  const update = run();
+  expect(update.code).toBe(0);
+  expect(update.stderr).toContain(`installed agent-gh v0.2.0 at ${bin}/agent-gh`);
+  expect(readdirSync(bin).sort()).toEqual(["agent-gh", "gitleaks"]);
+});
+
+test("an interrupted copy leaves the installed agent-gh whole and gitleaks absent, and a rerun completes", () => {
+  const { bin, download, run, cut } = release();
+  expect(run().code).toBe(0);
+  const installed = readFileSync(join(bin, "agent-gh"));
+  writeFileSync(join(download, ASSET), readFileSync(join(download, ASSET), "utf8").replace("v0.1.0", "v0.2.0"));
+  writeFileSync(join(download, "SHA256SUMS"), `${sha256(join(download, ASSET))}  ${ASSET}\n`);
+  rmSync(join(bin, "gitleaks"));
+  cut("agent-gh");
+  expect(run().code).not.toBe(0);
+  expect(readFileSync(join(bin, "agent-gh"))).toEqual(installed);
+  expect(readdirSync(bin)).toEqual(["agent-gh"]);
+  cut(undefined);
+  expect(run().code).toBe(0);
+  expect(readFileSync(join(bin, "agent-gh"), "utf8")).toContain("v0.2.0");
+
+  rmSync(join(bin, "gitleaks"));
+  cut("gitleaks");
+  expect(run().code).not.toBe(0);
+  expect(readdirSync(bin)).toEqual(["agent-gh"]);
+  cut(undefined);
+  const done = run();
+  expect(done.code).toBe(0);
+  expect(done.stderr).toContain(`installed gitleaks 8.30.1 at ${bin}/gitleaks`);
+  expect(readdirSync(bin).sort()).toEqual(["agent-gh", "gitleaks"]);
 });
 
 test("a binary or gitleaks tarball that does not match its checksum is never installed", () => {

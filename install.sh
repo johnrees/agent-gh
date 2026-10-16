@@ -52,8 +52,20 @@ fetch() { curl -fsSL --retry 3 -o "$2" "$1"; }
 listed() { awk -v f="$2" '$2 == f || $2 == "*" f { print $1; exit }' "$1"; }
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+staged=""
+trap 'rm -rf "$tmp"; [ -z "$staged" ] || rm -f "$staged"' EXIT
 mkdir -p "$BIN"
+
+# Puts FILE at DEST, mode 755, by a rename within DEST's directory: the temporary
+# directory may be another filesystem, where mv copies, and an interrupted copy
+# would leave a partial binary for the next run to trust.
+place() {
+  staged="$(mktemp "$(dirname "$2")/.$(basename "$2").XXXXXX")"
+  cp "$1" "$staged"
+  chmod 755 "$staged"
+  mv -f "$staged" "$2"
+  staged=""
+}
 
 # 1. agent-gh itself, checked against the release's SHA256SUMS before it runs.
 asset="agent-gh-$os-$arch"
@@ -63,10 +75,14 @@ fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "could not download SHA256SUMS
 want="$(listed "$tmp/SHA256SUMS" "$asset")"
 [ -n "$want" ] || die "SHA256SUMS lists no $asset"
 [ "$(sha256 "$tmp/$asset")" = "$want" ] || die "$asset does not match SHA256SUMS; nothing was installed"
-chmod 755 "$tmp/$asset"
-"$tmp/$asset" --version > /dev/null || die "the downloaded $asset does not run on this machine"
-mv -f "$tmp/$asset" "$BIN/agent-gh"
-say "installed $("$BIN/agent-gh" --version) at $BIN/agent-gh"
+if [ -x "$BIN/agent-gh" ] && [ "$(sha256 "$BIN/agent-gh")" = "$want" ]; then
+  say "$("$BIN/agent-gh" --version) at $BIN/agent-gh: already installed"
+else
+  chmod 755 "$tmp/$asset"
+  "$tmp/$asset" --version > /dev/null || die "the downloaded $asset does not run on this machine"
+  place "$tmp/$asset" "$BIN/agent-gh"
+  say "installed $("$BIN/agent-gh" --version) at $BIN/agent-gh"
+fi
 
 # 2. gitleaks, which repositories' pre-commit hooks scan with.
 if command -v gitleaks > /dev/null 2>&1 || [ -x "$BIN/gitleaks" ]; then
@@ -80,8 +96,7 @@ else
   want="$(listed "$tmp/$sums" "$tarball")"
   [ -n "$want" ] && [ "$(sha256 "$tmp/$tarball")" = "$want" ] || die "$tarball does not match $sums; gitleaks was not installed"
   tar -xzf "$tmp/$tarball" -C "$tmp" gitleaks
-  mv -f "$tmp/gitleaks" "$BIN/gitleaks"
-  chmod 755 "$BIN/gitleaks"
+  place "$tmp/gitleaks" "$BIN/gitleaks"
   say "installed gitleaks $GITLEAKS_VERSION at $BIN/gitleaks"
 fi
 
