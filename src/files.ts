@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 /**
@@ -14,7 +14,9 @@ import { basename, dirname, join } from "node:path";
 export const writeAtomic = (link: string, text: string): void => {
   let path = link;
   try {
-    path = realpathSync(link);
+    // Only a link is resolved: on Linux, resolving a regular file another writer just replaced can name
+    // "<file> (deleted)".
+    if (lstatSync(link).isSymbolicLink()) path = realpathSync(link);
   } catch {
     // A new file, or a dangling link: write where it names.
   }
