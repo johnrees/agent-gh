@@ -1,11 +1,14 @@
 name: agent-review
-# Reusable: sets the agent-review and agent-threads commit statuses on a pull
-# request's head with the caller's GITHUB_TOKEN, so they come from GitHub
-# Actions (App 15368) and a ruleset can require them from that App alone. The
-# caller's template, events, and permissions are in the README ("Statuses
-# from GitHub Actions"). It never checks out or runs the pull request's code:
-# it downloads a released agent-gh, reads GitHub's API, and fetches only the
-# commits carry-forward compares into a scratch repository.
+# Reusable: sets the agent-review and agent-threads commit statuses (and,
+# where the config has `hold`, agent-hold) on a pull request's head with the
+# caller's GITHUB_TOKEN, so they come from GitHub Actions (App 15368) and a
+# ruleset can require them from that App alone; and, when a hold's label goes
+# on, calls the repository owner in with a comment (and an ntfy push, where
+# the caller passes NTFY_URL). The caller's template, events, and permissions
+# are in the README ("Statuses from GitHub Actions"). It never checks out or
+# runs the pull request's code: it downloads a released agent-gh, reads
+# GitHub's API, and fetches only the commits it compares into a scratch
+# repository.
 on:
   workflow_call:
     inputs:
@@ -17,26 +20,34 @@ on:
         description: The runner, as a label (ubuntu-latest, ubicloud-standard-2) or a JSON list of labels (["self-hosted","linux"]). Linux only.
         type: string
         default: ubuntu-latest
+    secrets:
+      NTFY_URL:
+        description: An ntfy topic URL a hold's call is also pushed to. Optional, and never printed.
+        required: false
 permissions: {}
 jobs:
   status:
     runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     timeout-minutes: 10
-    # Declaring permissions drops the defaults, so every read the run makes is
+    # Declaring permissions drops the defaults, so every scope the run uses is
     # named here: contents (the config, compare, fetching commits),
-    # pull-requests (the PR, its commits and reviews), issues (comments, label
-    # events, reactions, closing issues), statuses (read and set). A caller
-    # must grant the same.
+    # pull-requests (the PR, its commits, files, and reviews), issues
+    # (comments, label events, reactions, closing issues), statuses (read and
+    # set). The two writes post a hold's call as github-actions[bot]: issues:
+    # write on an issue, and pull-requests: write as well on a pull request's
+    # conversation. A caller must grant the same.
     permissions:
       contents: read
-      issues: read
-      pull-requests: read
+      issues: write
+      pull-requests: write
       statuses: write
-    # One run per pull request (or per issue, for a comment on one): every run
-    # derives both statuses from GitHub as it stands, so a newer run, on a new
-    # head or after a new comment, replaces an older one still in progress. An
-    # issue's group cannot name its pull requests, so a run also derives them
-    # again after writing, and rewrites them if they changed meanwhile.
+    # One run per pull request (or per issue, for a comment on or a label
+    # change to one): every run derives the statuses from GitHub as it stands,
+    # so a newer run, on a new head or after a new comment, replaces an older
+    # one still in progress. An issue's group cannot name its pull requests,
+    # so a run also derives them again after writing, and rewrites them if
+    # they changed meanwhile. Only a run in a thread's own group calls the
+    # owner in on it.
     concurrency:
       group: agent-review-status-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: true
@@ -63,7 +74,9 @@ jobs:
           mv "$asset" agent-gh
           chmod +x agent-gh
           ./agent-gh --version
-      - name: Set agent-review and agent-threads
+      - name: Set the statuses, and call the owner in on a hold
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # Empty when the caller passes no NTFY_URL; agent-gh then sends no push.
+          AGENT_GH_NTFY_URL: ${{ secrets.NTFY_URL }}
         run: ./agent-gh status

@@ -47,7 +47,17 @@ export type ReviewConfig = {
    * derives it from the review's marker; `review full` then only waits for it.
    */
   readonly statusWriter: StatusWriter;
+  /** What holds a pull request until a person releases it (the agent-hold status); undefined when the config sets no `hold`. */
+  readonly hold: HoldConfig | undefined;
 };
+
+/**
+ * `hold`: a pull request is held once `label` has been on it or on an issue
+ * it closes, or while its diff touches a file `paths` names (`Bun.Glob`
+ * patterns), until the repository owner releases its exact head with the
+ * comment `agent-hold release <head sha>`.
+ */
+export type HoldConfig = { readonly label: string; readonly paths: readonly string[] };
 
 export const STATUS_WRITERS = ["agent", "actions"] as const;
 export type StatusWriter = (typeof STATUS_WRITERS)[number];
@@ -117,6 +127,26 @@ const statusWriter = (value: unknown): StatusWriter => {
   return value as StatusWriter;
 };
 
+/** GitHub compares label names without case, so the guard does too. */
+export const sameLabel = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+
+/**
+ * `hold`, which needs the agent-review workflow to set its status: with
+ * `status_writer` `"agent"`, the agent would set the status that holds it.
+ * Its label may not be the waiver's.
+ */
+const holdConfig = (value: unknown, writer: StatusWriter, waiverLabel: string): HoldConfig | undefined => {
+  if (value === undefined) return undefined;
+  const hold = object(value, "hold");
+  known(hold, ["label", "paths"], "hold");
+  if (writer !== "actions") throw new Failure(STAGE, `${CONFIG_PATH}: hold needs "status_writer": "actions", since otherwise the agent would set the status that holds it`);
+  const label = hold.label === undefined ? "needs-human" : string(hold.label, "hold.label");
+  if (sameLabel(label, waiverLabel)) throw new Failure(STAGE, `${CONFIG_PATH}: hold.label must differ from waiver_label`);
+  const paths = hold.paths ?? [];
+  if (!Array.isArray(paths)) throw new Failure(STAGE, `${CONFIG_PATH}: hold.paths must be a list of path patterns`);
+  return { label, paths: paths.map((path, index) => string(path, `hold.paths[${index}]`)) };
+};
+
 /** Parses and checks the config; every refusal names the field to fix. */
 export const parseReviewConfig = (text: string): ReviewConfig => {
   let raw: unknown;
@@ -126,7 +156,7 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
     throw new Failure(STAGE, `${CONFIG_PATH} is not valid JSON`);
   }
   const top = object(raw, "the file");
-  known(top, ["reviewers", "effort", "checklist", "waiver_label", "pin", "checks", "checks_output_lines", "post_checks_output", "checks_timeout_minutes", "block_on", "status_writer", "claims", "queue"], "the file");
+  known(top, ["reviewers", "effort", "checklist", "waiver_label", "pin", "checks", "checks_output_lines", "post_checks_output", "checks_timeout_minutes", "block_on", "status_writer", "hold", "claims", "queue"], "the file");
   const checksRaw = top.checks ?? [];
   if (!Array.isArray(checksRaw)) throw new Failure(STAGE, `${CONFIG_PATH}: checks must be a list of commands`);
   const reviewersRaw = object(top.reviewers, "reviewers");
@@ -154,18 +184,21 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
       effort: effort(rule.effort, `effort.rules[${index}].effort`),
     };
   });
+  const waiverLabel = top.waiver_label === undefined ? "review-waived" : string(top.waiver_label, "waiver_label");
+  const writer = statusWriter(top.status_writer);
   return {
     reviewers,
     effort: { default: effort(effortRaw.default ?? "high", "effort.default"), rules },
     checklist: top.checklist === undefined ? undefined : string(top.checklist, "checklist"),
-    waiverLabel: top.waiver_label === undefined ? "review-waived" : string(top.waiver_label, "waiver_label"),
+    waiverLabel,
     pin: pinned(top.pin, reviewers),
     checks: checksRaw.map((check, index) => string(check, `checks[${index}]`)),
     checksOutputLines: whole(top.checks_output_lines, "checks_output_lines", 60, 0, 1000),
     postChecksOutput: flag(top.post_checks_output, "post_checks_output"),
     checksTimeoutMinutes: whole(top.checks_timeout_minutes, "checks_timeout_minutes", 30, 1, 1440),
     blockOn: blockOn(top.block_on),
-    statusWriter: statusWriter(top.status_writer),
+    statusWriter: writer,
+    hold: holdConfig(top.hold, writer, waiverLabel),
   };
 };
 

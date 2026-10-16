@@ -162,8 +162,10 @@ const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): Re
 
 /**
  * `agent-gh status`'s I/O in a GitHub Actions job: the workflow's
- * GITHUB_TOKEN, and git in a scratch repository that fetches commits to
- * compare, with the token in git's environment, never its arguments.
+ * GITHUB_TOKEN, git in a scratch repository that fetches commits to
+ * compare, with the token in git's environment, never its arguments, and
+ * the NTFY_URL secret as the step passes it (`AGENT_GH_NTFY_URL`), which no
+ * child process sees.
  */
 const statusIo = (env: NodeJS.ProcessEnv, repo: Repo, token: string): StatusIo => {
   const dir = mkdtempSync(join(tmpdir(), "agent-gh-status-"));
@@ -182,6 +184,7 @@ const statusIo = (env: NodeJS.ProcessEnv, repo: Repo, token: string): StatusIo =
     token,
     repo,
     remote: `https://github.com/${slug(repo)}.git`,
+    ntfyUrl: env.AGENT_GH_NTFY_URL,
     git: async (args, input) => {
       const child = Bun.spawn(["git", ...args], { cwd: dir, env: gitEnv, stdin: input === undefined ? "ignore" : new Blob([input]), stdout: "pipe", stderr: "ignore" });
       const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);

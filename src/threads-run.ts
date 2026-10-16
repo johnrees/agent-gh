@@ -37,12 +37,22 @@ export const repoOwner = async (io: ApiIo, stage: Stage): Promise<string> => {
   return owner;
 };
 
-/** The issues a pull request closes (up to ten), in whichever repositories. */
+/** The most issues one pull request may close and still be read whole. */
+const CLOSING_LISTED = 25;
+
+/**
+ * The issues a pull request closes, in whichever repositories. More than
+ * GitHub lists in one page is refused: a label on one left out would hold
+ * nothing, and a comment on it would wait for no answer.
+ */
 export const closingIssues = async (io: ApiIo, stage: Stage, number: number): Promise<{ readonly repo: Repo; readonly number: number }[]> => {
-  const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){closingIssuesReferences(first:10){nodes{number repository{nameWithOwner}}}}}}`;
+  const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){closingIssuesReferences(first:${CLOSING_LISTED}){totalCount nodes{number repository{nameWithOwner}}}}}}`;
   const value = await get(io, stage, "/graphql", "POST", { query, variables: { owner: io.repo.owner, name: io.repo.name, number } });
-  const nodes = record(record(record(record(record(value).data).repository).pullRequest).closingIssuesReferences).nodes;
+  const references = record(record(record(record(value).data).repository).pullRequest).closingIssuesReferences;
+  const nodes = record(references).nodes;
   if (!Array.isArray(nodes)) throw new Failure(stage, `the issues #${number} closes: invalid response`);
+  const total = record(references).totalCount;
+  if (Number.isSafeInteger(total) && (total as number) > nodes.length) throw new Failure(stage, `#${number} closes over ${CLOSING_LISTED} issues, too many to read`);
   return nodes.flatMap((node) => {
     const repo = parseRepo(text(record(record(node).repository).nameWithOwner));
     const issue = record(node).number;
@@ -61,12 +71,14 @@ const comment = (value: unknown, thread: string): ThreadComment => {
     author: text(record(item.user).login),
     appId: Number.isSafeInteger(app) ? (app as number) : undefined,
     createdAt: text(item.created_at),
+    updatedAt: text(item.updated_at),
     body: text(item.body),
     thumbsUp: Number.isSafeInteger(thumbsUp) ? (thumbsUp as number) : 0,
   };
 };
 
-const issueComments = async (io: ApiIo, stage: Stage, repo: Repo, number: number, thread: string) =>
+/** Every conversation comment on issue or pull request `number` in `repo`, as `thread`'s. */
+export const issueComments = async (io: ApiIo, stage: Stage, repo: Repo, number: number, thread: string): Promise<ThreadComment[]> =>
   (await everyPage(io, stage, `/repos/${slug(repo)}/issues/${number}/comments`)).map((item) => comment(item, thread));
 
 /**

@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { type Claim, claimMarker, parseClaimArgs } from "../src/claim.ts";
 import { type ClaimIo, UNKNOWN } from "../src/claim-run.ts";
 import { type Blocker, frontier, labelFilter, type LabelRules, type Node, parseQueue, waves } from "../src/next.ts";
-import { apiReader, claimNext, nextIssues, nextJson, nextLines, type Read, wavesJson, wavesLines } from "../src/next-run.ts";
+import { apiReader, claimNext, nextIssues, nextJson, nextLines, queueConfig, type Read, wavesJson, wavesLines } from "../src/next-run.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
 
 const REPO = { owner: "johnrees", name: "widget" };
@@ -168,6 +168,26 @@ test("with no Queue configured, next falls back to the ready issues and says so"
   expect(nextLines(result, (line) => notes.push(line))).toEqual(["#2 T2", "#8 T8"]);
   expect(notes[0]).toContain("no Queue issue is configured");
   expect(nextJson(REPO, result).queue).toBeNull();
+});
+
+test("where the config has hold, next skips an issue carrying its label, in any case, which still blocks what waits on it", async () => {
+  const routes = (hold: unknown, queue?: unknown) => ({
+    ...BASE,
+    "repos/johnrees/widget/contents/.github/agent-review.json?ref=main": config({ reviewers: { codex: { model: "m" } }, status_writer: "actions", hold, ...(queue === undefined ? {} : { queue }) }),
+    "repos/johnrees/widget/issues?state=open&labels=ready": [issue(2, ["ready", "Needs-Human"]), issue(8, ["ready"]), issue(9, ["ready", "ask-john"])],
+    "repos/johnrees/widget/issues/8/dependencies/blocked_by": [issue(2, ["ready", "Needs-Human"])],
+  });
+  const held = await nextIssues(REPO, reader(routes({})).read);
+  expect(held.config.holdLabel).toBe("needs-human");
+  expect(held.waves.map((wave) => wave.map((item) => [item.issue, item.state]))).toEqual([[[2, "skipped"], [9, "workable"]], [[8, "waiting"]]]);
+  const notes: string[] = [];
+  expect(nextLines(held, (line) => notes.push(line))).toEqual(["#9 T9"]);
+  expect(notes).toContain("agent-gh: skipped #2 T2: carries Needs-Human (hold.label)");
+  expect(await queueConfig(REPO, reader(routes({ label: "ask-john" }, { skip_labels: ["model:redteam"] })).read)).toMatchObject({ skipLabels: ["model:redteam"], holdLabel: "ask-john" });
+  expect(nextLines(await nextIssues(REPO, reader(routes({ label: "ask-john" }, { skip_labels: ["model:redteam"] })).read), () => {})).toEqual(["#2 T2"]);
+  // Without hold, the label means nothing to next.
+  const { read } = reader({ ...routes({}), "repos/johnrees/widget/contents/.github/agent-review.json?ref=main": config({ reviewers: { codex: { model: "m" } } }) });
+  expect(nextLines(await nextIssues(REPO, read), () => {})).toEqual(["#2 T2", "#9 T9"]);
 });
 
 test("a Queue issue that cannot be read is refused, not read as empty", async () => {

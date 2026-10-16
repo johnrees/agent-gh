@@ -1,10 +1,12 @@
 import type { AgentApp } from "./config.ts";
-import { outcomeSummary, parseMarker, type ReviewMarker, type ReviewPolicy, reviewState, STATUS_CONTEXT, statusDescription } from "./review.ts";
+import { type HoldConfig, inert, outcomeSummary, parseMarker, type ReviewMarker, type ReviewPolicy, reviewState, sameLabel, STATUS_CONTEXT, statusDescription } from "./review.ts";
+import { byAgent, type ThreadComment } from "./threads.ts";
 
 /**
  * The agent-review workflow's pure decisions: which pull requests an event
- * concerns, whether one is an agent's, which review markers count, and the
- * agent-review status they give. status-run.ts does the I/O.
+ * concerns, whether one is an agent's, which review markers count, the
+ * agent-review status they give, and what holds a pull request for a person
+ * (agent-hold). status-run.ts does the I/O.
  */
 
 export type Status = {
@@ -18,8 +20,9 @@ const record = (value: unknown): Record<string, unknown> => (typeof value === "o
 
 /**
  * The pull requests an Actions event concerns: the event's own, or, for a
- * comment on an issue that is not a pull request, the issue (whose closing
- * pull requests the caller looks up). Undefined for any other event.
+ * comment on or a label change to an issue that is not a pull request, the
+ * issue (whose closing pull requests the caller looks up). Undefined for any
+ * other event.
  */
 export const eventTarget = (name: string, payload: unknown): { readonly pull: number } | { readonly issue: number } | undefined => {
   const event = record(payload);
@@ -27,7 +30,7 @@ export const eventTarget = (name: string, payload: unknown): { readonly pull: nu
   if (["pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment"].includes(name)) {
     return Number.isSafeInteger(pull) ? { pull: pull as number } : undefined;
   }
-  if (name === "issue_comment") {
+  if (name === "issue_comment" || name === "issues") {
     const issue = record(event.issue);
     if (!Number.isSafeInteger(issue.number)) return undefined;
     return issue.pull_request !== undefined && issue.pull_request !== null ? { pull: issue.number as number } : { issue: issue.number as number };
@@ -150,3 +153,271 @@ export const reviewStatus = (input: {
   }
   return status("pending", `needs a review: run \`gh pr checkout ${input.number} && agent-gh review full --pr ${input.number}\``);
 };
+
+// --- agent-hold: what holds a pull request until a person releases it ---
+
+export const HOLD_CONTEXT = "agent-hold";
+
+/** The bot whose statuses and comments a run's GITHUB_TOKEN makes: GitHub Actions' (App 15368). */
+export const ACTIONS_BOT = "github-actions[bot]";
+
+/** A label added to or removed from an issue or pull request, from GitHub's issue events. */
+export type LabelEvent = {
+  readonly id: number;
+  readonly event: "labeled" | "unlabeled";
+  readonly label: string;
+  readonly at: string;
+  readonly actor: string;
+  /**
+   * A person's own addition: no App acted for them (`performed_via_github_app`
+   * is null), and they are no bot. Never a removal's: GitHub records no App on
+   * an `unlabeled` event (checked live), so an agent's removal reads as a
+   * person's, and no removal can be told to be one.
+   */
+  readonly person: boolean;
+};
+
+/** The label events among an issue's events, oldest first as GitHub lists them. */
+export const labelEvents = (events: readonly unknown[]): LabelEvent[] =>
+  events.map(record).flatMap((entry): LabelEvent[] => {
+    const name = record(entry.label).name;
+    if ((entry.event !== "labeled" && entry.event !== "unlabeled") || typeof name !== "string" || !Number.isSafeInteger(entry.id)) return [];
+    const actor = record(entry.actor);
+    const login = typeof actor.login === "string" ? actor.login : "";
+    const viaApp = entry.performed_via_github_app !== null && entry.performed_via_github_app !== undefined;
+    return [{
+      id: entry.id as number, event: entry.event, label: name, at: typeof entry.created_at === "string" ? entry.created_at : "", actor: login,
+      person: entry.event === "labeled" && !viaApp && login !== "" && actor.type !== "Bot" && !login.endsWith("[bot]"),
+    }];
+  });
+
+/** The latest event that added `label`. */
+export const lastAdded = (events: readonly LabelEvent[], label: string) => events.findLast((event) => event.event === "labeled" && sameLabel(event.label, label));
+
+/** A comment on the pull request, as releases and the bot's markers are read from them; `edited` once its body was changed after it was posted. */
+export type PostedBy = { readonly author: string; readonly body: string; readonly edited?: boolean; readonly appId?: number | undefined; readonly at?: string; readonly id?: number };
+
+/** A comment as the hold reads it: an edited one (its updated_at moved; a reaction leaves it) releases nothing, since an agent, acting as the owner, can edit his (checked live). */
+export const postedBy = (comment: ThreadComment): PostedBy => ({ author: comment.author, body: comment.body, edited: comment.updatedAt !== comment.createdAt, appId: comment.appId, at: comment.createdAt, id: comment.id });
+
+const RELEASE = /^agent-hold release ([0-9a-f]{40})\s*$/m;
+
+/** The line a person posts to release a pull request at one exact head. */
+export const releaseLine = (head: string): string => `agent-hold release ${head}`;
+
+/**
+ * The person's release of `head`: the owner's own comment (no App acted for
+ * him) holding the line `agent-hold release <head>`, never edited, since an
+ * agent, acting as him, could edit it (GitHub records no App on an edit). It
+ * names one exact head, so any push holds the pull request again. The newest
+ * counts (comments come oldest first), so a release after the label went on
+ * again is not hidden by an earlier one.
+ */
+export const headRelease = (comments: readonly PostedBy[], owner: string, head: string): PostedBy | undefined =>
+  comments.findLast((comment) => comment.author.toLowerCase() === owner.toLowerCase() && comment.appId === undefined && comment.edited !== true && RELEASE.exec(comment.body)?.[1] === head);
+
+/** A thread the hold's label can hold a pull request from: the pull request itself (first), or an issue it closes. */
+export type HoldThread = {
+  /** `#N`, or `owner/repo#N` in another repository. */
+  readonly ref: string;
+  readonly labels: readonly string[];
+  readonly events: readonly LabelEvent[];
+  /** The first line of the ask for the label's latest addition, where the label is on. */
+  readonly ask?: string;
+};
+
+/**
+ * Whether the hold's label holds a thread (`on` it still, or `removed` from
+ * it): from the time it last went on until the person's release of the head
+ * (`release`) comes after it, whether or not the label is still on. Its
+ * removal releases nothing, since GitHub records no App on an `unlabeled`
+ * event (checked live): an agent's removal reads as a person's.
+ */
+export const labelHold = (thread: HoldThread, hold: HoldConfig, release: PostedBy | undefined): "on" | "removed" | undefined => {
+  const on = thread.labels.some((label) => sameLabel(label, hold.label));
+  const added = lastAdded(thread.events, hold.label);
+  if (added === undefined) return on ? "on" : undefined;
+  if (release?.at !== undefined && Date.parse(release.at) > Date.parse(added.at)) return undefined;
+  return on ? "on" : "removed";
+};
+
+/** A changed file as git lists it: its name, and its name before a rename. */
+export type ChangedFile = { readonly name: string; readonly previous: string | undefined };
+
+/**
+ * The changed files the hold's `paths` reserve (a `Bun.Glob` pattern
+ * matching the current name or, for a rename, the previous one), and the
+ * patterns that matched, in the config's order.
+ */
+export const reservedFiles = (files: readonly ChangedFile[], paths: readonly string[]): { readonly files: string[]; readonly patterns: string[] } => {
+  const globs = paths.map((pattern) => ({ pattern, glob: new Bun.Glob(pattern) }));
+  const matched = new Set<string>();
+  const hits: string[] = [];
+  for (const file of files) {
+    const names = [file.name, ...(file.previous === undefined ? [] : [file.previous])];
+    const by = globs.filter(({ glob }) => names.some((name) => glob.match(name)));
+    if (by.length === 0) continue;
+    hits.push(file.name);
+    for (const { pattern } of by) matched.add(pattern);
+  }
+  return { files: hits, patterns: paths.filter((pattern) => matched.has(pattern)) };
+};
+
+/**
+ * What an agent-hold status links: its pull request, and, where it passed on
+ * a person's release, `#agent-hold-released`, so the merge guard checks the
+ * release still stands. A status on a commit is any pull request's with that
+ * head, so the guard counts only one linking the pull request it merges.
+ */
+export const holdLink = (repo: string, number: number, released: boolean): string => `https://github.com/${repo}/pull/${number}${released ? "#agent-hold-released" : ""}`;
+
+/**
+ * Why the hold's label holds a pull request, from it (first) and the issues
+ * it closes (`labelHold`), or undefined: for the workflow's agent-hold, and
+ * for the merge guard, which reads it live, so a label added while its run
+ * waits still holds.
+ */
+export const labelHoldReason = (threads: readonly HoldThread[], hold: HoldConfig, release: PostedBy | undefined): string | undefined => {
+  const holds = threads.map((thread) => ({ thread, state: labelHold(thread, hold, release) }));
+  const on = holds.find((entry) => entry.state === "on");
+  if (on !== undefined) return `held: \`${hold.label}\` on ${on.thread.ref}${on.thread.ask === undefined ? "" : `: ${on.thread.ask}`}`;
+  const removed = holds.find((entry) => entry.state === "removed");
+  if (removed !== undefined) return `held: \`${hold.label}\` came off ${removed.thread.ref}, which releases nothing; John releases the head`;
+  return undefined;
+};
+
+export type HoldInput = {
+  readonly hold: HoldConfig;
+  /** Whose pull request: an agent's; a bot's that is no family App (Dependabot, which an agent could merge); or a person's own, which reserved paths do not hold. */
+  readonly author: "agent" | "bot" | "person";
+  /** The repository (`owner/name`) and the pull request's number, which its agent-hold status links. */
+  readonly repo: string;
+  readonly number: number;
+  /** The repository owner, the person who releases. */
+  readonly owner: string;
+  /** The pull request first, then each issue it closes. */
+  readonly threads: readonly HoldThread[];
+  /** The pull request's changed files, from its merge base to its head (none read for a person's own). */
+  readonly files: readonly ChangedFile[];
+  /** The pull request's comments, which carry the person's release. */
+  readonly comments: readonly PostedBy[];
+  readonly head: string;
+  /** Other open pull requests whose head is this one: a status on a commit is theirs too, so none is judged alone. */
+  readonly sharedWith: readonly number[];
+};
+
+/**
+ * agent-hold for a pull request's head, judged afresh on every event, for
+ * that head alone. In order:
+ * - held while its head is another open pull request's too, since the status
+ *   on that commit is theirs as well;
+ * - held while the hold's label holds the pull request or an issue it closes
+ *   (`labelHold`), whoever wrote it, until the person releases this head
+ *   after it went on;
+ * - not held, for a person's own pull request;
+ * - held while it touches a reserved file, until the person releases this
+ *   exact head (`headRelease`); a push to another head holds it again.
+ */
+export const holdStatus = (input: HoldInput): Status => {
+  const { hold } = input;
+  const of = (state: Status["state"], description: string, released = false): Status => ({ context: HOLD_CONTEXT, state, description: statusDescription(description), targetUrl: holdLink(input.repo, input.number, released) });
+  const head = input.head.slice(0, 8);
+  if (input.sharedWith.length > 0) return of("failure", `held: ${head} is also the head of ${input.sharedWith.map((number) => `#${number}`).join(", ")}, so neither is judged alone`);
+  const release = headRelease(input.comments, input.owner, input.head);
+  const label = labelHoldReason(input.threads, hold, release);
+  if (label !== undefined) return of("failure", label);
+  // Released only for this head: the label hold above, once it has been, passes like any other.
+  const labelled = input.threads.some((thread) => lastAdded(thread.events, hold.label) !== undefined);
+  if (input.author === "person") return of("success", "not an agent PR", labelled);
+  const reserved = reservedFiles(input.files, hold.paths);
+  if (reserved.files.length === 0) return labelled ? of("success", `released by ${input.owner} at ${head}`, true) : of("success", "not held");
+  if (release !== undefined) return of("success", `released by ${input.owner} at ${head}`, true);
+  const [first, ...rest] = reserved.files;
+  const patterns = reserved.patterns.map((pattern) => `\`${pattern}\``).join(", ");
+  return of("failure", `held: touches ${patterns} (${first}${rest.length === 0 ? "" : ` and ${rest.length} more`}); John releases ${head}`);
+};
+
+// --- Calling John in when the hold's label goes on ---
+
+/** How long before the label went on an agent's comment counts as its ask. */
+export const ASK_WINDOW_MS = 15 * 60_000;
+
+/** The ask's line when no agent posted one in the window. */
+export const NO_ASK = "(no ask posted; read the thread)";
+
+const ASK_CHARACTERS = 200;
+
+/**
+ * The ask's first line: the first line with text once agent-gh's markers
+ * (HTML comments) are stripped, unable to carry a marker of its own
+ * (`inert`), and at most 200 characters.
+ */
+export const firstLine = (body: string): string | undefined => {
+  const line = body.replace(/<!--[\s\S]*?-->/g, "").split(/\r?\n/).map((part) => part.trim()).find((part) => part !== "");
+  if (line === undefined) return undefined;
+  const safe = inert(line);
+  return safe.length <= ASK_CHARACTERS ? safe : `${safe.slice(0, ASK_CHARACTERS - 1)}…`;
+};
+
+/**
+ * The ask behind a hold's label: the newest comment an agent (the owner,
+ * through a family App) posted on the thread in the 15 minutes before the
+ * label went on, with its first line; else NO_ASK.
+ */
+export const askFor = (comments: readonly ThreadComment[], labeledAt: string, owner: string, apps: readonly number[]): { readonly line: string; readonly url: string | undefined } => {
+  const until = Date.parse(labeledAt);
+  const asks = comments.filter((comment) => {
+    const at = Date.parse(comment.createdAt);
+    return byAgent(comment, owner, apps) && at <= until && at >= until - ASK_WINDOW_MS && firstLine(comment.body) !== undefined;
+  });
+  const ask = asks.reduce<ThreadComment | undefined>((newest, comment) => (newest === undefined || comment.createdAt > newest.createdAt || (comment.createdAt === newest.createdAt && comment.id > newest.id) ? comment : newest), undefined);
+  return ask === undefined ? { line: NO_ASK, url: undefined } : { line: firstLine(ask.body) as string, url: ask.url };
+};
+
+/** The call's marker: the `labeled` event it answers, so a rerun or a later run never posts it twice. */
+export type CallMarker = { readonly v: 1; readonly event: number };
+
+const CALL = /<!-- agent-hold-call (\{[^\n]*?\}) -->/;
+
+export const callMarker = (value: CallMarker): string => `<!-- agent-hold-call ${JSON.stringify(value)} -->`;
+
+/** Whether `github-actions[bot]` has already called the owner in for `event` among these comments; anyone else's marker counts for nothing. */
+export const called = (comments: readonly PostedBy[], event: number): boolean =>
+  comments.some((comment) => {
+    if (comment.author !== ACTIONS_BOT) return false;
+    const match = CALL.exec(comment.body);
+    if (match === null) return false;
+    try {
+      const value = record(JSON.parse(match[1] as string));
+      return value.v === 1 && value.event === event;
+    } catch {
+      return false;
+    }
+  });
+
+/**
+ * The call's comment: it mentions the owner (a bot's mention notifies him,
+ * where an agent's, posted as him, would not), quotes the ask's line with no
+ * mention of its own, links the ask, and says how to release the hold.
+ */
+export const callBody = (input: {
+  readonly owner: string;
+  readonly ref: string;
+  readonly hold: HoldConfig;
+  readonly ask: { readonly line: string; readonly url: string | undefined };
+  readonly event: number;
+  /** The pull request's head, for a call on one: the line that releases it names it. */
+  readonly head?: string;
+}): string =>
+  [
+    `@${input.owner}, an agent needs you on ${input.ref}: ${input.ask.line.replace(/@(?=[A-Za-z0-9])/g, "@\u200b")}`,
+    "",
+    input.ask.url === undefined ? "No agent posted an ask in the 15 minutes before the label went on; read the thread." : `[The ask](${input.ask.url})`,
+    "",
+    input.head === undefined
+      ? `Only you release this hold, once it is answered: on each pull request that closes this issue, comment the line \`${releaseLine("<its head sha>")}\` with its full head sha.`
+      : `Only you release this hold, once it is answered: comment the line \`${releaseLine(input.head)}\`. It releases this head alone, so a later push is held again.`,
+    `Removing \`${input.hold.label}\` releases nothing (GitHub records no App on a removal, so an agent's would read as yours).`,
+    "",
+    callMarker({ v: 1, event: input.event }),
+  ].join("\n");
