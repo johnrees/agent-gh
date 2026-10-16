@@ -228,29 +228,63 @@ export const agentReviewStatus = (combined: Record<string, unknown>, context: st
 /** True when the commit's combined status has a successful agent-review status. */
 export const reviewed = (combined: Record<string, unknown>): boolean => agentReviewStatus(combined)?.state === "success";
 
-/** What a review's status depends on: its verdict, and its findings' priorities (undefined in a marker from before they were recorded). */
-export type Outcome = { readonly verdict: Review["verdict"]; readonly priorities?: readonly Priority[] | undefined };
+/**
+ * What a review's status depends on: its verdict, its findings' priorities
+ * (undefined in a marker from before they were recorded), and its checks'
+ * result.
+ */
+export type Outcome = { readonly verdict: Review["verdict"]; readonly priorities?: readonly Priority[] | undefined; readonly checks: ChecksResult["state"] };
+
+/** What judges an outcome: the config's `block_on`, and the checks it names, if any. */
+export type ReviewPolicy = Pick<ReviewConfig, "blockOn" | "checks">;
 
 /** How many of the priorities are at `threshold` or above. */
 const atOrAbove = (priorities: readonly Priority[], threshold: Priority): number =>
   priorities.filter((priority) => PRIORITIES.indexOf(priority) <= PRIORITIES.indexOf(threshold)).length;
 
+/** Whether `block_on` blocks the verdict and priorities alone. */
+const verdictBlocks = (outcome: Outcome, blockOn: BlockOn): boolean =>
+  blockOn === "changes_requested" ? outcome.verdict === blockOn : outcome.priorities === undefined || atOrAbove(outcome.priorities, blockOn) > 0;
+
+/**
+ * Why a review's checks keep it from passing, or undefined when they do not:
+ * they passed, or the config names none and none ran. Checks the config names
+ * that did not run verified nothing; a marker records only the state, so the
+ * config judging it says whether any were named. A failure or a timeout is
+ * never excused, even once the config names no checks.
+ */
+export const checksBlock = (checks: ChecksResult["state"], configured: boolean): "failed" | "unverified" | undefined =>
+  checks === "passed" || (checks === "not run" && !configured) ? undefined : checks === "failed" ? "failed" : "unverified";
+
 /**
  * The agent-review status a review sets. `changes_requested` fails on that
  * verdict. A priority fails on any finding at it or above, whatever the
- * verdict, and fails a review that records no priorities, which it cannot judge.
+ * verdict, and fails a review that records no priorities, which it cannot
+ * judge. Either way, checks that did not pass (`checksBlock`) fail it: it
+ * reads as reviewed and checked, so an approval whose checks failed, timed
+ * out, or never ran is not enough.
  */
-export const reviewState = (outcome: Outcome, blockOn: BlockOn): "success" | "failure" => {
-  if (blockOn === "changes_requested") return outcome.verdict === blockOn ? "failure" : "success";
-  return outcome.priorities === undefined || atOrAbove(outcome.priorities, blockOn) > 0 ? "failure" : "success";
-};
+export const reviewState = (outcome: Outcome, policy: ReviewPolicy): "success" | "failure" =>
+  verdictBlocks(outcome, policy.blockOn) || checksBlock(outcome.checks, policy.checks.length > 0) !== undefined ? "failure" : "success";
 
-/** The start of the status description: the verdict, and, under a priority threshold, what decided the status. */
-export const outcomeSummary = (outcome: Outcome, blockOn: BlockOn): string => {
+/**
+ * The start of the status description: the verdict, under a priority
+ * threshold what decided it, and `checks`, the checks' phrase. When only the
+ * checks fail a review, it says so: "but", led by "checks unverified" for
+ * checks that timed out or did not run.
+ */
+export const outcomeSummary = (outcome: Outcome, policy: ReviewPolicy, checks: string): string => {
+  const { blockOn } = policy;
   const verdict = outcome.verdict === "approve" ? "approved" : "changes requested";
-  if (blockOn === "changes_requested") return verdict;
-  if (outcome.priorities === undefined) return `${verdict}; the review records no finding priorities, which block_on ${blockOn} needs: review again`;
-  return `${verdict}; ${atOrAbove(outcome.priorities, blockOn)} finding(s) at ${blockOn} or above`;
+  const judged =
+    blockOn === "changes_requested"
+      ? verdict
+      : outcome.priorities === undefined
+        ? `${verdict}; the review records no finding priorities, which block_on ${blockOn} needs: review again`
+        : `${verdict}; ${atOrAbove(outcome.priorities, blockOn)} finding(s) at ${blockOn} or above`;
+  const blocked = checksBlock(outcome.checks, policy.checks.length > 0);
+  if (blocked === undefined || verdictBlocks(outcome, blockOn)) return `${judged}; ${checks}`;
+  return `${blocked === "unverified" ? "checks unverified: " : ""}${judged}, but ${checks}`;
 };
 
 /** A pull request a gh command names: a number, maybe with the repository of its URL, or a branch (the current one when undefined). */

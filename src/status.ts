@@ -1,5 +1,5 @@
 import type { AgentApp } from "./config.ts";
-import { type BlockOn, outcomeSummary, parseMarker, type ReviewMarker, reviewState, STATUS_CONTEXT, statusDescription } from "./review.ts";
+import { outcomeSummary, parseMarker, type ReviewMarker, type ReviewPolicy, reviewState, STATUS_CONTEXT, statusDescription } from "./review.ts";
 
 /**
  * The agent-review workflow's pure decisions: which pull requests an event
@@ -95,21 +95,22 @@ export const agentPull = (
   return pull.commits === undefined || pull.commits.some((message) => agentCommit(message, apps));
 };
 
-/** Whether a marker's review passes `block_on`. */
-export const passes = (found: FoundMarker, blockOn: BlockOn): boolean => reviewState(found.marker, blockOn) === "success";
+/** Whether a marker's review passes `block_on` and its checks. */
+export const passes = (found: FoundMarker, policy: ReviewPolicy): boolean => reviewState(found.marker, policy) === "success";
 
 /**
  * The marker a head with no review of its own may carry forward: the latest
  * for the same patch (`git patch-id --stable` of its diff from its merge
- * base), when that one passes `block_on`. A later blocking review of the
- * same patch is never skipped for an earlier pass. The caller still checks
- * that the base's changes since the marker's merge base touch none of the
- * patch's files.
+ * base), when that one passes `block_on` and its checks. A later blocking
+ * review of the same patch, one whose checks did not pass among them, is
+ * never skipped for an earlier pass, so carrying never upgrades a result.
+ * The caller still checks that the base's changes since the marker's merge
+ * base touch none of the patch's files.
  */
-export const carryCandidate = (markers: readonly FoundMarker[], patchId: string | null, blockOn: BlockOn): FoundMarker | undefined => {
+export const carryCandidate = (markers: readonly FoundMarker[], patchId: string | null, policy: ReviewPolicy): FoundMarker | undefined => {
   if (patchId === null) return undefined;
   const latest = markers.findLast((found) => found.marker.patch_id === patchId);
-  return latest !== undefined && passes(latest, blockOn) ? latest : undefined;
+  return latest !== undefined && passes(latest, policy) ? latest : undefined;
 };
 
 /** The latest marker for `head`, which decides its status. */
@@ -125,8 +126,8 @@ const status = (state: Status["state"], description: string, targetUrl?: string)
 /**
  * agent-review for pull request `number`'s head: success for a pull request
  * that is not an agent's, or that a person waived; else the head's own
- * marker, which `block_on` judges; else a passing review carried forward;
- * else pending, naming the command that reviews it.
+ * marker, which `block_on` and its checks judge; else a passing review
+ * carried forward; else pending, naming the command that reviews it.
  */
 export const reviewStatus = (input: {
   readonly number: number;
@@ -134,17 +135,17 @@ export const reviewStatus = (input: {
   readonly waivedBy: string | undefined;
   readonly current: FoundMarker | undefined;
   readonly carried: FoundMarker | undefined;
-  readonly blockOn: BlockOn;
+  readonly policy: ReviewPolicy;
 }): Status => {
   if (!input.agent) return status("success", "not an agent PR");
   if (input.waivedBy !== undefined) return status("success", `waived by ${input.waivedBy}`);
   if (input.current !== undefined) {
     const { marker } = input.current;
-    return status(reviewState(marker, input.blockOn), `${outcomeSummary(marker, input.blockOn)}; checks ${marker.checks} (${marker.reviewer} review)`, input.current.url);
+    return status(reviewState(marker, input.policy), `${outcomeSummary(marker, input.policy, `checks ${marker.checks}`)} (${marker.reviewer} review)`, input.current.url);
   }
   if (input.carried !== undefined) {
     const { marker } = input.carried;
-    const passed = input.blockOn === "changes_requested" ? "approved" : "passed";
+    const passed = input.policy.blockOn === "changes_requested" ? "approved" : "passed";
     return status("success", `${passed} at ${marker.head.slice(0, 8)}, carried forward: same patch, base changes miss its files; checks ${marker.checks}`, input.carried.url);
   }
   return status("pending", `needs a review: run \`gh pr checkout ${input.number} && agent-gh review full --pr ${input.number}\``);
