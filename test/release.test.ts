@@ -254,8 +254,9 @@ test("an agent's gh release write needs John's grant for its tag, and a new tag 
     "gh release edit v1.2.3 --draft=false",
     "gh release delete-asset v1.2.3 a.zip -y",
   ]);
-  // Moving a release to another tag needs that tag's grant too.
+  // Moving a release to another tag needs a grant for each.
   expect(await refusal(run(["release", "edit", "v1.2.3", "--tag", "v1.2.4"], tagged()))).toBe(ungranted("v1.2.4"));
+  expect(await refusal(run(["release", "edit", "v1.2.3", "--tag", "v1.2.4"], world({ grants: [{ tag: "v1.2.4" }], tags: { "v1.2.3": { type: "commit", sha: COMMIT } } })))).toBe(ungranted("v1.2.3"));
 });
 
 test("gh release delete is refused even with a grant; reads pass, and an unknown subcommand or an unreadable tag or repository is refused", async () => {
@@ -311,6 +312,8 @@ test("an agent's gh api tag ref or release write needs John's grant; moving or d
   await run(["api", "-X", "PATCH", "repos/johnrees/widget/releases/5", "-f", "body=Notes"], tagged());
   await run(["api", "-X", "DELETE", "repos/johnrees/widget/releases/5"], tagged());
   expect(await refusal(run(["api", "-X", "PATCH", "repos/johnrees/widget/releases/5", "-f", "tag_name=v1.2.4"], tagged()))).toBe(ungranted("v1.2.4"));
+  const renamed = world({ grants: [{ tag: "v1.2.4" }], tags: { "v1.2.3": { type: "commit", sha: COMMIT } }, releases: { 5: { tag_name: "v1.2.3", target_commitish: "main" } } });
+  expect(await refusal(run(["api", "-X", "PATCH", "repos/johnrees/widget/releases/5", "-f", "tag_name=v1.2.4", "-f", `target_commitish=${COMMIT}`], renamed))).toBe(ungranted("v1.2.3"));
   expect(await refusal(run(["api", "-X", "DELETE", "repos/johnrees/widget/releases/5"], world({ releases: { 5: { tag_name: "v1.2.3", target_commitish: "main" } } })))).toBe(ungranted("v1.2.3"));
   expect(await refusal(run(["api", "-X", "PATCH", "repos/johnrees/widget/releases/6", "-f", "body=x"], tagged()))).toContain("cannot find release 6 in johnrees/widget");
   // An asset upload goes to uploads.github.com, for the release's tag.

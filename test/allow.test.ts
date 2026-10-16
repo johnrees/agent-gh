@@ -13,7 +13,7 @@ const MAIN = join(import.meta.dir, "..", "src", "main.ts");
  * and issues: logged in as `login` (logged out when null), and opening
  * issues as GitHub records them, through `app` when one is given.
  */
-const personGh = ({ login = "johnrees" as string | null, label = false, app = null as unknown } = {}) => {
+const personGh = ({ login = "johnrees" as string | null, label = false, app = null as unknown, canLabel = true } = {}) => {
   const calls: string[][] = [];
   const issues: Record<string, unknown>[] = [];
   const labels: string[] = label ? ["agent-release"] : [];
@@ -34,6 +34,7 @@ const personGh = ({ login = "johnrees" as string | null, label = false, app = nu
     if (path === "repos/johnrees/widget") return { code: 0, stdout: "johnrees\n" };
     if (path === "repos/johnrees/widget/labels/agent-release") return { code: labels.includes("agent-release") ? 0 : 1, stdout: "" };
     if (path === "repos/johnrees/widget/labels") {
+      if (!canLabel) return { code: 1, stdout: "" };
       labels.push(fields(args).name as string);
       return { code: 0, stdout: "" };
     }
@@ -105,6 +106,18 @@ test("an issue GitHub records as opened through an App grants nothing, and allow
   expect(printed[0]).toBe(
     "agent-gh: #52 was opened through the johnrees-claude App, as an agent's would be, and grants nothing (close it), so open the grant yourself on GitHub, signed in as johnrees:",
   );
+});
+
+test("allow release stops before opening a grant the guard could not find, when the label cannot be made", async () => {
+  const person = personGh({ canLabel: false });
+  let detail = "";
+  try {
+    await allowRelease(allowIo(person.gh).io, HERE, "v1.2.3", null);
+  } catch (error) {
+    detail = (error as { detail?: string }).detail ?? String(error);
+  }
+  expect(detail).toBe("gh could not create the `agent-release` label in johnrees/widget, which the guard finds grants by");
+  expect(person.issues).toEqual([]);
 });
 
 test("allow release takes one valid tag, a full sha with --at, and -R in gh's spellings", () => {
