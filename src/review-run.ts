@@ -1029,9 +1029,11 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const before = actions ? await headStatus(io, head) : undefined;
   await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined }, outside));
   // A waiver John added while the review ran stands: the labels are read afresh, and the verdict never overwrites it.
-  const waived = actions ? undefined : await recordWaiver(await pull(io, stage, number));
-  if (actions) await awaitWorkflowStatus(io, head, before);
-  else if (waived === undefined) {
+  let waived: string | undefined;
+  if (actions) {
+    await awaitWorkflowStatus(io, head, before);
+    waived = await waiver(io, stage, await pull(io, stage, number), config);
+  } else if ((waived = await recordWaiver(await pull(io, stage, number))) === undefined) {
     await setStatus(io, head, reviewState(marker, config), `${outcomeSummary(marker, config, checksSummary(checks))}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
   }
   if (waived === undefined && checksBlock(checks.state, config.checks.length > 0) !== undefined) {

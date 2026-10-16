@@ -807,6 +807,19 @@ test("where the workflow writes the status, a full review posts its review and m
   expect(waived.printed).toContain("agent-gh: the review of #12 was waived by johnrees; the agent-review workflow records it");
 });
 
+test("where the workflow writes the status, checks that timed out are reported unless John waived the review meanwhile", async () => {
+  const config = { ...EXAMPLE, status_writer: "actions" };
+  const timedOut = { checkResults: [{ code: 137, output: "", timedOut: true }], answer: { verdict: "approve", spec: "Fine.", findings: [] } };
+  const hint = "so agent-review fails whatever the verdict";
+  const plain = world({ config, ...timedOut });
+  await reviewFull(plain.io, {});
+  expect(plain.printed.some((line) => line.includes(hint))).toBe(true);
+  const waived = world({ config, ...timedOut, labelsLater: ["review-waived"], events: [labeled("johnrees", null)] });
+  await reviewFull(waived.io, {});
+  expect(waived.commands).toHaveLength(1);
+  expect(waived.printed.some((line) => line.includes(hint))).toBe(false);
+});
+
 test("a waiver John adds while the review runs is never overwritten by the verdict", async () => {
   const w = world({ labelsLater: ["review-waived"], events: [labeled("johnrees", null)], answer: { verdict: "changes_requested", spec: "No.", findings: [] } });
   await reviewFull(w.io, {});
