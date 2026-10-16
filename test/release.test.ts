@@ -353,6 +353,11 @@ test("gh api endpoints the release guard cannot read are refused, and approving 
     // So must an encoded GraphQL endpoint (review finding 4125f56f31c9), whatever its mutation moves or merges.
     [["api", "gr%61phql", "-f", 'query=mutation { deleteRef(input: {refId: "REF_TAG"}) { clientMutationId } }'], "cannot read `gh api POST gr%61phql`: spell the GraphQL endpoint plainly, as `gh api graphql`"],
     [["api", "https://api.github.com/GRAPHQL%2F", "-f", 'query=mutation { mergePullRequest(input: {pullRequestId: "PR_1"}) { clientMutationId } }'], "spell the GraphQL endpoint plainly"],
+    // gh sends a GraphQL endpoint spelled other than `graphql` as REST, so `variables[id]` would be the $id GitHub reads (review finding db612a5f083a).
+    ...["https://api.github.com/graphql", "/graphql", "GRAPHQL", "graphql/"].map((endpoint): [string[], string] => [
+      ["api", endpoint, "-f", "query=mutation($id: ID!) { deleteRef(input: {refId: $id}) { clientMutationId } }", "-f", "id=REF_BRANCH", "-f", "variables[id]=REF_TAG"],
+      `cannot read \`gh api POST ${endpoint}\`: spell the GraphQL endpoint plainly, as \`gh api graphql\``,
+    ]),
     // A spelling of api.github.com gh would still send John's token to is read as no path.
     [["api", "https://api.github.com:443/repos/johnrees/widget/git/refs", "-f", "ref=refs/tags/v1.2.3", "-f", `sha=${COMMIT}`], "cannot tell what `gh api POST https://api.github.com:443/"],
   ] as [string[], string][]) {

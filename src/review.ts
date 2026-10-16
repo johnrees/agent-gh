@@ -455,8 +455,9 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
   // gh sends any endpoint holding `://` to that URL as it is.
   if (relative.includes("://")) return absoluteWrite(call, relative);
   const path = relative.replace(/^\/+/, "").split(/[?#]/)[0] as string;
-  if (/^graphql\/?$/i.test(path)) return { kind: "graphql" };
-  // GitHub decodes the path, so `gr%61phql` is GraphQL too; gh sends it as REST, whose body the guard does not read as GitHub would.
+  // gh reads fields as GraphQL variables only for exactly `graphql`. Any other spelling GitHub runs as GraphQL (a URL,
+  // `/graphql`, `GRAPHQL`, `gr%61phql`) gh sends as REST, its fields as the body itself, which the guard does not read.
+  if (call.endpoint === "graphql") return { kind: "graphql" };
   if (/^graphql\/*$/i.test(decodedOrRaw(path))) {
     return { kind: "refuse", reason: `cannot read \`gh api ${call.method} ${call.endpoint}\`: spell the GraphQL endpoint plainly, as \`gh api graphql\`` };
   }
