@@ -209,10 +209,12 @@ export const releaseLine = (head: string): string => `agent-hold release ${head}
  * The person's release of `head`: the owner's own comment (no App acted for
  * him) holding the line `agent-hold release <head>`, never edited, since an
  * agent, acting as him, could edit it (GitHub records no App on an edit). It
- * names one exact head, so any push holds the pull request again.
+ * names one exact head, so any push holds the pull request again. The newest
+ * counts (comments come oldest first), so a release after the label went on
+ * again is not hidden by an earlier one.
  */
 export const headRelease = (comments: readonly PostedBy[], owner: string, head: string): PostedBy | undefined =>
-  comments.find((comment) => comment.author.toLowerCase() === owner.toLowerCase() && comment.appId === undefined && comment.edited !== true && RELEASE.exec(comment.body)?.[1] === head);
+  comments.findLast((comment) => comment.author.toLowerCase() === owner.toLowerCase() && comment.appId === undefined && comment.edited !== true && RELEASE.exec(comment.body)?.[1] === head);
 
 /** A thread the hold's label can hold a pull request from: the pull request itself (first), or an issue it closes. */
 export type HoldThread = {

@@ -675,7 +675,13 @@ test("only the owner's own comment, never edited, with the line naming this exac
   ]) {
     expect(description({ files, comments: [refused] })).toBe("failure: held: touches `schema/**` (schema/a.json); John releases aaaaaaaa");
   }
-  expect(headRelease([releasing(A, { edited: true }), releasing(A, { id: 601 })], "johnrees", A)?.id).toBe(601);
+  expect(headRelease([releasing(A, { id: 601 }), releasing(A, { edited: true })], "johnrees", A)?.id).toBe(601);
+  // The newest release counts: John releases, the label goes on again, and John releases this head again.
+  const first = labelEvent(1, "labeled", "needs-human", CLAUDE, minutes(0));
+  const again = labelEvent(2, "labeled", "needs-human", CLAUDE, minutes(20));
+  const twice = [releasing(A, { at: minutes(10), id: 601 }), releasing(A, { at: minutes(30), id: 602 })];
+  expect(description({ threads: [thread("#12", ["needs-human"], [first, again], "Again?")], comments: twice })).toBe("success: released by johnrees at aaaaaaaa");
+  expect(headRelease(twice, "johnrees", A)?.id).toBe(602);
 });
 
 test("a reserved path holds a pull request, by its current name or a rename's old one; a person's own pull request is not held by its paths, and Dependabot's is", () => {
