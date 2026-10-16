@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { installBinary } from "../scripts/install-binary.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,10 +41,16 @@ test("install-local leaves an identical installed build alone, and installs a ch
   expect(installBinary(built, target)).toBe(true);
   expect(statSync(target).mode & 0o777).toBe(0o755);
   expect(readdirSync(join(dir, "bin"))).toEqual(["agent-gh"]);
-  // A copy that fails leaves the installed one as it was, and no temporary file.
+  // A copy interrupted after writing half leaves the installed one as it was, and no temporary file; a rerun completes.
   const before = readFileSync(target);
-  rmSync(built);
-  expect(() => installBinary(built, target)).toThrow();
+  writeFileSync(built, "build 3");
+  const interrupted = (from: string, to: string) => {
+    writeFileSync(to, readFileSync(from).subarray(0, 3));
+    throw new Error("interrupted");
+  };
+  expect(() => installBinary(built, target, interrupted)).toThrow("interrupted");
   expect(readFileSync(target)).toEqual(before);
   expect(readdirSync(join(dir, "bin"))).toEqual(["agent-gh"]);
+  expect(installBinary(built, target)).toBe(true);
+  expect(readFileSync(target, "utf8")).toBe("build 3");
 });
