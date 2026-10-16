@@ -101,9 +101,11 @@ test("session-env writes a PATH block that puts the shim first when sourced, and
   const sourced = Bun.spawnSync(["sh", "-c", `PATH=/first:/usr/bin:${shims}; . '${envFile}'; echo "$PATH"`], { stdout: "pipe" });
   expect(sourced.stdout.toString().trim()).toBe(`${shims}:${join(dir, ".local", "bin")}:/first:/usr/bin`);
 
-  // SessionStart again (a resume, a compaction) adds nothing while the block is last.
+  // SessionStart again (a resume, a compaction) adds nothing while the block is last, and says so.
   const once = readFileSync(envFile, "utf8");
-  expect(run().exitCode).toBe(0);
+  const rerun = run();
+  expect(rerun.exitCode).toBe(0);
+  expect(rerun.stderr.toString()).toContain("already ends with the PATH block; nothing changed");
   expect(readFileSync(envFile, "utf8")).toBe(once);
   // Another hook's PATH after it is kept, and the shim is put back first.
   appendFileSync(envFile, "export PATH=/opt/homebrew/bin:$PATH\n");

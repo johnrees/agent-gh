@@ -390,6 +390,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
         // write the same file, so it is appended to, never rewritten.
         const block = `${rcBlock(defaultShimDir(), defaultBinDir())}\n`;
         if (!existsSync(file) || !readFileSync(file, "utf8").endsWith(block)) appendFileSync(file, block);
+        else console.error(`agent-gh session-env: ${file} already ends with the PATH block; nothing changed`);
       } catch (error) {
         console.error(`agent-gh session-env: could not write ${file}: ${error instanceof Error ? error.message : String(error)}`);
       }
