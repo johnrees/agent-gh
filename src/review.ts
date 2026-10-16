@@ -461,16 +461,21 @@ export const apiMerge = (call: ApiCall): ApiMerge => {
   const segments = path.split("/");
   // A dot segment can move the request to another endpoint than it names.
   if (segments.some((segment) => segment === "." || segment === "..")) return unreadable;
-  // The operation is what follows the repository (`repos/{owner}/{repo}` or `repositories/{id}`); its names are not.
-  const skip = /^repos$/i.test(segments[0] ?? "") ? 3 : /^repositories$/i.test(segments[0] ?? "") ? 2 : 0;
-  let names: string[];
+  let parts: string[];
   try {
-    // An encoded separator (`heads%2Fmain`) names the same path to GitHub as a plain one.
-    names = segments.slice(skip).flatMap((segment) => decodeURIComponent(segment).split("/"));
+    // An encoded character (`heads%2Fmain`, `r%65pos`) names the same path to GitHub as a plain one, so the path is read decoded.
+    parts = segments.flatMap((segment) => decodeURIComponent(segment).split("/"));
   } catch {
     return unreadable;
   }
-  if (names.some((name) => name === "." || name === "..")) return unreadable;
+  if (parts.some((name) => name === "." || name === "..")) return unreadable;
+  // The operation is what follows the repository (`repos/{owner}/{repo}` or `repositories/{id}`); its names are not.
+  const skip = /^repos$/i.test(parts[0] ?? "") ? 3 : /^repositories$/i.test(parts[0] ?? "") ? 2 : 0;
+  // The repository is read from the path as written, so it must be written plainly.
+  if (segments.slice(0, skip).join("/") !== parts.slice(0, skip).join("/")) {
+    return { kind: "refuse", reason: `cannot read which repository \`gh api ${call.method} ${call.endpoint}\` writes to: spell its prefix plainly, as repos/OWNER/REPO/` };
+  }
+  const names = parts.slice(skip);
   const operation = names.map((name) => name.toLowerCase());
   if (operation.includes("pending_deployments") || operation.includes("deployment_protection_rule")) return { kind: "refuse", reason: DEPLOYMENTS, release: true };
   const refWrite = refPlan(path, skip, names, operation, call.method) ?? releasePlan(path, skip, operation, call.method);

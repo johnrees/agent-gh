@@ -346,6 +346,10 @@ test("gh api endpoints the release guard cannot read are refused, and approving 
     [["api", "-X", "POST", "repos/johnrees/widget/releases/latest"], "cannot tell which release"],
     [["api", "-X", "POST", "repositories/1/releases", "-f", "tag_name=v1.2.3"], "cannot tell which repository `gh api repositories/1/releases` writes to"],
     [["api", "https://uploads.github.com/repos/johnrees/widget/issues", "-f", "title=x"], "cannot tell what `gh api POST https://uploads.github.com/repos/johnrees/widget/issues` writes"],
+    // GitHub decodes the path, so an encoded repository prefix must not hide a release or ref write (review finding 54729a508c23).
+    [["api", "r%65pos/johnrees/widget/releases", "-f", "tag_name=v1.2.3"], "cannot read which repository `gh api POST r%65pos/johnrees/widget/releases` writes to"],
+    [["api", "-X", "DELETE", "repos%2Fjohnrees%2Fwidget/git/refs/tags/v1.2.3"], "cannot read which repository"],
+    [["api", "-X", "PATCH", "r%65pos/johnrees/widget/git/refs/heads/main", "-f", `sha=${COMMIT}`], "cannot read which repository"],
     // A spelling of api.github.com gh would still send John's token to is read as no path.
     [["api", "https://api.github.com:443/repos/johnrees/widget/git/refs", "-f", "ref=refs/tags/v1.2.3", "-f", `sha=${COMMIT}`], "cannot tell what `gh api POST https://api.github.com:443/"],
   ] as [string[], string][]) {
