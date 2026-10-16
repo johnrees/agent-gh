@@ -370,6 +370,10 @@ test("a skipped issue still blocks its dependents and counts in unblocks; it is 
   expect(result.waves[0]?.map((item) => [item.issue, item.state])).toEqual([[1, "skipped"], [3, "workable"]]);
   expect(result.waves[0]?.[0]).toMatchObject({ unblocks: 1, skipped_by: skipped, labels: ["needs-human", "ready"] });
   expect(result.waves[1]?.[0]).toMatchObject({ issue: 2, state: "waiting", waiting_on: ["#1"], skipped_by: null });
+  // A filtered issue behind a blocker is skipped too, in its own wave, still waiting on the blocker.
+  const later = graph([node(1), node(2, [blocker(1)], { skipped })]);
+  expect(later.waves[1]?.[0]).toMatchObject({ issue: 2, state: "skipped", skipped_by: skipped, waiting_on: ["#1"] });
+  expect(frontier(later).map((item) => item.issue)).toEqual([1]);
   expect(result.waves[0]?.[1]).toMatchObject({ skipped_by: null, labels: ["a", "b"] });
   expect(frontier(result).map((item) => item.issue)).toEqual([3]);
 });
@@ -456,4 +460,20 @@ test("claim --next filters again on the retry after a lost race", async () => {
   expect(printed.filter((line) => line.startsWith("agent-gh: claiming"))).toEqual(["agent-gh: claiming #7 T7", "agent-gh: claiming #9 T9"]);
   expect(comments[8]).toEqual([]);
   expect(printed.at(-1)).toContain("claimed #9 with a comment");
+});
+
+test("next --waves --json shows a filtered issue behind a blocker as skipped, with its reason and what it waits on", async () => {
+  const { read } = reader({
+    ...BASE,
+    "repos/johnrees/widget/issues?state=open&labels=ready": [issue(1), issue(2, ["ready", "needs-human"])],
+    "repos/johnrees/widget/issues/2/dependencies/blocked_by": [issue(1, [])],
+    "repos/johnrees/widget/issues/1/comments": [],
+    "repos/johnrees/widget/issues/2/comments": [],
+  });
+  const result = await nextIssues(REPO, read, { skip: ["needs-human"], require: [], fit: [] });
+  expect(wavesJson(REPO, result).waves[1]).toEqual({
+    wave: 2,
+    issues: [expect.objectContaining({ issue: 2, state: "skipped", waiting_on: ["#1"], skipped_by: { rule: "--skip-label", pattern: "needs-human", label: "needs-human" } })],
+  });
+  expect(frontier(result).map((item) => item.issue)).toEqual([1]);
 });

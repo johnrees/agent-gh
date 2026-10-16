@@ -231,8 +231,9 @@ export const waves = (input: GraphInput): Waves => {
   const entry = (number: number, layer: number | undefined): WaveIssue => {
     const node = nodes.get(number) as Node;
     const waitingOn = node.blockers.filter((blocker) => blocker.open).map(ref);
+    // A filtered issue is skipped in whatever wave it lands; waiting_on still says what it waits on.
     const state: IssueState =
-      layer !== 1 ? "waiting" : !node.dispatched ? "not_dispatched" : node.skipped !== undefined ? "skipped" : node.claim !== undefined ? "in_progress" : "workable";
+      node.skipped !== undefined ? "skipped" : layer !== 1 ? "waiting" : !node.dispatched ? "not_dispatched" : node.claim !== undefined ? "in_progress" : "workable";
     const claim = node.claim === undefined ? null : { kind: node.claim.kind, pr: node.claim.pr, url: node.claim.url, family: node.claim.family, session: node.claim.session };
     return { issue: number, title: node.title, state, queued: queued(number), waiting_on: waitingOn, unblocks: unblocks(number), priority: node.priority?.label ?? null, labels: [...node.labels].sort(), skipped_by: state === "skipped" ? (node.skipped ?? null) : null, claim };
   };
