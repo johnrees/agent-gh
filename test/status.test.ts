@@ -15,8 +15,10 @@ import {
   eventTarget,
   firstLine,
   type FoundMarker,
+  holdLink,
   holdNeeds,
   holdStatus,
+  releaseRunMatches,
   type HoldThread,
   labelEvents,
   NO_ASK,
@@ -747,6 +749,25 @@ test("the ask is the newest agent comment in the 15 minutes before the label, it
   expect(body.endsWith(callMarker({ v: 1, event: 900 }))).toBe(true);
 });
 
+test("a labeled run is the release's own only when the latest addition of the release label by its event's time is that release", () => {
+  const events = labelEvents([
+    labelEvent(1, "labeled", "human-approved", CLAUDE, minutes(-5)),
+    labelEvent(2, "unlabeled", "human-approved", null, minutes(-4)),
+    labelEvent(3, "labeled", "human-approved", null, minutes(0)),
+  ]);
+  const release = events[2] as (typeof events)[number];
+  expect(releaseRunMatches(events, "human-approved", release, minutes(0))).toBe(true);
+  expect(releaseRunMatches(events, "Human-Approved", release, minutes(1))).toBe(true);
+  // The agent's earlier addition's run, however late it runs, is not the release's.
+  expect(releaseRunMatches(events, "human-approved", release, minutes(-5))).toBe(false);
+  expect(releaseRunMatches(events, "human-approved", release, minutes(-10))).toBe(false);
+  // The link names the pull request and the hold it was judged by.
+  const hold = { label: "needs-human", releaseLabel: "human-approved", paths: ["schema/**"] };
+  expect(holdLink("johnrees/widget", 12, hold)).toMatch(/^https:\/\/github\.com\/johnrees\/widget\/pull\/12#agent-hold-[0-9a-f]{12}$/);
+  expect(holdLink("johnrees/widget", 12, { ...hold, paths: ["schema/**", ".github/**"] })).not.toBe(holdLink("johnrees/widget", 12, hold));
+  expect(holdLink("johnrees/widget", 13, hold)).not.toBe(holdLink("johnrees/widget", 12, hold));
+});
+
 test("a person, and no App or bot, is who labelEvents says added a label, and no removal is a person's", () => {
   const events = labelEvents([
     labelEvent(1, "labeled", "x", null, LABELED),
@@ -803,7 +824,9 @@ test("against real git, a person's release binds to the head its event gave, sur
     return statusWorld({ head, mergeBase, remote, hold: { paths: ["a.txt"] }, labels: ["human-approved"], events: [release], files: [{ filename: "a.txt" }], ...extra });
   };
   const hold = async (w: ReturnType<typeof statusWorld>) => (await deriveStatuses(w.io, 12))?.statuses[2];
-  const releasedAt = (head: string) => ({ name: "pull_request_target", payload: { action: "labeled", label: { name: "human-approved" }, pull_request: { number: 12, head: { sha: head } } } });
+  // As GitHub sends it: the head then, and the pull request's updated_at, the label's own time.
+  const releasedAt = (head: string, at = LABELED) => ({ name: "pull_request_target", payload: { action: "labeled", label: { name: "human-approved" }, pull_request: { number: 12, head: { sha: head }, updated_at: at } } });
+  const link = holdLink("johnrees/widget", 12, { label: "needs-human", releaseLabel: "human-approved", paths: ["a.txt"] });
   const { patchId } = await pullDiff(repo.io, repo.mb1, repo.head1, ["a.txt"]);
 
   // John releases head1; by the time the release's own run reads the pull request, an agent has pushed head4, another reserved diff.
@@ -817,7 +840,7 @@ test("against real git, a person's release binds to the head its event gave, sur
   const first = world(repo.head1, repo.mb1);
   await statusCommand(first.io, releasedAt(repo.head1), undefined);
   expect(first.commented(12)).toHaveLength(1);
-  expect(first.posted().find((status) => status.context === "agent-hold")).toEqual({ state: "success", context: "agent-hold", description: `released by johnrees at ${repo.head1.slice(0, 8)}`, target_url: "https://github.com/johnrees/widget/pull/12" });
+  expect(first.posted().find((status) => status.context === "agent-hold")).toEqual({ state: "success", context: "agent-hold", description: `released by johnrees at ${repo.head1.slice(0, 8)}`, target_url: link });
   const recorded = first.comments;
 
   // A rebase over base changes to other files, or a new commit to an unreserved file: the reserved diff is the same, so still released.
@@ -835,10 +858,15 @@ test("against real git, a person's release binds to the head its event gave, sur
   // A record anyone else posts counts for nothing; and with the record gone, no run but the release's own binds it, whatever the head.
   expect(await hold(world(head4, repo.mb2, { comments: [forge("johnrees")] }))).toMatchObject({ state: "failure", description: "held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again" });
   expect(await hold(world(repo.head1, repo.mb1))).toMatchObject({ state: "failure", description: "held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again" });
-  // Another label's event is no release's run.
+  // Another label's event is no release's run; nor is an earlier addition's, an agent's say, that runs after the person's release.
   const other = world(repo.head1, repo.mb1);
-  await statusCommand(other.io, { name: "pull_request_target", payload: { action: "labeled", label: { name: "bug" }, pull_request: { number: 12, head: { sha: repo.head1 } } } }, undefined);
+  await statusCommand(other.io, { name: "pull_request_target", payload: { action: "labeled", label: { name: "bug" }, pull_request: { number: 12, head: { sha: repo.head1 }, updated_at: LABELED } } }, undefined);
   expect(other.commented(12)).toEqual([]);
+  const agentFirst = labelEvent(490, "labeled", "human-approved", CLAUDE, minutes(-5));
+  const late = world(head4, repo.mb2, { events: [agentFirst, labelEvent(491, "unlabeled", "human-approved", null, minutes(-4)), release] });
+  await statusCommand(late.io, releasedAt(head4, minutes(-5)), undefined);
+  expect(late.commented(12)).toEqual([]);
+  expect(late.posted().find((status) => status.context === "agent-hold")).toMatchObject({ description: "held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again" });
 }, 30_000);
 
 /** An agent's comment on #12, posted as `owner` through Claude's App. */
@@ -929,7 +957,10 @@ test("a label on a plain issue calls the owner in there and holds every open pul
 
 test("a head another open pull request shares is held: the status on that commit is theirs too", async () => {
   const w = statusWorld({ head: A, mergeBase: B, hold: {}, sharedWith: [13] });
-  expect((await deriveStatuses(w.io, 12))?.statuses[2]).toEqual({ context: "agent-hold", state: "failure", description: "held: aaaaaaaa is also the head of #13, so neither is judged alone", targetUrl: "https://github.com/johnrees/widget/pull/12" });
+  expect((await deriveStatuses(w.io, 12))?.statuses[2]).toEqual({
+    context: "agent-hold", state: "failure", description: "held: aaaaaaaa is also the head of #13, so neither is judged alone",
+    targetUrl: holdLink("johnrees/widget", 12, { label: "needs-human", releaseLabel: "human-approved", paths: [] }),
+  });
   expect((await deriveStatuses(statusWorld({ head: A, mergeBase: B, hold: {} }).io, 12))?.statuses[2]).toMatchObject({ state: "success", description: "not held" });
 });
 

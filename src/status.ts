@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { AgentApp } from "./config.ts";
 import { type HoldConfig, inert, outcomeSummary, parseMarker, type ReviewMarker, type ReviewPolicy, reviewState, sameLabel, STATUS_CONTEXT, statusDescription } from "./review.ts";
 import { byAgent, type ThreadComment } from "./threads.ts";
@@ -308,6 +309,25 @@ export const recordFor = (comments: readonly PostedBy[], event: number): Release
 
 /** The longest list GitHub gives of a pull request's files; one with more cannot be checked. */
 export const FILES_LISTED = 3000;
+
+/**
+ * What an agent-hold status links: its pull request, with a fingerprint of
+ * the hold it was judged by. A status on a commit is any pull request's with
+ * that head, and outlives a change to the base branch's hold, so the merge
+ * guard counts only one linking the pull request it merges under the hold
+ * it reads now.
+ */
+export const holdLink = (repo: string, number: number, hold: HoldConfig): string =>
+  `https://github.com/${repo}/pull/${number}#agent-hold-${createHash("sha256").update(JSON.stringify([hold.label.toLowerCase(), hold.releaseLabel.toLowerCase(), hold.paths])).digest("hex").slice(0, 12)}`;
+
+/**
+ * Whether a `labeled` run is the release's own: the latest addition of the
+ * release label at or before the run's event time (`at`, the pull request's
+ * `updated_at` in its payload) is `release`. Another addition's run, an
+ * agent's before the person's say, records nothing.
+ */
+export const releaseRunMatches = (events: readonly LabelEvent[], releaseLabel: string, release: LabelEvent, at: string): boolean =>
+  events.filter((event) => event.event === "labeled" && sameLabel(event.label, releaseLabel) && Date.parse(event.at) <= Date.parse(at)).at(-1)?.id === release.id;
 
 /**
  * The release label's own `labeled` run: the head GitHub gave that event (the

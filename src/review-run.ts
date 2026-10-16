@@ -10,7 +10,7 @@ import { HARNESSES, type Env } from "./harness.ts";
 import { parseRemoteUrl, parseRepo, type Repo, slug } from "./repo.ts";
 import { absent, checkState, type PushedTag, pushedRefs, type RequiredCheck, requiredChecks } from "./merge.ts";
 import { type ApiIo, describeRequired, everyPage, pullThreads, repoOwner } from "./threads-run.ts";
-import { HOLD_CONTEXT, type MarkerPost, validMarkers } from "./status.ts";
+import { HOLD_CONTEXT, holdLink, type MarkerPost, validMarkers } from "./status.ts";
 import {
   agentReviewStatus,
   type ApiCall,
@@ -342,29 +342,31 @@ export const ACTIONS_APP = 15368;
 
 /**
  * Why the hold refuses a merge of `pr`, if it does: where the base branch's
- * config has `hold`, agent-hold must be `success` on the head, set by GitHub
- * Actions for this pull request (its link names it: a status on a commit
- * shared with another pull request is not this one's), whether or not a
- * ruleset requires it. Auto-merge (`auto`) waits only for the checks a
- * ruleset requires, and a hold can come after it is turned on, so it is let
- * through only where a ruleset requires agent-hold from GitHub Actions,
- * whatever agent-hold reads now.
+ * config has `hold`, the latest agent-hold GitHub Actions set on the head
+ * must be this pull request's, judged by the hold the config has now
+ * (`holdLink`): a status on a commit is any pull request's with that head,
+ * and outlives a change to the hold. For a merge it must be `success`,
+ * whether or not a ruleset requires it. Auto-merge (`auto`) waits only for
+ * the checks a ruleset requires, and a hold can come after it is turned on,
+ * so it is let through only where a ruleset requires agent-hold from GitHub
+ * Actions, whatever agent-hold reads now, once this pull request's own is on
+ * the head, so GitHub never waits on another's.
  */
 const holdRefusal = async (io: ReviewIo, pr: Pull, hold: HoldConfig, required: readonly RequiredCheck[], auto: boolean, byApps: () => Promise<Record<string, unknown>[]>): Promise<string | undefined> => {
   const release = `only a person releases a hold: John adds \`${hold.releaseLabel}\` himself`;
-  if (auto) {
-    if (required.some((entry) => entry.context === HOLD_CONTEXT && entry.app === ACTIONS_APP)) return undefined;
+  if (auto && !required.some((entry) => entry.context === HOLD_CONTEXT && entry.app === ACTIONS_APP)) {
     return `\`--auto\` cannot wait for ${HOLD_CONTEXT} on pull request #${pr.number}: ${pr.base}'s rules do not require ${HOLD_CONTEXT} from GitHub Actions, so a hold that comes later would not stop the merge; merge once ${HOLD_CONTEXT} passes, or ask John to require it`;
   }
   const shown = (await byApps()).find((status) => status.context === HOLD_CONTEXT && status.app_id === ACTIONS_APP);
-  const own = `https://github.com/${slug(io.repo)}/pull/${pr.number}`.toLowerCase() === text(shown?.target_url).toLowerCase();
-  if (shown?.state === "success" && own) return undefined;
+  const own = holdLink(slug(io.repo), pr.number, hold).toLowerCase() === text(shown?.target_url).toLowerCase();
   const why =
     shown === undefined
       ? `no ${HOLD_CONTEXT} status from GitHub Actions`
       : !own
-        ? `the latest ${HOLD_CONTEXT} on it is another pull request's (${text(shown.target_url) || "no link"})`
+        ? `the latest ${HOLD_CONTEXT} on it was not judged for this pull request under ${pr.base}'s hold now (${text(shown.target_url) || "no link"}); the agent-review workflow sets it on the next event`
         : `${HOLD_CONTEXT} ${shown.state === "failure" || shown.state === "error" ? "failed" : text(shown.state)}: ${text(shown.description)}`;
+  if (auto) return own ? undefined : `\`--auto\` would wait on another pull request's ${HOLD_CONTEXT} on #${pr.number}'s head ${pr.head.slice(0, 8)} (${why})`;
+  if (shown?.state === "success" && own) return undefined;
   return `pull request #${pr.number}'s head ${pr.head.slice(0, 8)} is not cleared by ${HOLD_CONTEXT} (${why}); ${release}, and an agent merges once ${HOLD_CONTEXT} passes`;
 };
 

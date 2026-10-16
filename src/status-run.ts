@@ -16,8 +16,10 @@ import {
   type FoundMarker,
   HOLD_CONTEXT,
   labelHold,
+  holdLink,
   holdNeeds,
   holdStatus,
+  releaseRunMatches,
   type HoldThread,
   labelEvents,
   markerFor,
@@ -171,10 +173,10 @@ const sharingHead = async (io: ApiIo, number: number, head: string): Promise<num
  * the pull request and every issue it closes, its files, its release
  * records, the open pull requests sharing its head, and, only when a
  * person's release has to be checked, the reserved files' diff, read from
- * git. `releaseHead` is the head the release label's own `labeled` event
- * gave, in that run alone.
+ * git. `labeled` is this run's own `labeled` event, if it has one: when it is
+ * the release's, it binds the release to the head that event gave.
  */
-const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "agent" | "bot" | "person", releaseHead: string | undefined): Promise<{ readonly status: Status; readonly record?: ReleaseRecord }> => {
+const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "agent" | "bot" | "person", labeled: LabeledEvent | undefined): Promise<{ readonly status: Status; readonly record?: ReleaseRecord }> => {
   const threads: (HoldThread & { readonly repo: Repo; readonly number: number })[] = [
     { ref: `#${pr.number}`, repo: io.repo, number: pr.number, labels: pr.labels, events: labelEvents(await issueEvents(io, io.repo, pr.number)) },
   ];
@@ -196,16 +198,19 @@ const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "age
   const files = author === "person" ? [] : await pullFiles(io, pr);
   // A comment edited since it was posted (its updated_at moved; a reaction leaves it) carries no trusted record.
   const comments = prComments.map((comment) => ({ author: comment.author, body: comment.body, edited: comment.updatedAt !== comment.createdAt }));
-  const input = { hold, author, number: pr.number, url: `https://github.com/${slug(io.repo)}/pull/${pr.number}`, threads, files, comments, head: pr.head, sharedWith: await sharingHead(io, pr.number, pr.head) };
+  const input = { hold, author, number: pr.number, url: holdLink(slug(io.repo), pr.number, hold), threads, files, comments, head: pr.head, sharedWith: await sharingHead(io, pr.number, pr.head) };
   const needs = holdNeeds(input);
+  // Only the run of the release's own `labeled` event records it, at the head that event gave.
+  const own = needs !== undefined && labeled !== undefined && releaseRunMatches(threads[0]?.events ?? [], hold.releaseLabel, needs.release, labeled.at);
+  const releaseHead = own ? labeled.head : undefined;
   if (needs === undefined || needs.record === "edited" || (needs.record === undefined && releaseHead === undefined)) return holdStatus(input);
   const pathsPatchId = await reservedPatchId(io, pr, hold.paths, pr.head);
   const releaseRun = needs.record === undefined && releaseHead !== undefined ? { head: releaseHead, pathsPatchId: releaseHead === pr.head ? pathsPatchId : await reservedPatchId(io, pr, hold.paths, releaseHead) } : undefined;
   return holdStatus({ ...input, pathsPatchId, ...(releaseRun === undefined ? {} : { releaseRun }) });
 };
 
-/** A pull request's `labeled` event, which this run handles: the label, and the head GitHub gave the event. */
-export type LabeledEvent = { readonly label: string; readonly head: string };
+/** A pull request's `labeled` event, which this run handles: the label, the head GitHub gave the event, and when (the pull request's `updated_at` then). */
+export type LabeledEvent = { readonly label: string; readonly head: string; readonly at: string };
 
 /** What a run derives for a pull request: the statuses for its head, a release record to write first, and the hold it judged by. */
 export type Derived = { readonly head: string; readonly statuses: readonly Status[]; readonly record?: ReleaseRecord; readonly hold?: HoldConfig };
@@ -234,8 +239,8 @@ export const deriveStatuses = async (io: StatusIo, number: number, labeled?: Lab
     apps,
   );
   // A bot that is no family App (Dependabot) is not an agent, but an agent could merge its pull request: reserved paths hold it.
-  const releaseHead = config.hold !== undefined && labeled !== undefined && sameLabel(labeled.label, config.hold.releaseLabel) ? labeled.head : undefined;
-  const held = config.hold === undefined ? undefined : await deriveHold(io, pr, config.hold, agent ? "agent" : pr.authorType === "Bot" ? "bot" : "person", releaseHead);
+  const own = config.hold !== undefined && labeled !== undefined && sameLabel(labeled.label, config.hold.releaseLabel) ? labeled : undefined;
+  const held = config.hold === undefined ? undefined : await deriveHold(io, pr, config.hold, agent ? "agent" : pr.authorType === "Bot" ? "bot" : "person", own);
   const hold = held === undefined ? {} : { hold: config.hold, ...(held.record === undefined ? {} : { record: held.record }) };
   if (!agent) {
     const skip = (context: string): Status => ({ context, state: "success", description: "not an agent PR", targetUrl: undefined });
@@ -494,7 +499,8 @@ const labeledEvent = (payload: unknown): LabeledEvent | undefined => {
   const event = record(payload);
   const head = text(record(record(event.pull_request).head).sha);
   const label = text(record(event.label).name);
-  return event.action === "labeled" && /^[0-9a-f]{40}$/.test(head) && label !== "" ? { label, head } : undefined;
+  const at = text(record(event.pull_request).updated_at);
+  return event.action === "labeled" && /^[0-9a-f]{40}$/.test(head) && label !== "" && !Number.isNaN(Date.parse(at)) ? { label, head, at } : undefined;
 };
 
 /** The hold on an open pull request's base branch's config. */
