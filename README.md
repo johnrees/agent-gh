@@ -119,7 +119,7 @@ jobs:
     uses: johnrees/agent-gh/.github/workflows/agent-review.yml@v0.8.0
     with:
       version: v0.8.0 # the agent-gh release that sets the statuses
-      # runs-on: ubicloud-standard-2
+      # runs-on: ubicloud-standard-2 # only once this pin is a release that has the input
     # Declaring permissions drops the defaults, so each read is named, though nothing is checked out:
     # contents (the config, compare, fetching commits), pull-requests (the PR, its commits and reviews),
     # issues (comments, labels' events, reactions, closing issues), statuses (read and set them).
@@ -130,7 +130,7 @@ jobs:
       statuses: write
 ```
 
-Both reusable workflows (`agent-review.yml` and `agent-claims.yml`) take a `runs-on` input, default `ubuntu-latest`: a runner label (`ubicloud-standard-2`) or a JSON list of labels (`'["self-hosted","linux"]'`), Linux only, x86_64 or arm64. The job downloads the release asset for the runner's architecture and checks it against `SHA256SUMS`; another OS or architecture fails naming the input.
+Both reusable workflows (`agent-review.yml` and `agent-claims.yml`) take a `runs-on` input, default `ubuntu-latest`: a runner label (`ubicloud-standard-2`) or a JSON list of labels (`'["self-hosted","linux"]'`), Linux only, x86_64 or arm64. The job downloads the release asset for the runner's architecture and checks it against `SHA256SUMS`; another OS or architecture fails naming the input. A release before the one that added `runs-on` fails a caller that passes it (an undefined input), so a repository moves its workflow's pin and `version` to a release with it before uncommenting the line.
 
 - **`agent-review`**: success "not an agent PR" when the author is a bot that is not a family App (Dependabot), or no commit has an `Agent-*` trailer or credits a family App or Claude as co-author (and the pull request was not opened through a family App). Else success "waived by <login>" when a person, not an App, added the waiver label. Else the latest valid marker for the current head, judged by `block_on` and its checks' result, as `review full` judges it. A marker is valid in a review or comment by the repository's owner; a comment must come through a family App in `apps.json`, and a review must only be the owner's, since GitHub records no App for a review. With no marker for the head, a review carries forward from the latest marker for the same patch id, when that review passes `block_on` and its checks (so a carried review never reads better than it did) and `git diff --name-only <its merge base> <the new merge base>` touches none of the patch's files. Otherwise it is pending: "needs a review: run `gh pr checkout N && agent-gh review full --pr N`".
 - **`agent-threads`**: success unless a comment waits for an agent's answer: an agent's P0 to P2 notify (`<!-- agent-notify {"v":1,"id":"<hex>","severity":"P1"} -->`) with no agent reply (`<!-- agent-reply {"v":1,"to":"<hex>"} -->`), or the owner's own comment, posted after the pull request was opened, on its conversation or an issue it closes, that is newer than the last comment an agent posted on that thread. The owner's 👍 on his own comment clears it. Only conversation comments count: GitHub records no App for inline review comments, so the ruleset's conversation resolution covers those. `gh pr ready` uses the same rule. A 👍 starts no workflow run, so the status catches up on the next event.
@@ -174,7 +174,7 @@ jobs:
     uses: johnrees/agent-gh/.github/workflows/agent-claims.yml@v0.9.0
     with:
       version: v0.9.0
-      # runs-on: ubicloud-standard-2
+      # runs-on: ubicloud-standard-2 # only once this pin is a release that has the input
     # contents (the label's name), pull-requests (the open pull requests), issues (the issues, comments, and the label).
     permissions:
       contents: read

@@ -574,7 +574,7 @@ test("the README's caller templates show the runs-on input, commented out", () =
   const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
   for (const name of WORKFLOWS) {
     const template = new RegExp(`\`\`\`yaml\\n(# \\.github/workflows/${name}\\.yml[\\s\\S]*?)\`\`\``).exec(readme)?.[1] ?? "";
-    expect(template).toContain("      # runs-on: ubicloud-standard-2\n");
+    expect(template).toContain("      # runs-on: ubicloud-standard-2 # only once this pin is a release that has the input\n");
     expect((Bun.YAML.parse(template) as Record<string, any>).jobs[name].with).not.toHaveProperty("runs-on");
   }
 });
