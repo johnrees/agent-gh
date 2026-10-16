@@ -54,9 +54,10 @@ export type ReviewConfig = {
 /**
  * `hold`: a pull request is held once `label` has been on it or on an issue
  * it closes, or while its diff touches a file `paths` names (`Bun.Glob`
- * patterns), until a person releases it by adding `releaseLabel`.
+ * patterns), until the repository owner releases its exact head with the
+ * comment `agent-hold release <head sha>`.
  */
-export type HoldConfig = { readonly label: string; readonly releaseLabel: string; readonly paths: readonly string[] };
+export type HoldConfig = { readonly label: string; readonly paths: readonly string[] };
 
 export const STATUS_WRITERS = ["agent", "actions"] as const;
 export type StatusWriter = (typeof STATUS_WRITERS)[number];
@@ -132,20 +133,18 @@ export const sameLabel = (a: string, b: string): boolean => a.toLowerCase() === 
 /**
  * `hold`, which needs the agent-review workflow to set its status: with
  * `status_writer` `"agent"`, the agent would set the status that holds it.
- * Neither of its labels may be another the config names.
+ * Its label may not be the waiver's.
  */
 const holdConfig = (value: unknown, writer: StatusWriter, waiverLabel: string): HoldConfig | undefined => {
   if (value === undefined) return undefined;
   const hold = object(value, "hold");
-  known(hold, ["label", "release_label", "paths"], "hold");
+  known(hold, ["label", "paths"], "hold");
   if (writer !== "actions") throw new Failure(STAGE, `${CONFIG_PATH}: hold needs "status_writer": "actions", since otherwise the agent would set the status that holds it`);
   const label = hold.label === undefined ? "needs-human" : string(hold.label, "hold.label");
-  const releaseLabel = hold.release_label === undefined ? "human-approved" : string(hold.release_label, "hold.release_label");
-  if (sameLabel(releaseLabel, label)) throw new Failure(STAGE, `${CONFIG_PATH}: hold.release_label must differ from hold.label`);
-  if (sameLabel(releaseLabel, waiverLabel) || sameLabel(label, waiverLabel)) throw new Failure(STAGE, `${CONFIG_PATH}: hold's labels must differ from waiver_label`);
+  if (sameLabel(label, waiverLabel)) throw new Failure(STAGE, `${CONFIG_PATH}: hold.label must differ from waiver_label`);
   const paths = hold.paths ?? [];
   if (!Array.isArray(paths)) throw new Failure(STAGE, `${CONFIG_PATH}: hold.paths must be a list of path patterns`);
-  return { label, releaseLabel, paths: paths.map((path, index) => string(path, `hold.paths[${index}]`)) };
+  return { label, paths: paths.map((path, index) => string(path, `hold.paths[${index}]`)) };
 };
 
 /** Parses and checks the config; every refusal names the field to fix. */

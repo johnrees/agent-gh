@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { AgentApp } from "./config.ts";
 import { type HoldConfig, inert, outcomeSummary, parseMarker, type ReviewMarker, type ReviewPolicy, reviewState, sameLabel, STATUS_CONTEXT, statusDescription } from "./review.ts";
 import { byAgent, type ThreadComment } from "./threads.ts";
@@ -192,21 +191,28 @@ export const labelEvents = (events: readonly unknown[]): LabelEvent[] =>
     }];
   });
 
-const later = (a: LabelEvent, b: LabelEvent) => Date.parse(a.at) > Date.parse(b.at) || (Date.parse(a.at) === Date.parse(b.at) && a.id > b.id);
-
 /** The latest event that added `label`. */
-const lastAdded = (events: readonly LabelEvent[], label: string) => events.findLast((event) => event.event === "labeled" && sameLabel(event.label, label));
+export const lastAdded = (events: readonly LabelEvent[], label: string) => events.findLast((event) => event.event === "labeled" && sameLabel(event.label, label));
+
+/** A comment on the pull request, as releases and the bot's markers are read from them; `edited` once its body was changed after it was posted. */
+export type PostedBy = { readonly author: string; readonly body: string; readonly edited?: boolean; readonly appId?: number | undefined; readonly at?: string; readonly id?: number };
+
+/** A comment as the hold reads it: an edited one (its updated_at moved; a reaction leaves it) releases nothing, since an agent, acting as the owner, can edit his (checked live). */
+export const postedBy = (comment: ThreadComment): PostedBy => ({ author: comment.author, body: comment.body, edited: comment.updatedAt !== comment.createdAt, appId: comment.appId, at: comment.createdAt, id: comment.id });
+
+const RELEASE = /^agent-hold release ([0-9a-f]{40})\s*$/m;
+
+/** The line a person posts to release a pull request at one exact head. */
+export const releaseLine = (head: string): string => `agent-hold release ${head}`;
 
 /**
- * The person's release a thread carries: `releaseLabel` is on it, and the
- * event that put it there was a person's, as for the review's waiver. An App
- * adding it, as an agent does, releases nothing.
+ * The person's release of `head`: the owner's own comment (no App acted for
+ * him) holding the line `agent-hold release <head>`, never edited, since an
+ * agent, acting as him, could edit it (GitHub records no App on an edit). It
+ * names one exact head, so any push holds the pull request again.
  */
-export const personRelease = (labels: readonly string[], events: readonly LabelEvent[], releaseLabel: string): LabelEvent | undefined => {
-  if (!labels.some((label) => sameLabel(label, releaseLabel))) return undefined;
-  const last = events.findLast((event) => sameLabel(event.label, releaseLabel));
-  return last?.event === "labeled" && last.person ? last : undefined;
-};
+export const headRelease = (comments: readonly PostedBy[], owner: string, head: string): PostedBy | undefined =>
+  comments.find((comment) => comment.author.toLowerCase() === owner.toLowerCase() && comment.appId === undefined && comment.edited !== true && RELEASE.exec(comment.body)?.[1] === head);
 
 /** A thread the hold's label can hold a pull request from: the pull request itself (first), or an issue it closes. */
 export type HoldThread = {
@@ -220,230 +226,113 @@ export type HoldThread = {
 
 /**
  * Whether the hold's label holds a thread (`on` it still, or `removed` from
- * it): from the time it last went on until a person adds the release label
- * (on the thread, or on the pull request, `prRelease`), whether or not it is
- * still on. Its removal releases nothing, since GitHub cannot say whose it
- * was (`LabelEvent.person`); adding it again holds again.
+ * it): from the time it last went on until the person's release of the head
+ * (`release`) comes after it, whether or not the label is still on. Its
+ * removal releases nothing, since GitHub records no App on an `unlabeled`
+ * event (checked live): an agent's removal reads as a person's.
  */
-export const labelHold = (thread: HoldThread, hold: HoldConfig, prRelease: LabelEvent | undefined): "on" | "removed" | undefined => {
+export const labelHold = (thread: HoldThread, hold: HoldConfig, release: PostedBy | undefined): "on" | "removed" | undefined => {
   const on = thread.labels.some((label) => sameLabel(label, hold.label));
   const added = lastAdded(thread.events, hold.label);
   if (added === undefined) return on ? "on" : undefined;
-  const released = [personRelease(thread.labels, thread.events, hold.releaseLabel), prRelease].some((release) => release !== undefined && later(release, added));
-  return released ? undefined : on ? "on" : "removed";
+  if (release?.at !== undefined && Date.parse(release.at) > Date.parse(added.at)) return undefined;
+  return on ? "on" : "removed";
 };
 
-/** A changed file as the pull request's files list gives it: its name, and its name before a rename. */
+/** A changed file as git lists it: its name, and its name before a rename. */
 export type ChangedFile = { readonly name: string; readonly previous: string | undefined };
 
 /**
  * The changed files the hold's `paths` reserve (a `Bun.Glob` pattern
- * matching the current name or, for a rename, the previous one), the names
- * to diff them by (both of a rename's), and the patterns that matched, in
- * the config's order.
+ * matching the current name or, for a rename, the previous one), and the
+ * patterns that matched, in the config's order.
  */
-export const reservedFiles = (files: readonly ChangedFile[], paths: readonly string[]): { readonly files: string[]; readonly names: string[]; readonly patterns: string[] } => {
+export const reservedFiles = (files: readonly ChangedFile[], paths: readonly string[]): { readonly files: string[]; readonly patterns: string[] } => {
   const globs = paths.map((pattern) => ({ pattern, glob: new Bun.Glob(pattern) }));
   const matched = new Set<string>();
-  const hits: ChangedFile[] = [];
+  const hits: string[] = [];
   for (const file of files) {
     const names = [file.name, ...(file.previous === undefined ? [] : [file.previous])];
     const by = globs.filter(({ glob }) => names.some((name) => glob.match(name)));
     if (by.length === 0) continue;
-    hits.push(file);
+    hits.push(file.name);
     for (const { pattern } of by) matched.add(pattern);
   }
-  return {
-    files: hits.map((file) => file.name),
-    names: [...new Set(hits.flatMap((file) => [file.name, ...(file.previous === undefined ? [] : [file.previous])]))],
-    patterns: paths.filter((pattern) => matched.has(pattern)),
-  };
+  return { files: hits, patterns: paths.filter((pattern) => matched.has(pattern)) };
 };
 
 /**
- * What binds a person's path release: the release label's event, who added
- * it, the head it released and the base branch it was against, and the
- * `git patch-id --stable` of the head's diff from its merge base with that
- * branch in the reserved files then (null for none). The release's own run
- * writes it as `github-actions[bot]`; a record anyone else posts counts for
- * nothing.
+ * What an agent-hold status links: its pull request, and, where it passed on
+ * a person's release, `#agent-hold-released`, so the merge guard checks the
+ * release still stands. A status on a commit is any pull request's with that
+ * head, so the guard counts only one linking the pull request it merges.
  */
-export type ReleaseRecord = { readonly v: 1; readonly event: number; readonly by: string; readonly head: string; readonly base: string; readonly paths_patch_id: string | null };
-
-const RELEASE = /<!-- agent-hold-release (\{[^\n]*?\}) -->/;
-const SHA = /^[0-9a-f]{40}$/;
-
-export const releaseMarker = (value: ReleaseRecord): string => `<!-- agent-hold-release ${JSON.stringify(value)} -->`;
-
-/** A comment's release record; undefined when it has none or it is malformed. */
-export const parseRelease = (body: string): ReleaseRecord | undefined => {
-  const match = RELEASE.exec(body);
-  if (match === null) return undefined;
-  try {
-    const value = record(JSON.parse(match[1] as string));
-    const ok =
-      value.v === 1 && Number.isSafeInteger(value.event) && typeof value.by === "string" && typeof value.head === "string" && SHA.test(value.head) &&
-      typeof value.base === "string" && value.base !== "" && (value.paths_patch_id === null || (typeof value.paths_patch_id === "string" && SHA.test(value.paths_patch_id)));
-    return ok ? { v: 1, event: value.event as number, by: value.by as string, head: value.head as string, base: value.base as string, paths_patch_id: value.paths_patch_id as string | null } : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
-/** A comment on the pull request, as the release records are read from them; `edited` once its body was changed after it was posted. */
-export type PostedBy = { readonly author: string; readonly body: string; readonly edited?: boolean };
-
-/**
- * The record that binds release `event`: the first `github-actions[bot]`
- * posted for it, so a later one cannot rebind it; `edited` when any of its
- * comments carrying one was edited since. Anyone with write access may edit
- * the bot's comment, its author unchanged (checked live), so an edited
- * record is never trusted.
- */
-export const recordFor = (comments: readonly PostedBy[], event: number): ReleaseRecord | "edited" | undefined => {
-  const records = comments.filter((comment) => comment.author === ACTIONS_BOT).flatMap((comment) => {
-    const value = parseRelease(comment.body);
-    return value?.event === event ? [{ value, edited: comment.edited === true }] : [];
-  });
-  return records.some((entry) => entry.edited) ? "edited" : records[0]?.value;
-};
-
-/**
- * What an agent-hold status links: its pull request, with a fingerprint of
- * what it was judged against: the base branch, the merge base, the hold, and
- * the person's release then (its event, or none). A status on a commit is
- * any pull request's with that head, and outlives a retarget, a merge into
- * the base that moves the merge base (and so the diff), a change to the
- * base branch's hold, or a release taken back, so the merge guard counts
- * only one linking the pull request it merges against what it reads now.
- */
-export const holdLink = (repo: string, number: number, hold: HoldConfig, base: string, mergeBase: string, release: number | null): string =>
-  `https://github.com/${repo}/pull/${number}#agent-hold-${createHash("sha256").update(JSON.stringify([base, mergeBase, hold.label.toLowerCase(), hold.releaseLabel.toLowerCase(), hold.paths, release])).digest("hex").slice(0, 12)}`;
+export const holdLink = (repo: string, number: number, released: boolean): string => `https://github.com/${repo}/pull/${number}${released ? "#agent-hold-released" : ""}`;
 
 /**
  * Why the hold's label holds a pull request, from it (first) and the issues
- * it closes (`labelHold`), or undefined: the workflow's agent-hold and the
- * merge guard, which checks it live, so a label added while its run waits
- * still holds.
+ * it closes (`labelHold`), or undefined: for the workflow's agent-hold, and
+ * for the merge guard, which reads it live, so a label added while its run
+ * waits still holds.
  */
-export const labelHoldReason = (threads: readonly HoldThread[], hold: HoldConfig): string | undefined => {
-  const pr = threads[0];
-  const prRelease = pr === undefined ? undefined : personRelease(pr.labels, pr.events, hold.releaseLabel);
-  const holds = threads.map((thread) => ({ thread, state: labelHold(thread, hold, prRelease) }));
+export const labelHoldReason = (threads: readonly HoldThread[], hold: HoldConfig, release: PostedBy | undefined): string | undefined => {
+  const holds = threads.map((thread) => ({ thread, state: labelHold(thread, hold, release) }));
   const on = holds.find((entry) => entry.state === "on");
   if (on !== undefined) return `held: \`${hold.label}\` on ${on.thread.ref}${on.thread.ask === undefined ? "" : `: ${on.thread.ask}`}`;
   const removed = holds.find((entry) => entry.state === "removed");
-  if (removed !== undefined) return `held: \`${hold.label}\` came off ${removed.thread.ref}, which releases nothing; a person adds \`${hold.releaseLabel}\``;
+  if (removed !== undefined) return `held: \`${hold.label}\` came off ${removed.thread.ref}, which releases nothing; John releases the head`;
   return undefined;
 };
-
-/**
- * Whether a `labeled` run is the release's own: the latest addition of the
- * release label at or before the run's event time (`at`, the pull request's
- * `updated_at` in its payload, which GitHub gives to the second) is
- * `release`, and no other change to that label shares its second. Another
- * addition's run, an agent's before the person's say, records nothing, and
- * neither does a run that cannot tell which it is.
- */
-export const releaseRunMatches = (events: readonly LabelEvent[], releaseLabel: string, release: LabelEvent, at: string): boolean => {
-  const changes = events.filter((event) => sameLabel(event.label, releaseLabel));
-  const second = changes.filter((event) => Date.parse(event.at) === Date.parse(release.at));
-  return second.length === 1 && changes.filter((event) => event.event === "labeled" && Date.parse(event.at) <= Date.parse(at)).at(-1)?.id === release.id;
-};
-
-/**
- * The release label's own `labeled` run: the head GitHub gave that event (the
- * one the person released) and the reserved files' patch id there. Only it
- * writes a release record, so no later push, rewind, or deleted record can
- * bind the release to another head.
- */
-export type ReleaseRun = { readonly head: string; readonly base: string; readonly pathsPatchId: string | null };
-
 
 export type HoldInput = {
   readonly hold: HoldConfig;
   /** Whose pull request: an agent's; a bot's that is no family App (Dependabot, which an agent could merge); or a person's own, which reserved paths do not hold. */
   readonly author: "agent" | "bot" | "person";
-  /** The pull request's number and URL, which its agent-hold status links, so the merge guard reads only its own. */
+  /** The repository (`owner/name`) and the pull request's number, which its agent-hold status links. */
+  readonly repo: string;
   readonly number: number;
-  readonly url: string;
+  /** The repository owner, the person who releases. */
+  readonly owner: string;
   /** The pull request first, then each issue it closes. */
   readonly threads: readonly HoldThread[];
-  /** The pull request's changed files, from its merge base (none read for a person's own, which its paths do not hold). */
+  /** The pull request's changed files, from its merge base to its head (none read for a person's own). */
   readonly files: readonly ChangedFile[];
-  /** The pull request's comments, which carry the release records. */
+  /** The pull request's comments, which carry the person's release. */
   readonly comments: readonly PostedBy[];
   readonly head: string;
-  /** The base branch it is judged against now. */
-  readonly base: string;
   /** Other open pull requests whose head is this one: a status on a commit is theirs too, so none is judged alone. */
   readonly sharedWith: readonly number[];
-  /** The reserved files' patch id at the head now (`ReleaseRecord.paths_patch_id`); undefined when it was not needed. */
-  readonly pathsPatchId?: string | null;
-  /** Set only in the release label's own `labeled` run, when no record binds the release yet. */
-  readonly releaseRun?: ReleaseRun;
-};
-
-/** What a release must be checked against: the release, its files, and the record if one binds it (`edited` if one was tampered with). */
-export type HoldNeeds = { readonly release: LabelEvent; readonly names: readonly string[]; readonly record: ReleaseRecord | "edited" | undefined };
-
-/** What holdStatus needs read from git: undefined when nothing reserved has a release to check. */
-export const holdNeeds = (input: Omit<HoldInput, "pathsPatchId" | "releaseRun">): HoldNeeds | undefined => {
-  if (input.author === "person") return undefined;
-  const pr = input.threads[0];
-  const release = pr === undefined ? undefined : personRelease(pr.labels, pr.events, input.hold.releaseLabel);
-  const { names } = reservedFiles(input.files, input.hold.paths);
-  if (release === undefined || names.length === 0) return undefined;
-  return { release, names, record: recordFor(input.comments, release.id) };
 };
 
 /**
- * agent-hold for a pull request's head, and the release record to write in
- * the release's own run. In order:
+ * agent-hold for a pull request's head, judged afresh on every event, for
+ * that head alone. In order:
  * - held while its head is another open pull request's too, since the status
  *   on that commit is theirs as well;
  * - held while the hold's label holds the pull request or an issue it closes
- *   (`labelHold`), whoever wrote it, until a person adds the release label;
+ *   (`labelHold`), whoever wrote it, until the person releases this head
+ *   after it went on;
  * - not held, for a person's own pull request;
- * - held while it touches a reserved file, until a person adds the release
- *   label. The release label's own run binds the release to the reserved
- *   files' diff at the head GitHub gave that event (`ReleaseRun`), and a
- *   change to that diff holds it again. A release no run recorded, or whose
- *   record was edited, binds nothing.
+ * - held while it touches a reserved file, until the person releases this
+ *   exact head (`headRelease`); a push to another head holds it again.
  */
-export const holdStatus = (input: HoldInput): { readonly status: Status; readonly record?: ReleaseRecord } => {
+export const holdStatus = (input: HoldInput): Status => {
   const { hold } = input;
-  const of = (state: Status["state"], description: string): Status => ({ context: HOLD_CONTEXT, state, description: statusDescription(description), targetUrl: input.url });
-  const held = (description: string) => ({ status: of("failure", description) });
-  if (input.sharedWith.length > 0) return held(`held: ${input.head.slice(0, 8)} is also the head of ${input.sharedWith.map((number) => `#${number}`).join(", ")}, so neither is judged alone`);
-  const label = labelHoldReason(input.threads, hold);
-  if (label !== undefined) return held(label);
-  if (input.author === "person") return { status: of("success", "not an agent PR") };
+  const of = (state: Status["state"], description: string, released = false): Status => ({ context: HOLD_CONTEXT, state, description: statusDescription(description), targetUrl: holdLink(input.repo, input.number, released) });
+  const head = input.head.slice(0, 8);
+  if (input.sharedWith.length > 0) return of("failure", `held: ${head} is also the head of ${input.sharedWith.map((number) => `#${number}`).join(", ")}, so neither is judged alone`);
+  const release = headRelease(input.comments, input.owner, input.head);
+  const label = labelHoldReason(input.threads, hold, release);
+  if (label !== undefined) return of("failure", label);
+  // Released only for this head: the label hold above, once it has been, passes like any other.
+  const labelled = input.threads.some((thread) => lastAdded(thread.events, hold.label) !== undefined);
+  if (input.author === "person") return of("success", "not an agent PR", labelled);
   const reserved = reservedFiles(input.files, hold.paths);
-  if (reserved.files.length === 0) return { status: of("success", "not held") };
-  const needs = holdNeeds(input);
-  if (needs === undefined) {
-    const [first, ...rest] = reserved.files;
-    const patterns = reserved.patterns.map((pattern) => `\`${pattern}\``).join(", ");
-    return held(`held: touches ${patterns} (${first}${rest.length === 0 ? "" : ` and ${rest.length} more`}); John adds \`${hold.releaseLabel}\``);
-  }
-  const { release, record: bound } = needs;
-  const again = `John adds \`${hold.releaseLabel}\` again`;
-  if (bound === "edited") return held(`held: the record of ${release.actor}'s release was edited; ${again}`);
-  const binding = bound ?? (input.releaseRun === undefined ? undefined : { v: 1 as const, event: release.id, by: release.actor, head: input.releaseRun.head, base: input.releaseRun.base, paths_patch_id: input.releaseRun.pathsPatchId });
-  if (binding === undefined) return held(`held: ${release.actor}'s release is not recorded yet; if this stays, ${again}`);
-  // A release judged the diff against one base branch; retargeted, the diff is another.
-  if (binding.base !== input.base) {
-    const status = of("failure", `held: ${binding.by} released it against ${binding.base}, and it targets ${input.base} now; ${again}`);
-    return bound === undefined ? { status, record: binding } : { status };
-  }
-  // Never released on a guess: what this needs and was not given holds it.
-  if (input.pathsPatchId === undefined) return held("held: the reserved paths' diff was not read; rerun the workflow");
-  const status =
-    binding.paths_patch_id === input.pathsPatchId
-      ? of("success", `released by ${binding.by} at ${binding.head.slice(0, 8)}`)
-      : of("failure", `held: reserved paths changed since ${binding.by} released at ${binding.head.slice(0, 8)}; ${again}`);
-  return bound === undefined ? { status, record: binding } : { status };
+  if (reserved.files.length === 0) return labelled ? of("success", `released by ${input.owner} at ${head}`, true) : of("success", "not held");
+  if (release !== undefined) return of("success", `released by ${input.owner} at ${head}`, true);
+  const [first, ...rest] = reserved.files;
+  const patterns = reserved.patterns.map((pattern) => `\`${pattern}\``).join(", ");
+  return of("failure", `held: touches ${patterns} (${first}${rest.length === 0 ? "" : ` and ${rest.length} more`}); John releases ${head}`);
 };
 
 // --- Calling John in when the hold's label goes on ---
@@ -509,13 +398,24 @@ export const called = (comments: readonly PostedBy[], event: number): boolean =>
  * where an agent's, posted as him, would not), quotes the ask's line with no
  * mention of its own, links the ask, and says how to release the hold.
  */
-export const callBody = (input: { readonly owner: string; readonly ref: string; readonly hold: HoldConfig; readonly ask: { readonly line: string; readonly url: string | undefined }; readonly event: number }): string =>
+export const callBody = (input: {
+  readonly owner: string;
+  readonly ref: string;
+  readonly hold: HoldConfig;
+  readonly ask: { readonly line: string; readonly url: string | undefined };
+  readonly event: number;
+  /** The pull request's head, for a call on one: the line that releases it names it. */
+  readonly head?: string;
+}): string =>
   [
     `@${input.owner}, an agent needs you on ${input.ref}: ${input.ask.line.replace(/@(?=[A-Za-z0-9])/g, "@\u200b")}`,
     "",
     input.ask.url === undefined ? "No agent posted an ask in the 15 minutes before the label went on; read the thread." : `[The ask](${input.ask.url})`,
     "",
-    `Only a person releases this hold: once it is answered, add \`${input.hold.releaseLabel}\` yourself. Removing \`${input.hold.label}\` releases nothing (GitHub records no App on a removal, so an agent's would read as yours), and nor does an agent adding \`${input.hold.releaseLabel}\`.`,
+    input.head === undefined
+      ? `Only you release this hold, once it is answered: on each pull request that closes this issue, comment the line \`${releaseLine("<its head sha>")}\` with its full head sha.`
+      : `Only you release this hold, once it is answered: comment the line \`${releaseLine(input.head)}\`. It releases this head alone, so a later push is held again.`,
+    `Removing \`${input.hold.label}\` releases nothing (GitHub records no App on a removal, so an agent's would read as yours).`,
     "",
     callMarker({ v: 1, event: input.event }),
   ].join("\n");

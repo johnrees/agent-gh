@@ -33,9 +33,9 @@ jobs:
     # named here: contents (the config, compare, fetching commits),
     # pull-requests (the PR, its commits, files, and reviews), issues
     # (comments, label events, reactions, closing issues), statuses (read and
-    # set). The two writes post a hold's call and release record as
-    # github-actions[bot]: issues: write on an issue, and pull-requests: write
-    # as well on a pull request's conversation. A caller must grant the same.
+    # set). The two writes post a hold's call as github-actions[bot]: issues:
+    # write on an issue, and pull-requests: write as well on a pull request's
+    # conversation. A caller must grant the same.
     permissions:
       contents: read
       issues: write
@@ -46,12 +46,10 @@ jobs:
     # so a newer run, on a new head or after a new comment, replaces an older
     # one still in progress. An issue's group cannot name its pull requests,
     # so a run also derives them again after writing, and rewrites them if
-    # they changed meanwhile. A label's run has a group of its own and is
-    # never cancelled: a hold's release is recorded only by its own run, from
-    # the head GitHub gave that event, and a call two runs post at once is
-    # cut back to the first.
+    # they changed meanwhile. Only a run in a thread's own group calls the
+    # owner in on it.
     concurrency:
-      group: agent-review-status-${{ github.repository }}-${{ github.event.action == 'labeled' && format('labeled-{0}', github.run_id) || github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      group: agent-review-status-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: true
     steps:
       - name: Download agent-gh, checked against the release's SHA256SUMS

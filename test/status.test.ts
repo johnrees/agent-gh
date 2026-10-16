@@ -15,14 +15,14 @@ import {
   eventTarget,
   firstLine,
   type FoundMarker,
+  headRelease,
   holdLink,
-  holdNeeds,
   holdStatus,
-  releaseRunMatches,
   type HoldThread,
   labelEvents,
   NO_ASK,
-  releaseMarker,
+  type PostedBy,
+  releaseLine,
   reservedFiles,
   reviewStatus,
   validMarkers,
@@ -217,9 +217,9 @@ afterEach(() => {
 });
 
 const gitEnv = (home: string) => ({ PATH: process.env.PATH ?? "", HOME: home, GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "A", GIT_AUTHOR_EMAIL: "a@example.com", GIT_COMMITTER_NAME: "A", GIT_COMMITTER_EMAIL: "a@example.com" });
-const runGit = (env: Record<string, string>, cwd: string, args: readonly string[], input?: string, raw?: boolean) => {
+const runGit = (env: Record<string, string>, cwd: string, args: readonly string[], input?: string) => {
   const result = Bun.spawnSync(["git", ...args], { cwd, env, stdin: input === undefined ? "ignore" : new TextEncoder().encode(input), stdout: "pipe", stderr: "pipe" });
-  return result.exitCode !== 0 ? undefined : raw === true ? result.stdout.toString() : result.stdout.toString().trim();
+  return result.exitCode === 0 ? result.stdout.toString().trim() : undefined;
 };
 
 /**
@@ -376,9 +376,9 @@ const statusWorld = (scenario: Scenario) => {
     repo: { owner: "johnrees", name: "widget" },
     remote: scenario.remote ?? "file:///nowhere",
     ntfyUrl: scenario.ntfy === undefined ? undefined : scenario.ntfy === "unreachable" ? `http://127.0.0.1:1/${TOPIC}` : `${fake.api.base}/ntfy/${TOPIC}`,
-    git: async (args, input, raw) => {
+    git: async (args, input) => {
       gitCalls.push(args.join(" "));
-      return runGit(env, scratch, args, input, raw);
+      return runGit(env, scratch, args, input);
     },
     print: (line) => printed.push(line),
   };
@@ -584,8 +584,6 @@ test("the reusable workflow is a workflow_call that sets the statuses with GITHU
   expect(job.steps.at(-1).env.AGENT_GH_NTFY_URL).toBe("${{ secrets.NTFY_URL }}");
   expect(JSON.stringify(job.steps.slice(0, -1))).not.toContain("NTFY_URL");
   expect(job.concurrency.group).toContain("github.event.pull_request.number || github.event.issue.number");
-  // A label's run is never cancelled by a later event: a release is recorded only in its own run.
-  expect(job.concurrency.group).toContain("github.event.action == 'labeled' && format('labeled-{0}', github.run_id) ||");
   expect(job.concurrency["cancel-in-progress"]).toBe(true);
   const steps = JSON.stringify(job.steps);
   expect(steps).not.toContain("actions/checkout");
@@ -612,7 +610,7 @@ test("the README's caller template grants the reusable workflow every scope it d
 
 // --- agent-hold ---
 
-const HOLD = { label: "needs-human", releaseLabel: "human-approved", paths: ["docs/security-claims.md", "schema/**", ".github/**"] } as const;
+const HOLD = { label: "needs-human", paths: ["docs/security-claims.md", "schema/**", ".github/**"] } as const;
 const LABELED = "2026-10-11T12:00:00Z";
 const minutes = (offset: number) => new Date(Date.parse(LABELED) + offset * 60_000).toISOString();
 const PERSON = { login: "johnrees", type: "User" };
@@ -621,103 +619,79 @@ const labelEvent = (id: number, event: "labeled" | "unlabeled", name: string, ap
   id, event, label: { name }, actor, performed_via_github_app: app === null ? null : { id: app }, created_at: at,
 });
 const PR_URL = "https://github.com/johnrees/widget/pull/12";
+const RELEASED_URL = `${PR_URL}#agent-hold-released`;
 const thread = (ref: string, labels: string[], events: unknown[], ask?: string): HoldThread => ({ ref, labels, events: labelEvents(events), ...(ask === undefined ? {} : { ask }) });
+/** The owner's own comment releasing `head`, ten minutes after the label, unless overridden. */
+const releasing = (head: string, overrides: Partial<PostedBy> = {}): PostedBy => ({ author: "johnrees", body: releaseLine(head), edited: false, appId: undefined, at: minutes(10), id: 600, ...overrides });
 const holdInput = (overrides: Partial<Parameters<typeof holdStatus>[0]> = {}): Parameters<typeof holdStatus>[0] => ({
-  hold: HOLD, author: "agent", number: 12, url: PR_URL, threads: [thread("#12", [], [])], files: [{ name: "src/a.ts", previous: undefined }], comments: [], head: A, base: "main", sharedWith: [], ...overrides,
+  hold: HOLD, author: "agent", repo: "johnrees/widget", number: 12, owner: "johnrees", threads: [thread("#12", [], [])], files: [{ name: "src/a.ts", previous: undefined }],
+  comments: [], head: A, sharedWith: [], ...overrides,
 });
 const description = (overrides: Partial<Parameters<typeof holdStatus>[0]>) => {
-  const { status } = holdStatus(holdInput(overrides));
+  const status = holdStatus(holdInput(overrides));
   return `${status.state}: ${status.description}`;
 };
 const file = (name: string, previous?: string) => ({ name, previous });
 
-test("the hold's label holds while it is on the pull request or an issue it closes, and once gone until a person adds the release label: no removal releases it", () => {
+test("the hold's label holds while on the pull request or an issue it closes, and once gone, until the owner releases this head after it went on: no removal releases it", () => {
   // Each agent-hold links its pull request, so the merge guard reads only its own.
-  expect(holdStatus(holdInput())).toEqual({ status: { context: "agent-hold", state: "success", description: "not held", targetUrl: PR_URL } });
+  expect(holdStatus(holdInput())).toEqual({ context: "agent-hold", state: "success", description: "not held", targetUrl: PR_URL });
   // A head that is another open pull request's too is held: the status on that commit is theirs as well.
   expect(description({ sharedWith: [13] })).toBe("failure: held: aaaaaaaa is also the head of #13, so neither is judged alone");
   const added = labelEvent(1, "labeled", "needs-human", CLAUDE, minutes(0));
   expect(description({ threads: [thread("#12", ["needs-human"], [added], "Drop the v1 schema?")] })).toBe("failure: held: `needs-human` on #12: Drop the v1 schema?");
   expect(description({ threads: [thread("#12", [], []), thread("#7", ["Needs-Human"], [added], "Which API?")] })).toBe("failure: held: `needs-human` on #7: Which API?");
   // GitHub records no App on a removal (checked live: an agent's reads `performed_via_github_app: null`), so none releases it, whoever's it looks.
-  const byAgent = labelEvent(2, "unlabeled", "needs-human", null, minutes(5));
-  expect(description({ threads: [thread("#12", [], [added, byAgent])] })).toBe("failure: held: `needs-human` came off #12, which releases nothing; a person adds `human-approved`");
-  expect(description({ threads: [thread("#12", [], []), thread("#7", [], [added, byAgent])] })).toBe("failure: held: `needs-human` came off #7, which releases nothing; a person adds `human-approved`");
-  expect(description({ threads: [thread("#12", [], [added, labelEvent(2, "unlabeled", "needs-human", CLAUDE, minutes(5))])] })).toContain("came off #12");
-  // The release label, added by a person after the label last went on, releases it once it is gone; an App's, or an older one, does not.
-  const release = (app: number | null, at: string) => labelEvent(3, "labeled", "human-approved", app, at);
-  expect(description({ threads: [thread("#12", ["human-approved"], [added, byAgent, release(null, minutes(6))])] })).toBe("success: not held");
-  expect(description({ threads: [thread("#12", ["human-approved"], [added, byAgent, release(CLAUDE, minutes(6))])] })).toContain("came off #12");
-  expect(description({ threads: [thread("#12", ["human-approved"], [release(null, minutes(-1)), added, byAgent])] })).toContain("came off #12");
-  // A release label a bot added, or one since removed, releases nothing either.
-  expect(description({ threads: [thread("#12", ["human-approved"], [added, byAgent, labelEvent(3, "labeled", "human-approved", null, minutes(6), { login: "github-actions[bot]", type: "Bot" })])] })).toContain("came off #12");
-  expect(description({ threads: [thread("#12", [], [added, byAgent, release(null, minutes(6)), labelEvent(4, "unlabeled", "human-approved", null, minutes(7))])] })).toContain("came off #12");
-  // On the pull request, it releases a closing issue's label too, and it releases a label still on; the label added again holds again.
-  expect(description({ threads: [thread("#12", ["human-approved"], [release(null, minutes(6))]), thread("#7", [], [added, byAgent])] })).toBe("success: not held");
-  expect(description({ threads: [thread("#12", ["needs-human", "human-approved"], [added, release(null, minutes(6))], "Ask")] })).toBe("success: not held");
-  const again = labelEvent(5, "labeled", "needs-human", CLAUDE, minutes(8));
-  expect(description({ threads: [thread("#12", ["needs-human", "human-approved"], [added, release(null, minutes(6)), again], "Again?")] })).toBe("failure: held: `needs-human` on #12: Again?");
-  // A person's own pull request is still held by the label, however it was removed.
+  const removed = labelEvent(2, "unlabeled", "needs-human", null, minutes(5));
+  expect(description({ threads: [thread("#12", [], [added, removed])] })).toBe("failure: held: `needs-human` came off #12, which releases nothing; John releases the head");
+  expect(description({ threads: [thread("#12", [], []), thread("#7", [], [added, removed])] })).toContain("came off #7");
+  // The owner's release of this head, after the label went on, releases it, on or off, and the status says it leans on that release.
+  expect(holdStatus(holdInput({ threads: [thread("#12", ["needs-human"], [added], "Ask")], comments: [releasing(A)] }))).toEqual({
+    context: "agent-hold", state: "success", description: "released by johnrees at aaaaaaaa", targetUrl: RELEASED_URL,
+  });
+  expect(description({ threads: [thread("#12", [], []), thread("#7", [], [added, removed])], comments: [releasing(A)] })).toBe("success: released by johnrees at aaaaaaaa");
+  // Not one from before the label went on, nor one of another head (any push holds again), nor once the label goes on again.
+  expect(description({ threads: [thread("#12", ["needs-human"], [added], "Ask")], comments: [releasing(A, { at: minutes(-1) })] })).toBe("failure: held: `needs-human` on #12: Ask");
+  expect(description({ threads: [thread("#12", ["needs-human"], [added], "Ask")], comments: [releasing(B)] })).toBe("failure: held: `needs-human` on #12: Ask");
+  const again = labelEvent(3, "labeled", "needs-human", CLAUDE, minutes(20));
+  expect(description({ threads: [thread("#12", ["needs-human"], [added, again], "Again?")], comments: [releasing(A)] })).toBe("failure: held: `needs-human` on #12: Again?");
+  // A person's own pull request is still held by the label; released, it is not an agent's.
   expect(description({ author: "person", threads: [thread("#12", ["needs-human"], [added], "Ask")] })).toBe("failure: held: `needs-human` on #12: Ask");
-  expect(description({ author: "person", threads: [thread("#12", [], [added, byAgent])] })).toContain("came off #12");
+  expect(holdStatus(holdInput({ author: "person", threads: [thread("#12", [], [added, removed])], comments: [releasing(A)] }))).toMatchObject({ state: "success", description: "not an agent PR", targetUrl: RELEASED_URL });
 });
 
-test("a reserved path holds a pull request, by its current name or a rename's old one, until a person adds the release label; a person's own pull request is not held by its paths", () => {
+test("only the owner's own comment, never edited, with the line naming this exact head, releases a reserved path; a push to another head holds it again", () => {
+  const files = [file("schema/a.json")];
+  expect(description({ files })).toBe("failure: held: touches `schema/**` (schema/a.json); John releases aaaaaaaa");
+  expect(holdStatus(holdInput({ files, comments: [releasing(A)] }))).toEqual({ context: "agent-hold", state: "success", description: "released by johnrees at aaaaaaaa", targetUrl: RELEASED_URL });
+  expect(description({ files, comments: [releasing(A, { author: "JohnRees", body: `Looks right.\n\n${releaseLine(A)}\n` })] })).toBe("success: released by johnrees at aaaaaaaa");
+  for (const refused of [
+    releasing(B), // another head: any push holds it again
+    releasing(A, { appId: CLAUDE }), // an agent, posting as the owner
+    releasing(A, { edited: true }), // edited since: an agent, acting as him, could have edited it
+    releasing(A, { author: "mallory" }),
+    releasing(A, { body: `please ${releaseLine(A)}` }), // not its own line
+    releasing(A, { body: releaseLine(A.slice(0, 12)) }), // not the whole sha
+  ]) {
+    expect(description({ files, comments: [refused] })).toBe("failure: held: touches `schema/**` (schema/a.json); John releases aaaaaaaa");
+  }
+  expect(headRelease([releasing(A, { edited: true }), releasing(A, { id: 601 })], "johnrees", A)?.id).toBe(601);
+});
+
+test("a reserved path holds a pull request, by its current name or a rename's old one; a person's own pull request is not held by its paths, and Dependabot's is", () => {
   const schema = [file("schema/request.schema.json"), file("schema/b.json"), file("src/x.ts"), file("schema/c.json")];
-  expect(description({ files: schema })).toBe("failure: held: touches `schema/**` (schema/request.schema.json and 2 more); John adds `human-approved`");
-  expect(description({ files: [file("old-schema/x.json", "schema/x.json")] })).toBe("failure: held: touches `schema/**` (old-schema/x.json); John adds `human-approved`");
+  expect(description({ files: schema })).toBe("failure: held: touches `schema/**` (schema/request.schema.json and 2 more); John releases aaaaaaaa");
+  expect(description({ files: [file("old-schema/x.json", "schema/x.json")] })).toBe("failure: held: touches `schema/**` (old-schema/x.json); John releases aaaaaaaa");
   // A dot directory matches when the pattern names it.
   expect(description({ files: [file(".github/workflows/ci.yml"), file("docs/security-claims.md")] })).toBe(
-    "failure: held: touches `docs/security-claims.md`, `.github/**` (.github/workflows/ci.yml and 1 more); John adds `human-approved`",
+    "failure: held: touches `docs/security-claims.md`, `.github/**` (.github/workflows/ci.yml and 1 more); John releases aaaaaaaa",
   );
   expect(description({ files: [file("schemas/x.json"), file("docs/other.md")] })).toBe("success: not held");
-  expect(reservedFiles([file("new.json", "schema/old.json"), file("src/a.ts")], HOLD.paths)).toEqual({ files: ["new.json"], names: ["new.json", "schema/old.json"], patterns: ["schema/**"] });
-  // A person's own is not held by its paths; Dependabot's is, since an agent could merge it.
+  expect(reservedFiles([file("new.json", "schema/old.json"), file("src/a.ts")], HOLD.paths)).toEqual({ files: ["new.json"], patterns: ["schema/**"] });
   expect(description({ author: "person", files: schema })).toBe("success: not an agent PR");
   expect(description({ author: "bot", files: schema })).toContain("held: touches `schema/**`");
-  // An App's release label releases nothing.
-  const byApp = thread("#12", ["human-approved"], [labelEvent(3, "labeled", "human-approved", CLAUDE, minutes(0))]);
-  expect(description({ files: schema, threads: [byApp] })).toContain("held: touches `schema/**`");
-});
-
-test("a person's path release binds, in the release label's own run, to the reserved files' diff at the head GitHub gave that event; only GitHub Actions' first unedited record counts", () => {
-  const P1 = "1".repeat(40);
-  const P2 = "2".repeat(40);
-  const release = labelEvent(501, "labeled", "human-approved", null, LABELED);
-  const released = thread("#12", ["human-approved"], [release]);
-  const files = [file("schema/a.json")];
-  // The release's own run writes the record for the head its event gave (B), whatever the head is by then (A).
-  const first = holdStatus(holdInput({ files, threads: [released], pathsPatchId: P1, releaseRun: { head: B, base: "main", pathsPatchId: P1 } }));
-  expect(first).toEqual({
-    status: { context: "agent-hold", state: "success", description: "released by johnrees at bbbbbbbb", targetUrl: PR_URL },
-    record: { v: 1, event: 501, by: "johnrees", head: B, base: "main", paths_patch_id: P1 },
-  });
-  // Pushed or rewound to another reserved diff before the record was written: recorded as released, held all the same.
-  expect(holdStatus(holdInput({ files, threads: [released], pathsPatchId: P2, releaseRun: { head: B, base: "main", pathsPatchId: P1 } }))).toMatchObject({
-    status: { state: "failure", description: "held: reserved paths changed since johnrees released at bbbbbbbb; John adds `human-approved` again" },
-    record: { head: B, paths_patch_id: P1 },
-  });
-  const record = { author: "github-actions[bot]", body: `johnrees's release\n\n${releaseMarker(first.record as NonNullable<typeof first.record>)}` };
-  expect(holdStatus(holdInput({ files, threads: [released], comments: [record], head: C, pathsPatchId: P1 }))).toEqual({ status: { context: "agent-hold", state: "success", description: "released by johnrees at bbbbbbbb", targetUrl: PR_URL } });
-  expect(description({ files, threads: [released], comments: [record], head: C, pathsPatchId: P2 })).toBe("failure: held: reserved paths changed since johnrees released at bbbbbbbb; John adds `human-approved` again");
-  // A later record, or anyone else's, never rebinds the release.
-  const forged = (author: string) => ({ author, body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: C, base: "main", paths_patch_id: P2 }) });
-  expect(description({ files, threads: [released], comments: [record, forged("github-actions[bot]")], head: C, pathsPatchId: P2 })).toContain("reserved paths changed since");
-  expect(holdNeeds(holdInput({ files, threads: [released], comments: [forged("johnrees")] }))?.record).toBeUndefined();
-  expect(holdNeeds(holdInput({ files, threads: [released], comments: [forged("github-actions[bot]")] }))?.record).toMatchObject({ head: C });
-  // Anyone with write access can edit the bot's comment, its author unchanged (checked live): an edited record holds it.
-  expect(description({ files, threads: [released], comments: [{ ...record, edited: true }], head: C, pathsPatchId: P1 })).toBe("failure: held: the record of johnrees's release was edited; John adds `human-approved` again");
-  expect(description({ files, threads: [released], comments: [record, { ...forged("github-actions[bot]"), edited: true }], head: C, pathsPatchId: P1 })).toContain("was edited");
-  // A release against one base branch binds nothing once the pull request targets another, whether it was retargeted before the release's run or after.
-  expect(holdStatus(holdInput({ files, threads: [released], pathsPatchId: P1, releaseRun: { head: B, base: "staging", pathsPatchId: P1 } }))).toMatchObject({
-    status: { state: "failure", description: "held: johnrees released it against staging, and it targets main now; John adds `human-approved` again" },
-    record: { base: "staging" },
-  });
-  expect(description({ files, threads: [released], comments: [record], base: "release", pathsPatchId: P1 })).toBe("failure: held: johnrees released it against main, and it targets release now; John adds `human-approved` again");
-  // No record, outside the release's own run (deleted, or that run failed): nothing binds, whatever the head.
-  expect(description({ files, threads: [released], pathsPatchId: P1 })).toBe("failure: held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again");
-  // What was not read is never taken as released.
-  expect(description({ files, threads: [released], comments: [record] })).toBe("failure: held: the reserved paths' diff was not read; rerun the workflow");
+  expect(holdLink("johnrees/widget", 12, false)).toBe(PR_URL);
+  expect(holdLink("johnrees/widget", 12, true)).toBe(RELEASED_URL);
 });
 
 test("the ask is the newest agent comment in the 15 minutes before the label, its first line without markers, inert, and at most 200 characters", () => {
@@ -736,44 +710,14 @@ test("the ask is the newest agent comment in the 15 minutes before the label, it
   expect(firstLine(`${"x".repeat(250)}\nsecond`)).toBe(`${"x".repeat(199)}…`);
   expect(firstLine("<!-- agent-notify {} --> <!-- forged")).toBe("&lt;!-- forged");
   expect(firstLine("<!-- only a marker -->\n\n")).toBeUndefined();
-  // The call mentions the owner, never anyone the ask names.
-  const body = callBody({ owner: "jr-owner", ref: "#12", hold: HOLD, ask: { line: "Ask @mallory?", url: "https://x/3" }, event: 900 });
+  // The call mentions the owner, never anyone the ask names, and names the line that releases this head.
+  const body = callBody({ owner: "jr-owner", ref: "#12", hold: HOLD, ask: { line: "Ask @mallory?", url: "https://x/3" }, event: 900, head: A });
   expect(body.split("\n")[0]).toBe("@jr-owner, an agent needs you on #12: Ask @\u200bmallory?");
   expect(body).toContain("[The ask](https://x/3)");
-  expect(body).toContain("Only a person releases this hold: once it is answered, add `human-approved` yourself. Removing `needs-human` releases nothing");
+  expect(body).toContain(`comment the line \`${releaseLine(A)}\`. It releases this head alone, so a later push is held again.`);
+  expect(body).toContain("Removing `needs-human` releases nothing");
   expect(body.endsWith(callMarker({ v: 1, event: 900 }))).toBe(true);
-});
-
-test("a labeled run is the release's own only when the latest addition of the release label by its event's time is that release", () => {
-  const events = labelEvents([
-    labelEvent(1, "labeled", "human-approved", CLAUDE, minutes(-5)),
-    labelEvent(2, "unlabeled", "human-approved", null, minutes(-4)),
-    labelEvent(3, "labeled", "human-approved", null, minutes(0)),
-  ]);
-  const release = events[2] as (typeof events)[number];
-  expect(releaseRunMatches(events, "human-approved", release, minutes(0))).toBe(true);
-  expect(releaseRunMatches(events, "Human-Approved", release, minutes(1))).toBe(true);
-  // The agent's earlier addition's run, however late it runs, is not the release's.
-  expect(releaseRunMatches(events, "human-approved", release, minutes(-5))).toBe(false);
-  expect(releaseRunMatches(events, "human-approved", release, minutes(-10))).toBe(false);
-  // GitHub gives the time to the second: an agent's change to the label in the person's second leaves the run unable to tell, so it records nothing.
-  const crowded = labelEvents([
-    labelEvent(1, "labeled", "human-approved", CLAUDE, minutes(0)),
-    labelEvent(2, "unlabeled", "human-approved", null, minutes(0)),
-    labelEvent(3, "labeled", "human-approved", null, minutes(0)),
-  ]);
-  expect(releaseRunMatches(crowded, "human-approved", crowded[2] as (typeof crowded)[number], minutes(0))).toBe(false);
-  // The link names the pull request and the hold it was judged by.
-  const hold = { label: "needs-human", releaseLabel: "human-approved", paths: ["schema/**"] };
-  const main = holdLink("johnrees/widget", 12, hold, "main", A, null);
-  expect(main).toMatch(/^https:\/\/github\.com\/johnrees\/widget\/pull\/12#agent-hold-[0-9a-f]{12}$/);
-  expect(holdLink("johnrees/widget", 12, { ...hold, paths: ["schema/**", ".github/**"] }, "main", A, null)).not.toBe(main);
-  expect(holdLink("johnrees/widget", 13, hold, "main", A, null)).not.toBe(main);
-  // And the base branch and merge base it was judged against: retargeted, or merged into, the diff is another.
-  expect(holdLink("johnrees/widget", 12, hold, "staging", A, null)).not.toBe(main);
-  expect(holdLink("johnrees/widget", 12, hold, "main", B, null)).not.toBe(main);
-  // And the person's release it relied on: taken back, or another, the status no longer stands.
-  expect(holdLink("johnrees/widget", 12, hold, "main", A, 501)).not.toBe(main);
+  expect(callBody({ owner: "jr-owner", ref: "#7", hold: HOLD, ask: { line: "Ask", url: undefined }, event: 901 })).toContain("on each pull request that closes this issue");
 });
 
 test("a person, and no App or bot, is who labelEvents says added a label, and no removal is a person's", () => {
@@ -789,26 +733,33 @@ test("a person, and no App or bot, is who labelEvents says added a label, and no
   expect(events.map((event) => [event.id, event.person])).toEqual([[1, true], [2, false], [3, false], [4, false], [5, false]]);
 });
 
-test("the workflow sets agent-hold from the base branch's hold, never the pull request's own config, from the files git shows between the merge base and the head; and a label on an issue it closes holds it", async () => {
-  // The changed files come from git, between the merge base and the head the status is fingerprinted by: here, a.txt.
+test("the workflow sets agent-hold from the base branch's hold, never the pull request's own config, from the files git shows between the merge base and the head, released for that head alone; and a label on an issue it closes holds it", async () => {
+  // The changed files come from git, between the merge base and the head: here, a.txt.
   const repo = history();
-  repo.git(["update-ref", "refs/pull/12/head", repo.head1]);
-  const real = { head: repo.head1, mergeBase: repo.mb1, remote: `file://${repo.dir}` };
-  const w = statusWorld({ ...real, hold: { paths: ["*.txt"] } });
+  const real = (head: string, mergeBase: string) => {
+    repo.git(["update-ref", "refs/pull/12/head", head]);
+    return { head, mergeBase, remote: `file://${repo.dir}` };
+  };
+  const w = statusWorld({ ...real(repo.head1, repo.mb1), hold: { paths: ["*.txt"] } });
   const derived = await deriveStatuses(w.io, 12);
   expect(derived?.statuses.map((status) => status.context)).toEqual(["agent-review", "agent-threads", "agent-hold"]);
-  expect(derived?.statuses[2]).toMatchObject({ state: "failure", description: "held: touches `*.txt` (a.txt); John adds `human-approved`" });
-  expect((await deriveStatuses(statusWorld({ ...real, hold: { paths: ["b.txt"] } }).io, 12))?.statuses[2]).toMatchObject({ state: "success", description: "not held" });
+  expect(derived?.statuses[2]).toMatchObject({ state: "failure", description: `held: touches \`*.txt\` (a.txt); John releases ${repo.head1.slice(0, 8)}` });
   // The pull request's own copy of the config (any other ref) drops the hold: only the base branch's is read.
-  expect(w.configRefs.length).toBeGreaterThan(0);
   expect(new Set(w.configRefs)).toEqual(new Set(["main"]));
+  expect((await deriveStatuses(statusWorld({ ...real(repo.head1, repo.mb1), hold: { paths: ["b.txt"] } }).io, 12))?.statuses[2]).toMatchObject({ state: "success", description: "not held" });
+  // The owner's release of this head passes it; pushed (rebased) to another head, it is held again.
+  const release = { id: 300, user: { login: "johnrees" }, performed_via_github_app: null, created_at: minutes(1), updated_at: minutes(1), body: releaseLine(repo.head1) };
+  expect((await deriveStatuses(statusWorld({ ...real(repo.head1, repo.mb1), hold: { paths: ["a.txt"] }, comments: [release] }).io, 12))?.statuses[2]).toEqual({
+    context: "agent-hold", state: "success", description: `released by johnrees at ${repo.head1.slice(0, 8)}`, targetUrl: RELEASED_URL,
+  });
+  expect((await deriveStatuses(statusWorld({ ...real(repo.head2, repo.mb2), hold: { paths: ["a.txt"] }, comments: [release] }).io, 12))?.statuses[2]).toMatchObject({ state: "failure" });
   const onIssue = statusWorld({
     head: A, mergeBase: B, hold: {}, issueLabels: ["needs-human"], issueEvents: [labelEvent(80, "labeled", "needs-human", CLAUDE, LABELED)],
     issueComments: [{ id: 71, user: { login: "johnrees" }, performed_via_github_app: { id: CLAUDE }, created_at: minutes(-3), html_url: "https://github.com/johnrees/widget/issues/7#issuecomment-71", body: "Which API version?" }],
   });
   expect((await deriveStatuses(onIssue.io, 12))?.statuses[2]).toMatchObject({ state: "failure", description: "held: `needs-human` on #7: Which API version?" });
   // Dependabot's pull request is not an agent's, but reserved paths still hold it; a person's own is not held by its paths, so git is never read.
-  const dependabot = statusWorld({ ...real, author: { login: "dependabot[bot]", type: "Bot" }, hold: { paths: ["a.txt"] } });
+  const dependabot = statusWorld({ ...real(repo.head1, repo.mb1), author: { login: "dependabot[bot]", type: "Bot" }, hold: { paths: ["a.txt"] } });
   expect((await deriveStatuses(dependabot.io, 12))?.statuses.map((status) => [status.context, status.state])).toEqual([["agent-review", "success"], ["agent-threads", "success"], ["agent-hold", "failure"]]);
   const person = statusWorld({ head: A, mergeBase: B, commits: ["by hand"], hold: { paths: ["a.txt"] } });
   expect((await deriveStatuses(person.io, 12))?.statuses[2]).toMatchObject({ state: "success", description: "not an agent PR" });
@@ -817,89 +768,6 @@ test("the workflow sets agent-hold from the base branch's hold, never the pull r
   let refusal = "";
   await deriveStatuses(statusWorld({ head: A, mergeBase: B, hold: { paths: ["a.txt"] } }).io, 12).catch((error: Error) => (refusal = error.message));
   expect(refusal).toContain("could not fetch aaaaaaaa and its merge base to read #12's changed files");
-}, 30_000);
-
-test("against real git, a person's release binds to the head its event gave, survives a rebase that leaves the reserved diff as it was, and a change to it holds the pull request again", async () => {
-  const repo = history();
-  const remote = `file://${repo.dir}`;
-  // head4 changes the reserved a.txt further; head5 changes only b.txt, which is not reserved.
-  const amend = (from: string, name: string, path: string, text: string) => {
-    repo.git(["checkout", "-q", "-b", name, from]);
-    writeFileSync(join(repo.dir, path), text);
-    repo.git(["commit", "-q", "-am", name]);
-    return repo.git(["rev-parse", "HEAD"]) as string;
-  };
-  const lines = Array.from({ length: 30 }, (_, index) => `line ${index + 1}`);
-  const head4 = amend(repo.head2, "more", "a.txt", `${["changed", "also changed", ...lines.slice(2)].join("\n")}\n`);
-  const head5 = amend(repo.head2, "other", "b.txt", "b3\n");
-  const release = labelEvent(501, "labeled", "human-approved", null, LABELED);
-  const world = (head: string, mergeBase: string, extra: Partial<Scenario> = {}) => {
-    repo.git(["update-ref", "refs/pull/12/head", head]);
-    // The release's run compares its head with main's commit at the event (mb1, say).
-    const mergeBases = { [`${repo.mb1}...${repo.head1}`]: repo.mb1, ...extra.mergeBases };
-    return statusWorld({ head, mergeBase, remote, hold: { paths: ["a.txt"] }, labels: ["human-approved"], events: [release], ...extra, mergeBases });
-  };
-  const hold = async (w: ReturnType<typeof statusWorld>) => (await deriveStatuses(w.io, 12))?.statuses[2];
-  // The reserved diff's id as the workflow reads it: untrimmed, through git patch-id --verbatim.
-  const verbatim = (from: string, to: string) => runGit(repo.env, repo.dir, ["patch-id", "--verbatim"], runGit(repo.env, repo.dir, ["diff", "--no-color", "--no-ext-diff", "-M", "--src-prefix=a/", "--dst-prefix=b/", from, to, "--", "a.txt"], undefined, true))?.split(" ")[0] ?? null;
-  // As GitHub sends it: the head then, and the pull request's updated_at, the label's own time.
-  const releasedAt = (head: string, at = LABELED, base = "main", baseSha = repo.mb1) => ({ name: "pull_request_target", payload: { action: "labeled", label: { name: "human-approved" }, pull_request: { number: 12, head: { sha: head }, base: { ref: base, sha: baseSha }, updated_at: at } } });
-  const link = holdLink("johnrees/widget", 12, { label: "needs-human", releaseLabel: "human-approved", paths: ["a.txt"] }, "main", repo.mb1, 501);
-  const patchId = verbatim(repo.mb1, repo.head1);
-
-  // John releases head1; by the time the release's own run reads the pull request, an agent has pushed head4, another reserved diff.
-  // The run binds the release to head1, the head GitHub gave the event, and holds head4.
-  const raced = world(head4, repo.mb2);
-  await statusCommand(raced.io, releasedAt(repo.head1), undefined);
-  expect(raced.commented(12)).toEqual([expect.stringContaining(releaseMarker({ v: 1, event: 501, by: "johnrees", head: repo.head1, base: "main", paths_patch_id: patchId }))]);
-  expect(raced.posted().find((status) => status.context === "agent-hold")).toMatchObject({ state: "failure", description: `held: reserved paths changed since johnrees released at ${repo.head1.slice(0, 8)}; John adds \`human-approved\` again` });
-
-  // With head1 still the head, the release's run records it and passes agent-hold; the re-derivation after finds the record.
-  const first = world(repo.head1, repo.mb1);
-  await statusCommand(first.io, releasedAt(repo.head1), undefined);
-  expect(first.commented(12)).toHaveLength(1);
-  expect(first.posted().find((status) => status.context === "agent-hold")).toEqual({ state: "success", context: "agent-hold", description: `released by johnrees at ${repo.head1.slice(0, 8)}`, target_url: link });
-  const recorded = first.comments;
-
-  // A rebase over base changes to other files, or a new commit to an unreserved file: the reserved diff is the same, so still released.
-  expect(await hold(world(repo.head2, repo.mb2, { comments: recorded }))).toMatchObject({ state: "success", description: `released by johnrees at ${repo.head1.slice(0, 8)}` });
-  expect(await hold(world(head5, repo.mb2, { comments: recorded }))).toMatchObject({ state: "success" });
-  // The record's comment edited since (its updated_at moves; a reaction's does not): never trusted.
-  const edited = (recorded as Record<string, unknown>[]).map((comment) => ({ ...comment, updated_at: minutes(20) }));
-  expect(await hold(world(repo.head2, repo.mb2, { comments: edited }))).toMatchObject({ state: "failure", description: "held: the record of johnrees's release was edited; John adds `human-approved` again" });
-  // A change to the reserved file holds it again, whatever a later record says.
-  const changed = await hold(world(head4, repo.mb2, { comments: recorded }));
-  expect(changed).toMatchObject({ state: "failure", description: `held: reserved paths changed since johnrees released at ${repo.head1.slice(0, 8)}; John adds \`human-approved\` again` });
-  const changedId = verbatim(repo.mb2, head4);
-  const forge = (login: string) => ({ id: 9000, user: { login }, created_at: minutes(10), updated_at: minutes(10), body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: head4, base: "main", paths_patch_id: changedId }) });
-  expect(await hold(world(head4, repo.mb2, { comments: [...recorded, forge("github-actions[bot]")] }))).toMatchObject({ state: "failure" });
-  // Whitespace counts: a space inside a line, or trailing on the diff's very last line (read untrimmed), is a change John has not released.
-  const spaced = amend(repo.head1, "spaced", "a.txt", `${["chan ged", ...lines.slice(1)].join("\n")}\n`);
-  expect(await hold(world(spaced, repo.mb1, { comments: recorded }))).toMatchObject({ state: "failure", description: `held: reserved paths changed since johnrees released at ${repo.head1.slice(0, 8)}; John adds \`human-approved\` again` });
-  const tailX = amend(repo.head1, "tail-x", "a.txt", `${["changed", ...lines.slice(1, 29), "line 30 x"].join("\n")}\n`);
-  const tailY = amend(repo.head1, "tail-y", "a.txt", `${["changed", ...lines.slice(1, 29), "line 30 x "].join("\n")}\n`);
-  const boundX = { id: 9100, user: { login: "github-actions[bot]" }, created_at: minutes(1), updated_at: minutes(1), body: releaseMarker({ v: 1, event: 501, by: "johnrees", head: tailX, base: "main", paths_patch_id: verbatim(repo.mb1, tailX) }) };
-  expect(await hold(world(tailX, repo.mb1, { comments: [boundX] }))).toMatchObject({ state: "success" });
-  expect(await hold(world(tailY, repo.mb1, { comments: [boundX] }))).toMatchObject({ state: "failure", description: `held: reserved paths changed since johnrees released at ${tailX.slice(0, 8)}; John adds \`human-approved\` again` });
-  // A record anyone else posts counts for nothing; and with the record gone, no run but the release's own binds it, whatever the head.
-  expect(await hold(world(head4, repo.mb2, { comments: [forge("johnrees")] }))).toMatchObject({ state: "failure", description: "held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again" });
-  expect(await hold(world(repo.head1, repo.mb1))).toMatchObject({ state: "failure", description: "held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again" });
-  // John released against staging; the pull request was retargeted to main before the release's run: it binds staging's diff, and holds against main.
-  const retargeted = world(repo.head1, repo.mb1);
-  await statusCommand(retargeted.io, releasedAt(repo.head1, LABELED, "staging"), undefined);
-  expect(retargeted.commented(12)).toEqual([expect.stringContaining('"base":"staging"')]);
-  expect(retargeted.posted().find((status) => status.context === "agent-hold")).toMatchObject({ state: "failure", description: "held: johnrees released it against staging, and it targets main now; John adds `human-approved` again" });
-  // Judged against the base branch's commit the event gave, not the branch as it is when the run reads it.
-  expect(retargeted.fake.log.some((entry) => entry.path === `${REPO}/compare/${repo.mb1}...${repo.head1}`)).toBe(true);
-  // Another label's event is no release's run; nor is an earlier addition's, an agent's say, that runs after the person's release.
-  const other = world(repo.head1, repo.mb1);
-  await statusCommand(other.io, { name: "pull_request_target", payload: { action: "labeled", label: { name: "bug" }, pull_request: { number: 12, head: { sha: repo.head1 }, base: { ref: "main", sha: repo.mb1 }, updated_at: LABELED } } }, undefined);
-  expect(other.commented(12)).toEqual([]);
-  const agentFirst = labelEvent(490, "labeled", "human-approved", CLAUDE, minutes(-5));
-  const late = world(head4, repo.mb2, { events: [agentFirst, labelEvent(491, "unlabeled", "human-approved", null, minutes(-4)), release] });
-  await statusCommand(late.io, releasedAt(head4, minutes(-5)), undefined);
-  expect(late.commented(12)).toEqual([]);
-  expect(late.posted().find((status) => status.context === "agent-hold")).toMatchObject({ description: "held: johnrees's release is not recorded yet; if this stays, John adds `human-approved` again" });
 }, 30_000);
 
 /** An agent's comment on #12, posted as `owner` through Claude's App. */
@@ -963,11 +831,13 @@ test("a label added and removed before a run read it still holds, so the call is
   await statusCommand(gone.io, { name: "pull_request_target", payload: { action: "unlabeled", pull_request: { number: 12 } } }, undefined);
   expect(gone.commented(12)).toHaveLength(1);
   expect(gone.commented(12)[0]?.split("\n")[0]).toBe("@johnrees, an agent needs you on #12: Which way?");
-  expect(gone.posted().find((status) => status.context === "agent-hold")).toMatchObject({ description: "held: `needs-human` came off #12, which releases nothing; a person adds `human-approved`" });
-  const released = statusWorld({ head: A, mergeBase: B, hold: {}, labels: ["human-approved"], events: [added, removed, labelEvent(902, "labeled", "human-approved", null, minutes(5))] });
+  expect(gone.posted().find((status) => status.context === "agent-hold")).toMatchObject({ description: "held: `needs-human` came off #12, which releases nothing; John releases the head" });
+  // Once the owner has released this head, no call is made.
+  const release = { id: 300, user: { login: "johnrees" }, performed_via_github_app: null, created_at: minutes(5), updated_at: minutes(5), body: releaseLine(A) };
+  const released = statusWorld({ head: A, mergeBase: B, hold: {}, events: [added, removed], comments: [release] });
   await statusCommand(released.io, LABELED_EVENT, undefined);
   expect(released.commented(12)).toEqual([]);
-  expect(released.posted().find((status) => status.context === "agent-hold")).toMatchObject({ state: "success", description: "not held" });
+  expect(released.posted().find((status) => status.context === "agent-hold")).toMatchObject({ state: "success", description: "released by johnrees at aaaaaaaa", target_url: RELEASED_URL });
 });
 
 test("a label on a plain issue calls the owner in there and holds every open pull request here that closes it", async () => {
@@ -992,7 +862,7 @@ test("a head another open pull request shares is held: the status on that commit
   const w = statusWorld({ head: A, mergeBase: B, hold: {}, sharedWith: [13] });
   expect((await deriveStatuses(w.io, 12))?.statuses[2]).toEqual({
     context: "agent-hold", state: "failure", description: "held: aaaaaaaa is also the head of #13, so neither is judged alone",
-    targetUrl: holdLink("johnrees/widget", 12, { label: "needs-human", releaseLabel: "human-approved", paths: [] }, "main", B, null),
+    targetUrl: PR_URL,
   });
   expect((await deriveStatuses(statusWorld({ head: A, mergeBase: B, hold: {} }).io, 12))?.statuses[2]).toMatchObject({ state: "success", description: "not held" });
 });

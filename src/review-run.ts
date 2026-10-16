@@ -10,7 +10,7 @@ import { HARNESSES, type Env } from "./harness.ts";
 import { parseRemoteUrl, parseRepo, type Repo, slug } from "./repo.ts";
 import { absent, checkState, type PushedTag, pushedRefs, type RequiredCheck, requiredChecks } from "./merge.ts";
 import { type ApiIo, closingIssues, describeRequired, everyPage, pullThreads, repoOwner } from "./threads-run.ts";
-import { HOLD_CONTEXT, holdLink, type HoldThread, labelEvents, labelHoldReason, type MarkerPost, personRelease, validMarkers } from "./status.ts";
+import { HOLD_CONTEXT, holdLink, type HoldThread, labelEvents, labelHoldReason, type MarkerPost, headRelease, releaseLine, validMarkers } from "./status.ts";
 import {
   agentReviewStatus,
   type ApiCall,
@@ -70,8 +70,8 @@ export type ReviewIo = {
   readonly repo: Repo;
   /** The session's family: its work is reviewed by another family. */
   readonly family: string;
-  /** Runs git in the working tree, with `input` on stdin; its stdout (trimmed unless `raw`), or undefined when it fails. */
-  readonly git: (args: readonly string[], input?: string, raw?: boolean) => Promise<string | undefined>;
+  /** Runs git in the working tree, with `input` on stdin; its trimmed stdout, or undefined when it fails. */
+  readonly git: (args: readonly string[], input?: string) => Promise<string | undefined>;
   /** Runs one of the config's checks, a shell command, in `cwd` with `env` added, stopping it after `timeoutMs`; its exit code and its stdout and stderr together. */
   readonly runCheck: (command: string, cwd: string, timeoutMs: number, env: Readonly<Record<string, string>>) => Promise<CheckRun>;
   /** Runs a reviewer CLI in `cwd` with `stdin` (none when empty) and returns its exit code and stdout. */
@@ -351,42 +351,44 @@ const liveThreads = async (io: ReviewIo, pr: Pull): Promise<HoldThread[]> => {
 
 /**
  * Why the hold refuses a merge of `pr`, if it does, where the base branch's
- * config has `hold`. The hold's label is read live (`labelHoldReason`), so
- * one added while its run waits still holds. Then the latest agent-hold
- * GitHub Actions set on the head must be this pull request's, judged against
- * the base branch, merge base, and hold it has now (`holdLink`): a status on
- * a commit is any pull request's with that head, and outlives a retarget, a
- * merge into the base, or a change to the hold. For a merge it must be
- * `success`, whether or not a ruleset requires it. Auto-merge (`auto`) waits
- * only for the checks a ruleset requires, and a hold can come after it is
- * turned on, so it is let through only where a ruleset requires agent-hold
- * from GitHub Actions, whatever agent-hold reads now, once this pull
- * request's own is on the head, so GitHub never waits on another's.
+ * config has `hold`. The hold's label, and the owner's release of the head,
+ * are read live, so a label added, or a release withdrawn, while its run
+ * waits still counts. Then the latest agent-hold GitHub Actions set on the
+ * head must link this pull request (a status on a commit is any pull
+ * request's with that head) and be `success`, whether or not a ruleset
+ * requires it, and one that passed on a release needs that release to
+ * stand. Auto-merge (`auto`) is let through while it is not `success` only
+ * where a ruleset requires agent-hold from GitHub Actions, which auto-merge
+ * then waits for.
  */
 const holdRefusal = async (io: ReviewIo, pr: Pull, hold: HoldConfig, required: readonly RequiredCheck[], auto: boolean, byApps: () => Promise<Record<string, unknown>[]>): Promise<string | undefined> => {
-  const release = `only a person releases a hold: John adds \`${hold.releaseLabel}\` himself`;
-  // The label is read live, so one added while its run waits still holds.
-  const threads = await liveThreads(io, pr);
-  const label = labelHoldReason(threads, hold);
-  if (label !== undefined) return `pull request #${pr.number} is ${label}; ${release}`;
-  if (auto && !required.some((entry) => entry.context === HOLD_CONTEXT && entry.app === ACTIONS_APP)) {
-    return `\`--auto\` cannot wait for ${HOLD_CONTEXT} on pull request #${pr.number}: ${pr.base}'s rules do not require ${HOLD_CONTEXT} from GitHub Actions, so a hold that comes later would not stop the merge; merge once ${HOLD_CONTEXT} passes, or ask John to require it`;
-  }
+  const releasing = `only John releases it, with a comment of his own on #${pr.number}: \`${releaseLine(pr.head)}\``;
+  const owner = await repoOwner(io, MERGE_STAGE);
+  const comments = (await everyPage(io, MERGE_STAGE, `${repoPath(io)}/issues/${pr.number}/comments`)).map((item) => {
+    const comment = record(item);
+    const app = record(comment.performed_via_github_app).id;
+    return { author: text(record(comment.user).login), body: text(comment.body), edited: text(comment.updated_at) !== text(comment.created_at), appId: Number.isSafeInteger(app) ? (app as number) : undefined, at: text(comment.created_at) };
+  });
+  const release = headRelease(comments, owner, pr.head);
+  const label = labelHoldReason(await liveThreads(io, pr), hold, release);
+  if (label !== undefined) return `pull request #${pr.number} is ${label}; ${releasing}`;
   const shown = (await byApps()).find((status) => status.context === HOLD_CONTEXT && status.app_id === ACTIONS_APP);
-  const compare = record((await call(io, MERGE_STAGE, "GET", `${repoPath(io)}/compare/${encodeURIComponent(pr.base)}...${pr.head}`)).value);
-  const mergeBase = text(record(compare.merge_base_commit).sha);
-  // The release the status relied on must still stand: a person's release taken back changes the fingerprint.
-  const released = threads[0] === undefined ? undefined : personRelease(threads[0].labels, threads[0].events, hold.releaseLabel);
-  const own = holdLink(slug(io.repo), pr.number, hold, pr.base, mergeBase, released?.id ?? null).toLowerCase() === text(shown?.target_url).toLowerCase();
+  const link = text(shown?.target_url).toLowerCase();
+  const own = [false, true].some((released) => holdLink(slug(io.repo), pr.number, released).toLowerCase() === link);
+  const leansOnRelease = holdLink(slug(io.repo), pr.number, true).toLowerCase() === link;
+  const cleared = shown?.state === "success" && own && (!leansOnRelease || release !== undefined);
+  if (cleared) return undefined;
+  if (auto && required.some((entry) => entry.context === HOLD_CONTEXT && entry.app === ACTIONS_APP)) return undefined;
   const why =
     shown === undefined
       ? `no ${HOLD_CONTEXT} status from GitHub Actions`
       : !own
-        ? `the latest ${HOLD_CONTEXT} on it was not judged for this pull request against ${pr.base}, its merge base, its hold, and its release now (${text(shown.target_url) || "no link"}); the agent-review workflow sets it on the next event`
-        : `${HOLD_CONTEXT} ${shown.state === "failure" || shown.state === "error" ? "failed" : text(shown.state)}: ${text(shown.description)}`;
-  if (auto) return own ? undefined : `\`--auto\` would wait on another pull request's ${HOLD_CONTEXT} on #${pr.number}'s head ${pr.head.slice(0, 8)} (${why})`;
-  if (shown?.state === "success" && own) return undefined;
-  return `pull request #${pr.number}'s head ${pr.head.slice(0, 8)} is not cleared by ${HOLD_CONTEXT} (${why}); ${release}, and an agent merges once ${HOLD_CONTEXT} passes`;
+        ? `the latest ${HOLD_CONTEXT} on it is another pull request's (${text(shown.target_url) || "no link"})`
+        : shown.state === "success"
+          ? `it passed on ${owner}'s release of ${pr.head.slice(0, 8)}, which no longer stands`
+          : `${HOLD_CONTEXT} ${shown.state === "failure" || shown.state === "error" ? "failed" : text(shown.state)}: ${text(shown.description)}`;
+  const wait = auto ? `; \`--auto\` would not wait for it, since ${pr.base}'s rules do not require ${HOLD_CONTEXT} from GitHub Actions` : "";
+  return `pull request #${pr.number}'s head ${pr.head.slice(0, 8)} is not cleared by ${HOLD_CONTEXT} (${why})${wait}; ${releasing}, and an agent merges once ${HOLD_CONTEXT} passes`;
 };
 
 /**

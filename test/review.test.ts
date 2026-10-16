@@ -50,7 +50,7 @@ import {
 import { fakeGitHub, reply } from "./fake-github.ts";
 import { parseRepo, type Repo, repoFlag, slug } from "../src/repo.ts";
 import { pushedRefs } from "../src/merge.ts";
-import { holdLink } from "../src/status.ts";
+import { holdLink, releaseLine } from "../src/status.ts";
 
 /** The issue's example config: Codex and Claude reviewers, effort from the ticket's labels. */
 const EXAMPLE = {
@@ -122,20 +122,18 @@ test("a config with a typo is refused with the field to fix, and defaults fill w
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, status_writer: "ci" })))).toBe('.github/agent-review.json: status_writer must be "agent" or "actions"');
 });
 
-test("hold defaults its labels and paths, needs the workflow to set its status, and refuses unknown keys and labels that clash", () => {
+test("hold defaults its label and paths, needs the workflow to set its status, and refuses unknown keys and a label that clashes", () => {
   const actions = { ...EXAMPLE, status_writer: "actions" };
   expect(parseReviewConfig(JSON.stringify(EXAMPLE)).hold).toBeUndefined();
-  expect(parseReviewConfig(JSON.stringify({ ...actions, hold: {} })).hold).toEqual({ label: "needs-human", releaseLabel: "human-approved", paths: [] });
-  expect(parseReviewConfig(JSON.stringify({ ...actions, hold: { label: "ask-john", release_label: "john-ok", paths: ["schema/**", ".github/**"] } })).hold).toEqual({
-    label: "ask-john", releaseLabel: "john-ok", paths: ["schema/**", ".github/**"],
-  });
+  expect(parseReviewConfig(JSON.stringify({ ...actions, hold: {} })).hold).toEqual({ label: "needs-human", paths: [] });
+  expect(parseReviewConfig(JSON.stringify({ ...actions, hold: { label: "ask-john", paths: ["schema/**", ".github/**"] } })).hold).toEqual({ label: "ask-john", paths: ["schema/**", ".github/**"] });
   // Without the workflow, the agent would set the status that holds it.
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, hold: {} })))).toBe('.github/agent-review.json: hold needs "status_writer": "actions", since otherwise the agent would set the status that holds it');
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, status_writer: "agent", hold: {} })))).toContain('hold needs "status_writer": "actions"');
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...actions, hold: { labels: "x" } })))).toBe(".github/agent-review.json: hold has unknown key labels");
-  expect(refusal(() => parseReviewConfig(JSON.stringify({ ...actions, hold: { release_label: "Needs-Human" } })))).toBe(".github/agent-review.json: hold.release_label must differ from hold.label");
-  expect(refusal(() => parseReviewConfig(JSON.stringify({ ...actions, hold: { release_label: "review-waived" } })))).toBe(".github/agent-review.json: hold's labels must differ from waiver_label");
-  expect(refusal(() => parseReviewConfig(JSON.stringify({ ...actions, hold: { label: "review-waived" } })))).toBe(".github/agent-review.json: hold's labels must differ from waiver_label");
+  // The owner releases a head with a comment; there is no release label.
+  expect(refusal(() => parseReviewConfig(JSON.stringify({ ...actions, hold: { release_label: "human-approved" } })))).toBe(".github/agent-review.json: hold has unknown key release_label");
+  expect(refusal(() => parseReviewConfig(JSON.stringify({ ...actions, hold: { label: "Review-Waived" } })))).toBe(".github/agent-review.json: hold.label must differ from waiver_label");
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...actions, hold: { paths: "schema/**" } })))).toBe(".github/agent-review.json: hold.paths must be a list of path patterns");
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...actions, hold: { paths: [""] } })))).toBe(".github/agent-review.json: hold.paths[0] must be a non-empty string");
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...actions, hold: [] })))).toBe(".github/agent-review.json: hold must be an object");
@@ -931,15 +929,14 @@ test("gh pr ready runs only after the gate passes, with the gate's token; other 
 
 /** A config with a hold, which the workflow's statuses need. */
 const HELD = { ...EXAMPLE, status_writer: "actions", hold: { paths: ["schema/**"] } };
-const HELD_POLICY = { label: "needs-human", releaseLabel: "human-approved", paths: ["schema/**"] };
 const ACTIONS = { login: "github-actions[bot]" };
 const reviewedByActions = { context: "agent-review", state: "success", creator: ACTIONS };
 
 test("gh pr ready lets a held pull request go ready, so CI runs on it, and prints the hold", async () => {
-  const held = { context: "agent-hold", state: "failure", description: "held: touches `schema/**` (schema/a.json); John adds `human-approved`", creator: ACTIONS };
+  const held = { context: "agent-hold", state: "failure", description: "held: touches `schema/**` (schema/a.json); John releases aaaaaaaa", creator: ACTIONS };
   const w = world({ config: HELD, status: [reviewedByActions, held] });
   await gateReady(w.io, { number: 12 });
-  expect(w.printed).toEqual(["agent-gh: held: touches `schema/**` (schema/a.json); John adds `human-approved`; John releases it before it can merge"]);
+  expect(w.printed).toEqual(["agent-gh: held: touches `schema/**` (schema/a.json); John releases aaaaaaaa; John releases it before it can merge"]);
   const unset = world({ config: HELD, status: [reviewedByActions] });
   await gateReady(unset.io, { number: 12 });
   expect(unset.printed).toEqual(["agent-gh: agent-hold on aaaaaaaa is not set yet; the merge waits for it, and only John releases a hold"]);
@@ -948,82 +945,83 @@ test("gh pr ready lets a held pull request go ready, so CI runs on it, and print
   expect(clear.printed).toEqual([]);
 });
 
-test("where the base branch's config has hold, an agent's merge needs agent-hold to pass on the head, set by GitHub Actions, whatever the ruleset lists", async () => {
+/** What the merge guard says releases a hold on #12 at HEAD. */
+const RELEASING = `only John releases it, with a comment of his own on #12: \`${releaseLine(HEAD)}\``;
+/** agent-hold as the workflow sets it: GitHub Actions', linking a pull request (#12 unless given), and whether it passed on a release. */
+const holdStatusOf = (state: string, { pr = 12, released = false, creator = ACTIONS }: { pr?: number; released?: boolean; creator?: { login: string } } = {}) => ({
+  context: "agent-hold", state, description: state === "success" ? "not held" : "held: `needs-human` on #12: Ask", creator, target_url: holdLink("johnrees/widget", pr, released),
+});
+
+test("where the base branch's config has hold, an agent's merge needs this pull request's own agent-hold to pass, set by GitHub Actions, whatever the ruleset lists", async () => {
   const here = parseRepo("johnrees/widget");
   const calls: string[] = [];
-  const hold = (state: string, creator = ACTIONS, pr = 12, policy = HELD_POLICY) => ({ context: "agent-hold", state, description: state === "success" ? "not held" : "held: `needs-human` on #12: Ask", creator, target_url: holdLink("johnrees/widget", pr, policy, "main", OLD, null) });
-  const merge = async (status: unknown[], args = ["pr", "merge", "12"], rules: unknown[] = []) =>
-    gateRefusal(dispatchGh(args, here, mergeDeps(world({ config: HELD, status: status as never, rules }).io, calls)));
-  expect(await merge([hold("failure")])).toBe(
-    "pull request #12's head aaaaaaaa is not cleared by agent-hold (agent-hold failed: held: `needs-human` on #12: Ask); only a person releases a hold: John adds `human-approved` himself, and an agent merges once agent-hold passes",
+  const merge = async (status: unknown[], args = ["pr", "merge", "12"], extra: World = {}) =>
+    gateRefusal(dispatchGh(args, here, mergeDeps(world({ config: HELD, status: status as never, ...extra }).io, calls)));
+  expect(await merge([holdStatusOf("failure")])).toBe(
+    `pull request #12's head aaaaaaaa is not cleared by agent-hold (agent-hold failed: held: \`needs-human\` on #12: Ask); ${RELEASING}, and an agent merges once agent-hold passes`,
   );
-  expect(await merge([hold("pending")])).toContain("(agent-hold pending: held: `needs-human` on #12: Ask)");
+  expect(await merge([holdStatusOf("pending")])).toContain("(agent-hold pending: held: `needs-human` on #12: Ask)");
   // An agent's App can set a status with that name; it is not GitHub Actions', so it clears nothing.
-  expect(await merge([hold("success", { login: "johnrees" })])).toContain("(no agent-hold status from GitHub Actions)");
-  expect(await merge([hold("success", { login: "johnrees-claude[bot]" })])).toContain("(no agent-hold status from GitHub Actions)");
+  expect(await merge([holdStatusOf("success", { creator: { login: "johnrees" } })])).toContain("(no agent-hold status from GitHub Actions)");
+  expect(await merge([holdStatusOf("success", { creator: { login: "johnrees-claude[bot]" } })])).toContain("(no agent-hold status from GitHub Actions)");
   // The latest of GitHub Actions' own decides.
-  expect(await merge([hold("failure"), hold("success")])).toContain("agent-hold failed");
+  expect(await merge([holdStatusOf("failure"), holdStatusOf("success")])).toContain("agent-hold failed");
   expect(await merge([])).toContain("no agent-hold status from GitHub Actions");
-  // A status on the head is any pull request's with that head, and outlives a change to the hold: only one linking this pull request, judged by the hold now, clears it.
-  expect(await merge([hold("success", ACTIONS, 13)])).toContain(`(the latest agent-hold on it was not judged for this pull request against main, its merge base, its hold, and its release now (${holdLink("johnrees/widget", 13, HELD_POLICY, "main", OLD, null)})`);
-  expect(await merge([hold("success", ACTIONS, 12, { ...HELD_POLICY, paths: [] })])).toContain("was not judged for this pull request against main, its merge base, its hold, and its release now");
-  expect(await merge([{ ...hold("success"), target_url: undefined }])).toContain("(no link)");
-  // Nor one judged against another merge base: a merge into main can move it, and the diff with it.
-  expect(await merge([{ ...hold("success"), target_url: holdLink("johnrees/widget", 12, HELD_POLICY, "main", "e".repeat(40), null) }])).toContain("was not judged for this pull request against main, its merge base, its hold, and its release now");
-  // The label is read live: added while its run waits, it holds whatever agent-hold reads, on the pull request or an issue it closes.
-  const added = { id: 900, event: "labeled", label: { name: "needs-human" }, actor: { login: "johnrees", type: "User" }, performed_via_github_app: { id: 5085898 }, created_at: CREATED };
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ config: HELD, labels: ["needs-human"], events: [added], status: [hold("success")] as never }).io, calls)))).toBe(
-    "pull request #12 is held: `needs-human` on #12; only a person releases a hold: John adds `human-approved` himself",
-  );
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto"], here, mergeDeps(world({ config: HELD, issueLabels: ["needs-human"], issueEvents: [added], status: [hold("success")] as never }).io, calls)))).toContain("is held: `needs-human` on #7");
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ config: HELD, events: [added, { ...added, id: 901, event: "unlabeled", performed_via_github_app: null }], status: [hold("success")] as never }).io, calls)))).toContain("is held: `needs-human` came off #12, which releases nothing");
-  // Nor one that relied on a person's release since taken back: the fingerprint names the release it was judged with.
-  const released = { id: 777, event: "labeled", label: { name: "human-approved" }, actor: { login: "johnrees", type: "User" }, performed_via_github_app: null, created_at: CREATED };
-  const withRelease = { ...hold("success"), target_url: holdLink("johnrees/widget", 12, HELD_POLICY, "main", OLD, 777) };
-  expect(await dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ config: HELD, labels: ["human-approved"], events: [released], status: [withRelease] as never }).io, calls))).toBe(0);
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ config: HELD, events: [released, { ...released, id: 778, event: "unlabeled" }], status: [withRelease] as never }).io, calls)))).toContain("its release now");
-  calls.length = 0;
-  // Nor one judged against another base: retargeted, the pull request's diff is another.
-  expect(await merge([{ ...hold("success"), target_url: holdLink("johnrees/widget", 12, HELD_POLICY, "staging", OLD, null) }])).toContain("was not judged for this pull request against main, its merge base, its hold, and its release now");
-  const retargeted = world({ base: "staging", config: HELD, status: [hold("success")] as never });
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(retargeted.io, calls)))).toContain("was not judged for this pull request against staging, its merge base, its hold, and its release now");
+  // A status on the head is any pull request's with that head: only one linking this pull request clears it.
+  expect(await merge([holdStatusOf("success", { pr: 13 })])).toContain("(the latest agent-hold on it is another pull request's (https://github.com/johnrees/widget/pull/13))");
+  expect(await merge([{ ...holdStatusOf("success"), target_url: undefined }])).toContain("(no link)");
   // The REST merge and the GraphQL merge are held alike.
-  expect(await merge([hold("failure")], ["api", "-X", "PUT", "repos/johnrees/widget/pulls/12/merge"])).toContain("is not cleared by agent-hold");
+  expect(await merge([holdStatusOf("failure")], ["api", "-X", "PUT", "repos/johnrees/widget/pulls/12/merge"])).toContain("is not cleared by agent-hold");
   const graphql = `mutation { mergePullRequest(input: {pullRequestId: "PR_12", expectedHeadOid: "${HEAD}"}) { x } }`;
-  expect(await merge([hold("failure")], ["api", "graphql", "-f", `query=${graphql}`])).toContain("is not cleared by agent-hold");
+  expect(await merge([holdStatusOf("failure")], ["api", "graphql", "-f", `query=${graphql}`])).toContain("is not cleared by agent-hold");
   expect(calls).toEqual([]);
-  expect(await dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ config: HELD, status: [hold("success")] as never }).io, calls))).toBe(0);
+  expect(await dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ config: HELD, status: [holdStatusOf("success")] as never }).io, calls))).toBe(0);
   // Without hold in the config, agent-hold is not looked for.
-  expect(await dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ status: [hold("failure")] as never }).io, calls))).toBe(0);
+  expect(await dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ status: [holdStatusOf("failure")] as never }).io, calls))).toBe(0);
   expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD}`, `gh pr merge 12 --match-head-commit ${HEAD}`]);
 });
 
-test("--auto, or GraphQL enablePullRequestAutoMerge, passes only where the ruleset requires agent-hold from GitHub Actions, which auto-merge then waits for, whatever agent-hold reads now", async () => {
+test("the merge guard reads the hold's label and the owner's release live, so one added, or withdrawn, while its run waits still counts", async () => {
   const here = parseRepo("johnrees/widget");
   const calls: string[] = [];
-  const failing = [{ context: "agent-hold", state: "failure", description: "held: touches `schema/**` (schema/a.json); John adds `human-approved`", creator: ACTIONS, target_url: holdLink("johnrees/widget", 12, HELD_POLICY, "main", OLD, null) }];
-  const passing = [{ ...failing[0], state: "success", description: "not held" }];
+  const merge = async (status: unknown[], extra: World = {}, args = ["pr", "merge", "12"]) =>
+    gateRefusal(dispatchGh(args, here, mergeDeps(world({ config: HELD, status: status as never, ...extra }).io, calls)));
+  const added = { id: 900, event: "labeled", label: { name: "needs-human" }, actor: { login: "johnrees", type: "User" }, performed_via_github_app: { id: 5085898 }, created_at: CREATED };
+  expect(await merge([holdStatusOf("success")], { labels: ["needs-human"], events: [added] })).toBe(`pull request #12 is held: \`needs-human\` on #12; ${RELEASING}`);
+  expect(await merge([holdStatusOf("success")], { issueLabels: ["needs-human"], issueEvents: [added] }, ["pr", "merge", "12", "--auto"])).toContain("is held: `needs-human` on #7");
+  expect(await merge([holdStatusOf("success")], { events: [added, { ...added, id: 901, event: "unlabeled", performed_via_github_app: null }] })).toContain("is held: `needs-human` came off #12, which releases nothing");
+  // The owner's own release of this head, never edited, releases the label hold and lets a status that leans on it stand.
+  const release = { id: 61, user: { login: "johnrees" }, performed_via_github_app: null, created_at: "2026-10-11T00:00:00Z", updated_at: "2026-10-11T00:00:00Z", body: releaseLine(HEAD) };
+  expect(await dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ config: HELD, labels: ["needs-human"], events: [added], comments: [release], status: [holdStatusOf("success", { released: true })] as never }).io, calls))).toBe(0);
+  expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD}`]);
+  // Withdrawn (deleted, edited, or of another head), the status it passed on clears nothing.
+  expect(await merge([holdStatusOf("success", { released: true })])).toContain("(it passed on johnrees's release of aaaaaaaa, which no longer stands)");
+  expect(await merge([holdStatusOf("success", { released: true })], { comments: [{ ...release, updated_at: "2026-10-12T00:00:00Z" }] })).toContain("which no longer stands");
+  expect(await merge([holdStatusOf("success", { released: true })], { comments: [{ ...release, body: releaseLine(OLD) }] })).toContain("which no longer stands");
+  expect(await merge([holdStatusOf("success", { released: true })], { comments: [{ ...release, performed_via_github_app: { id: 5085898 } }] })).toContain("which no longer stands");
+});
+
+test("--auto, or GraphQL enablePullRequestAutoMerge, passes a hold only where the ruleset requires agent-hold from GitHub Actions, which auto-merge then waits for", async () => {
+  const here = parseRepo("johnrees/widget");
+  const calls: string[] = [];
+  const failing = [{ ...holdStatusOf("failure"), description: "held: touches `schema/**` (schema/a.json); John releases aaaaaaaa" }];
   const requires = (check: Record<string, unknown>) => [{ type: "required_status_checks", parameters: { required_status_checks: [check] } }];
   const auto = (rules: unknown[], status: unknown[] = failing) => mergeDeps(world({ config: HELD, status: status as never, rules }).io, calls);
-  const unwaited = "`--auto` cannot wait for agent-hold on pull request #12: main's rules do not require agent-hold from GitHub Actions, so a hold that comes later would not stop the merge; merge once agent-hold passes, or ask John to require it";
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto"], here, auto([])))).toBe(unwaited);
-  // Passing now is not enough: a hold that comes after auto-merge is on would not stop GitHub merging.
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto"], here, auto([], passing)))).toBe(unwaited);
-  // A requirement any App's status meets (an agent could set it) is not enough either.
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto"], here, auto(requires({ context: "agent-hold" }))))).toBe(unwaited);
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto"], here, auto([])))).toBe(
+    `pull request #12's head aaaaaaaa is not cleared by agent-hold (agent-hold failed: held: touches \`schema/**\` (schema/a.json); John releases aaaaaaaa); \`--auto\` would not wait for it, since main's rules do not require agent-hold from GitHub Actions; ${RELEASING}, and an agent merges once agent-hold passes`,
+  );
+  // A requirement any App's status meets (an agent could set it) is not enough.
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto"], here, auto(requires({ context: "agent-hold" }))))).toContain("`--auto` would not wait for it");
   const enable = (oid: string) => `mutation { enablePullRequestAutoMerge(input: {pullRequestId: "PR_12", expectedHeadOid: "${oid}"}) { clientMutationId } }`;
-  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=${enable(HEAD)}`], here, auto([], passing)))).toBe(unwaited);
+  expect(await gateRefusal(dispatchGh(["api", "graphql", "-f", `query=${enable(HEAD)}`], here, auto([])))).toContain("`--auto` would not wait for it");
   expect(calls).toEqual([]);
   const enforced = requires({ context: "agent-hold", integration_id: 15368 });
-  // With the ruleset requiring it, GitHub waits on the head's agent-hold: only once this pull request's own, under the hold now, is there.
-  const theirs = [{ ...failing[0], state: "success", target_url: holdLink("johnrees/widget", 13, HELD_POLICY, "main", OLD, null) }];
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto"], here, auto(enforced, theirs)))).toContain("`--auto` would wait on another pull request's agent-hold on #12's head aaaaaaaa");
-  expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto"], here, auto(enforced, [])))).toContain("(no agent-hold status from GitHub Actions)");
   expect(await dispatchGh(["pr", "merge", "12", "--auto"], here, auto(enforced))).toBe(0);
   expect(await dispatchGh(["api", "graphql", "-f", `query=${enable(HEAD)}`], here, auto(enforced))).toBe(0);
-  // A direct merge still needs agent-hold passed, whatever the ruleset requires.
+  // Passing now, auto-merge needs no ruleset; a direct merge still needs agent-hold passed, whatever the ruleset requires.
+  expect(await dispatchGh(["pr", "merge", "12", "--auto"], here, auto([], [holdStatusOf("success")]))).toBe(0);
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, auto(enforced)))).toContain("is not cleared by agent-hold");
-  expect(calls).toEqual([`gh pr merge 12 --auto --match-head-commit ${HEAD}`, `gh api graphql -f query=${enable(HEAD)}`]);
+  expect(calls).toEqual([`gh pr merge 12 --auto --match-head-commit ${HEAD}`, `gh api graphql -f query=${enable(HEAD)}`, `gh pr merge 12 --auto --match-head-commit ${HEAD}`]);
 });
 
 test("gh pr merge names its pull request as gh does, skipping flag values, and --admin is always seen", () => {

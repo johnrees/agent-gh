@@ -14,19 +14,15 @@ import {
   eventTarget,
   type FoundMarker,
   HOLD_CONTEXT,
-  labelHold,
-  holdLink,
-  holdNeeds,
   holdStatus,
-  releaseRunMatches,
   type HoldThread,
   labelEvents,
-  personRelease,
+  labelHold,
+  lastAdded,
+  postedBy,
   markerFor,
   passes,
-  type ReleaseRecord,
-  releaseMarker,
-  reservedFiles,
+  headRelease,
   reviewStatus,
   type Status,
   validMarkers,
@@ -136,9 +132,8 @@ const fetchPair = async (io: StatusIo, number: number, head: string, mergeBase: 
 
 /**
  * Every file `head` changes from `mergeBase`, as git names them (both names
- * of a rename): read from the same two commits the status is judged and
- * fingerprinted by, never a list GitHub may have drawn from another moment,
- * and with no cap on how many.
+ * of a rename): read from the two commits themselves, for this head alone,
+ * with no cap on how many.
  */
 const changedFiles = async (io: StatusIo, mergeBase: string, head: string): Promise<ChangedFile[]> => {
   const out = await io.git(["diff", "--name-status", "-M", "-z", "--no-ext-diff", mergeBase, head]);
@@ -158,24 +153,6 @@ const changedFiles = async (io: StatusIo, mergeBase: string, head: string): Prom
   return files;
 };
 
-/**
- * The reserved files' patch id at `head` from `mergeBase` (null for none),
- * both fetched: `git patch-id --verbatim` (git 2.42 or later) of their diff,
- * read untrimmed, so it ignores line numbers (a rebase keeps it) but no
- * whitespace, which can change what a file means (a space inside a string).
- */
-const reservedPatchId = async (io: StatusIo, mergeBase: string, head: string, paths: readonly string[]): Promise<string | null> => {
-  const names = reservedFiles(await changedFiles(io, mergeBase, head), paths).names;
-  if (names.length === 0) return null;
-  const only = names.map((name) => `:(literal)${name}`);
-  const diff = await io.git(["diff", "--no-color", "--no-ext-diff", "-M", "--src-prefix=a/", "--dst-prefix=b/", mergeBase, head, "--", ...only], undefined, true);
-  if (diff === undefined) throw new Failure(STAGE, `could not diff ${head.slice(0, 8)}'s reserved paths`);
-  if (diff === "") return null;
-  const id = (await io.git(["patch-id", "--verbatim"], diff))?.split(" ")[0];
-  if (id === undefined || !/^[0-9a-f]{40}$/.test(id)) throw new Failure(STAGE, "git patch-id --verbatim gave no id for the reserved paths' diff; it needs git 2.42 or later");
-  return id;
-};
-
 /** The other open pull requests here whose head is `head`. */
 const sharingHead = async (io: ApiIo, number: number, head: string): Promise<number[]> =>
   (await everyPage(io, STAGE, `${repoPath(io)}/commits/${head}/pulls`, 3))
@@ -184,14 +161,12 @@ const sharingHead = async (io: ApiIo, number: number, head: string): Promise<num
     .map((item) => item.number as number);
 
 /**
- * agent-hold for `pr`'s head (holdStatus), from the labels and label events of
- * the pull request and every issue it closes, its files, its release
- * records, the open pull requests sharing its head, and, only when a
- * person's release has to be checked, the reserved files' diff, read from
- * git. `labeled` is this run's own `labeled` event, if it has one: when it is
- * the release's, it binds the release to the head that event gave.
+ * agent-hold for `pr`'s head (holdStatus), judged afresh: from the labels and
+ * label events of the pull request and every issue it closes, its comments
+ * (the person's release), the open pull requests sharing its head, and its
+ * changed files, read from git between its merge base and its head.
  */
-const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "agent" | "bot" | "person", labeled: LabeledEvent | undefined): Promise<{ readonly status: Status; readonly record?: ReleaseRecord }> => {
+const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "agent" | "bot" | "person"): Promise<Status> => {
   const threads: (HoldThread & { readonly repo: Repo; readonly number: number })[] = [
     { ref: `#${pr.number}`, repo: io.repo, number: pr.number, labels: pr.labels, events: labelEvents(await issueEvents(io, io.repo, pr.number)) },
   ];
@@ -199,54 +174,38 @@ const deriveHold = async (io: StatusIo, pr: Pull, hold: HoldConfig, author: "age
     const labels = labelNames(record(await get(io, STAGE, `/repos/${slug(issue.repo)}/issues/${issue.number}`)).labels);
     threads.push({ ref: threadRef(io, issue.repo, issue.number), repo: issue.repo, number: issue.number, labels, events: labelEvents(await issueEvents(io, issue.repo, issue.number)) });
   }
+  const owner = await repoOwner(io, STAGE);
   const prComments = await issueComments(io, STAGE, io.repo, pr.number, `#${pr.number}`);
   // The ask, on each thread the label is on, names the hold.
-  let owner: string | undefined;
   for (const [index, thread] of threads.entries()) {
     if (!thread.labels.some((label) => sameLabel(label, hold.label))) continue;
-    const added = thread.events.findLast((event) => event.event === "labeled" && sameLabel(event.label, hold.label));
+    const added = lastAdded(thread.events, hold.label);
     if (added === undefined) continue;
-    owner ??= await repoOwner(io, STAGE);
     const comments = index === 0 ? prComments : await issueComments(io, STAGE, thread.repo, thread.number, thread.ref);
     threads[index] = { ...thread, ask: askFor(comments, added.at, owner, agentApps().map((app) => app.id)).line };
   }
-  // One merge base, read once: the files, the patch ids, and the fingerprint are all judged against it.
-  const mergeBase = await mergeBaseOf(io, pr.base, pr.head);
   const reads = author !== "person" && hold.paths.length > 0;
-  if (reads) await fetchPair(io, pr.number, pr.head, mergeBase);
-  const files = reads ? await changedFiles(io, mergeBase, pr.head) : [];
-  // A comment edited since it was posted (its updated_at moved; a reaction leaves it) carries no trusted record.
-  const comments = prComments.map((comment) => ({ author: comment.author, body: comment.body, edited: comment.updatedAt !== comment.createdAt }));
-  const release = threads[0] === undefined ? undefined : personRelease(threads[0].labels, threads[0].events, hold.releaseLabel);
-  const url = holdLink(slug(io.repo), pr.number, hold, pr.base, mergeBase, release?.id ?? null);
-  const input = { hold, author, number: pr.number, url, threads, files, comments, head: pr.head, base: pr.base, sharedWith: await sharingHead(io, pr.number, pr.head) };
-  const needs = holdNeeds(input);
-  // Only the run of the release's own `labeled` event records it, at the head that event gave.
-  const own = needs !== undefined && labeled !== undefined && releaseRunMatches(threads[0]?.events ?? [], hold.releaseLabel, needs.release, labeled.at);
-  if (needs === undefined || needs.record === "edited" || (needs.record === undefined && !own)) return holdStatus(input);
-  const pathsPatchId = await reservedPatchId(io, mergeBase, pr.head, hold.paths);
-  // The release's diff is the one its event showed: that head, against the base branch's commit then, whatever has merged into it since.
-  let releaseRun: { readonly head: string; readonly base: string; readonly pathsPatchId: string | null } | undefined;
-  if (needs.record === undefined && own) {
-    const released = await mergeBaseOf(io, labeled.baseSha, labeled.head);
-    await fetchPair(io, pr.number, labeled.head, released);
-    releaseRun = { head: labeled.head, base: labeled.base, pathsPatchId: await reservedPatchId(io, released, labeled.head, hold.paths) };
+  let files: ChangedFile[] = [];
+  if (reads) {
+    const mergeBase = await mergeBaseOf(io, pr.base, pr.head);
+    await fetchPair(io, pr.number, pr.head, mergeBase);
+    files = await changedFiles(io, mergeBase, pr.head);
   }
-  return holdStatus({ ...input, pathsPatchId, ...(releaseRun === undefined ? {} : { releaseRun }) });
+  return holdStatus({
+    hold, author, repo: slug(io.repo), number: pr.number, owner, threads, files, head: pr.head,
+    comments: prComments.map(postedBy), sharedWith: await sharingHead(io, pr.number, pr.head),
+  });
 };
 
-/** A pull request's `labeled` event, which this run handles: the label, the head and base branch (and its commit) GitHub gave the event, and when (the pull request's `updated_at` then). */
-export type LabeledEvent = { readonly label: string; readonly head: string; readonly base: string; readonly baseSha: string; readonly at: string };
-
-/** What a run derives for a pull request: the statuses for its head, a release record to write first, and the hold it judged by. */
-export type Derived = { readonly head: string; readonly statuses: readonly Status[]; readonly record?: ReleaseRecord; readonly hold?: HoldConfig };
+/** What a run derives for a pull request: the statuses for its head, and the hold it judged by. */
+export type Derived = { readonly head: string; readonly statuses: readonly Status[]; readonly hold?: HoldConfig };
 
 /**
  * The statuses for pull request `number`'s current head (agent-hold too when
  * its base branch's config has `hold`); undefined when it is closed, or its
  * base branch has no review config.
  */
-export const deriveStatuses = async (io: StatusIo, number: number, labeled?: LabeledEvent): Promise<Derived | undefined> => {
+export const deriveStatuses = async (io: StatusIo, number: number): Promise<Derived | undefined> => {
   const pr = await pull(io, STAGE, number);
   if (!pr.open) {
     io.print(`agent-gh: #${number} is closed; no status set`);
@@ -265,13 +224,12 @@ export const deriveStatuses = async (io: StatusIo, number: number, labeled?: Lab
     apps,
   );
   // A bot that is no family App (Dependabot) is not an agent, but an agent could merge its pull request: reserved paths hold it.
-  const own = config.hold !== undefined && labeled !== undefined && sameLabel(labeled.label, config.hold.releaseLabel) ? labeled : undefined;
-  const held = config.hold === undefined ? undefined : await deriveHold(io, pr, config.hold, agent ? "agent" : pr.authorType === "Bot" ? "bot" : "person", own);
-  const hold = held === undefined ? {} : { hold: config.hold, ...(held.record === undefined ? {} : { record: held.record }) };
+  const held = config.hold === undefined ? undefined : await deriveHold(io, pr, config.hold, agent ? "agent" : pr.authorType === "Bot" ? "bot" : "person");
+  const hold = config.hold === undefined ? {} : { hold: config.hold };
   if (!agent) {
     const skip = (context: string): Status => ({ context, state: "success", description: "not an agent PR", targetUrl: undefined });
     const review = reviewStatus({ number, agent, waivedBy: undefined, current: undefined, carried: undefined, policy: config });
-    return { head: pr.head, statuses: [review, skip(THREADS_CONTEXT), ...(held === undefined ? [] : [held.status])], ...hold };
+    return { head: pr.head, statuses: [review, skip(THREADS_CONTEXT), ...(held === undefined ? [] : [held])], ...hold };
   }
   const owner = await repoOwner(io, STAGE);
   const waivedBy = await waiver(io, STAGE, pr, config);
@@ -280,7 +238,7 @@ export const deriveStatuses = async (io: StatusIo, number: number, labeled?: Lab
   const carried = current === undefined && waivedBy === undefined ? await carriedForward(io, number, pr.base, pr.head, markers, config) : undefined;
   const review = reviewStatus({ number, agent, waivedBy, current, carried, policy: config });
   const threads = threadsStatus(await pullThreads(io, STAGE, pr, owner));
-  return { head: pr.head, statuses: [review, { context: THREADS_CONTEXT, ...threads }, ...(held === undefined ? [] : [held.status])], ...hold };
+  return { head: pr.head, statuses: [review, { context: THREADS_CONTEXT, ...threads }, ...(held === undefined ? [] : [held])], ...hold };
 };
 
 /**
@@ -324,27 +282,6 @@ const WRITE_ROUNDS = 3;
 const NO_COMMENT = "the workflow needs `issues: write` and, on a pull request, `pull-requests: write`; a fork's pull_request_review run is read-only";
 
 /**
- * Posts a person's release record on the pull request, as
- * `github-actions[bot]`, before the status it lets pass is set. A token that
- * may not comment (a fork's run) is reported, and nothing is set.
- */
-const writeRecord = async (io: StatusIo, number: number, value: ReleaseRecord): Promise<boolean> => {
-  const body = [
-    `${value.by}'s \`${HOLD_CONTEXT}\` release binds to ${value.head.slice(0, 8)}'s reserved paths: a change to them holds this pull request again.`,
-    "",
-    releaseMarker(value),
-  ].join("\n");
-  const { status: code } = await request(io.api, STAGE, "POST", `${repoPath(io)}/issues/${number}/comments`, io.token, { body });
-  if (code === 403 || code === 404) {
-    io.print(`agent-gh: this run's token may not comment (HTTP ${code}: ${NO_COMMENT}), so ${value.by}'s release of #${number} is not recorded yet`);
-    return false;
-  }
-  if (code < 200 || code >= 300) throw new Failure(STAGE, `HTTP ${code} from POST ${repoPath(io)}/issues/${number}/comments`);
-  io.print(`agent-gh: recorded ${value.by}'s release of #${number} at ${value.head.slice(0, 8)}`);
-  return true;
-};
-
-/**
  * Derives and sets pull request `number`'s statuses, then derives them again:
  * when the pull request changed while this run wrote (a new head, or a comment
  * whose own run, in another concurrency group, wrote first), it writes what
@@ -352,12 +289,11 @@ const writeRecord = async (io: StatusIo, number: number, value: ReleaseRecord): 
  * a newer one: the last write of any run follows a read made after it.
  * Returns the last derivation.
  */
-const settle = async (io: StatusIo, number: number, labeled: LabeledEvent | undefined): Promise<Derived | undefined> => {
-  let derived = await deriveStatuses(io, number, labeled);
+const settle = async (io: StatusIo, number: number): Promise<Derived | undefined> => {
+  let derived = await deriveStatuses(io, number);
   for (let round = 1; derived !== undefined; round++) {
-    if (derived.record !== undefined && !(await writeRecord(io, number, derived.record))) return derived;
     if (!(await writeStatuses(io, derived.head, derived.statuses))) return derived;
-    const now = await deriveStatuses(io, number, labeled);
+    const now = await deriveStatuses(io, number);
     if (now === undefined || sameStatuses(now, derived)) return now;
     if (round >= WRITE_ROUNDS) {
       io.print(`agent-gh: #${number} kept changing while this run wrote its statuses; the next event's run sets them`);
@@ -407,39 +343,41 @@ const push = async (io: StatusIo, title: string, click: string, line: string): P
 
 /**
  * Calls the repository owner in on issue or pull request `number`, here,
- * while the hold's label holds it (`labelHold`): once for the event that last added the
- * label (marked in the comment, so a rerun, or any later run, never posts
- * it twice), and never for a label the owner added himself. The comment, as
+ * while the hold's label holds it (`labelHold`; for a pull request, until he
+ * releases its `head`): once for the event that last added the label (marked
+ * in the comment, so a rerun, or any later run, never posts it twice), and
+ * never for a label the owner added himself. The comment, as
  * `github-actions[bot]`, mentions him, which notifies him where an agent's
  * mention (posted as him) would not; a newly posted one is also pushed to
  * the NTFY_URL secret's topic.
  */
-const callOwner = async (io: StatusIo, number: number, hold: HoldConfig): Promise<void> => {
+const callOwner = async (io: StatusIo, number: number, hold: HoldConfig, head: string | undefined): Promise<void> => {
   const issue = record(await get(io, STAGE, `${repoPath(io)}/issues/${number}`));
   const events = labelEvents(await issueEvents(io, io.repo, number));
+  const owner = await repoOwner(io, STAGE);
+  const comments = await issueComments(io, STAGE, io.repo, number, `#${number}`);
+  const release = head === undefined ? undefined : headRelease(comments.map(postedBy), owner, head);
   // Whether or not the label is still on: one added and removed before any run read it holds all the same, so it calls all the same.
-  if (labelHold({ ref: `#${number}`, labels: labelNames(issue.labels), events }, hold, undefined) === undefined) return;
-  const added = events.findLast((event) => event.event === "labeled" && sameLabel(event.label, hold.label));
+  if (labelHold({ ref: `#${number}`, labels: labelNames(issue.labels), events }, hold, release) === undefined) return;
+  const added = lastAdded(events, hold.label);
   if (added === undefined) {
     io.print(`agent-gh: #${number} has \`${hold.label}\` but GitHub lists no event that added it; no call`);
     return;
   }
-  const owner = await repoOwner(io, STAGE);
   if (added.person && added.actor.toLowerCase() === owner.toLowerCase()) {
     io.print(`agent-gh: ${owner} added \`${hold.label}\` to #${number} himself; no call`);
     return;
   }
-  const comments = await issueComments(io, STAGE, io.repo, number, `#${number}`);
   if (called(comments, added.id)) return;
   const ask = askFor(comments, added.at, owner, agentApps().map((app) => app.id));
-  const body = callBody({ owner, ref: `#${number}`, hold, ask, event: added.id });
+  const body = callBody({ owner, ref: `#${number}`, hold, ask, event: added.id, ...(head === undefined ? {} : { head }) });
   const { status: code, value } = await request(io.api, STAGE, "POST", `${repoPath(io)}/issues/${number}/comments`, io.token, { body });
   if (code === 403 || code === 404) {
     io.print(`agent-gh: this run's token may not comment (HTTP ${code}: ${NO_COMMENT}); a later run calls ${owner} in`);
     return;
   }
   if (code < 200 || code >= 300) throw new Failure(STAGE, `HTTP ${code} from POST ${repoPath(io)}/issues/${number}/comments`);
-  // A labeled run has a concurrency group of its own, so another run may have called at the same moment: the earliest call stands, and a later one removes itself unpushed.
+  // Each thread's calls come from its own concurrency group's runs; should two land at once all the same, the earliest stands, and a later one removes itself unpushed.
   const id = record(value).id;
   const calls = (await issueComments(io, STAGE, io.repo, number, `#${number}`)).filter((comment) => called([comment], added.id)).map((comment) => comment.id);
   if (Number.isSafeInteger(id) && calls.some((other) => other < (id as number))) {
@@ -492,48 +430,34 @@ const defaultHold = async (io: StatusIo): Promise<HoldConfig | undefined> => {
  * Then, where the config has `hold`, calls the owner in on the thread the
  * event names while the hold's label holds it. A pull request that cannot be
  * judged is set to error and the rest still settled, the call still made,
- * before the run fails. A pull request's `labeled` event is passed on, so
- * the release label's own run can record its release.
+ * before the run fails.
  */
 export const statusCommand = async (io: StatusIo, event: { readonly name: string; readonly payload: unknown }, pr: number | undefined): Promise<void> => {
   const target = pr === undefined ? eventTarget(event.name, event.payload) : { pull: pr };
   if (target === undefined) throw new Failure(STAGE, `a ${event.name} event names no pull request; run it from the agent-review workflow's events, or pass --pr N`);
   const numbers = "pull" in target ? [target.pull] : await closingPulls(io, target.issue);
   if (numbers.length === 0) io.print(`agent-gh: no open pull request closes #${"issue" in target ? target.issue : ""}; no status set`);
-  const labeled = pr === undefined && "pull" in target ? labeledEvent(event.payload) : undefined;
   // One pull request that cannot be judged never leaves the others as they were, nor stops the call: each is settled, and the run fails after.
   let failure: unknown;
   for (const number of numbers) {
     try {
-      await settle(io, number, labeled);
+      await settle(io, number);
     } catch (error) {
       await withdraw(io, number, error);
       failure ??= error;
     }
   }
   try {
-    const hold = "pull" in target ? await pullHold(io, target.pull) : await defaultHold(io);
-    if (hold !== undefined) await callOwner(io, "pull" in target ? target.pull : target.issue, hold);
+    if ("pull" in target) {
+      const open = await pull(io, STAGE, target.pull);
+      const hold = open.open ? (await readReviewConfig(io, STAGE, open.base))?.hold : undefined;
+      if (hold !== undefined) await callOwner(io, target.pull, hold, open.head);
+    } else {
+      const hold = await defaultHold(io);
+      if (hold !== undefined) await callOwner(io, target.issue, hold, undefined);
+    }
   } catch (error) {
     failure ??= error;
   }
   if (failure !== undefined) throw failure;
-};
-
-/** The event's own `labeled` change to a pull request, with the head GitHub gave it; undefined for any other event. */
-const labeledEvent = (payload: unknown): LabeledEvent | undefined => {
-  const event = record(payload);
-  const head = text(record(record(event.pull_request).head).sha);
-  const label = text(record(event.label).name);
-  const at = text(record(event.pull_request).updated_at);
-  const base = text(record(record(event.pull_request).base).ref);
-  const baseSha = text(record(record(event.pull_request).base).sha);
-  const valid = event.action === "labeled" && /^[0-9a-f]{40}$/.test(head) && /^[0-9a-f]{40}$/.test(baseSha) && label !== "" && base !== "" && !Number.isNaN(Date.parse(at));
-  return valid ? { label, head, base, baseSha, at } : undefined;
-};
-
-/** The hold on an open pull request's base branch's config. */
-const pullHold = async (io: StatusIo, number: number): Promise<HoldConfig | undefined> => {
-  const pr = await pull(io, STAGE, number);
-  return pr.open ? (await readReviewConfig(io, STAGE, pr.base))?.hold : undefined;
 };
