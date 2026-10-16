@@ -45,6 +45,8 @@ export type Stage =
   | "checking the review"
   | "checking the merge"
   | "checking the push"
+  | "checking the release"
+  | "granting a release"
   | "notifying"
   | "replying"
   | "reviewing"

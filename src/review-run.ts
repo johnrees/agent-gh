@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { type GrantMarker, GRANT_LABEL, grantCommand, grantProblem, parseGrant, validTag } from "./allow.ts";
 import { agentApps, REGISTRY } from "./config.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { familyNames } from "./family.ts";
 import { type Api, request } from "./github.ts";
 import { HARNESSES, type Env } from "./harness.ts";
 import { parseRemoteUrl, parseRepo, type Repo, slug } from "./repo.ts";
-import { checkState, pushedBranches, requiredChecks } from "./merge.ts";
+import { absent, checkState, type PushedTag, pushedRefs, requiredChecks } from "./merge.ts";
 import { type ApiIo, describeRequired, everyPage, pullThreads, repoOwner } from "./threads-run.ts";
 import { type MarkerPost, validMarkers } from "./status.ts";
 import {
@@ -28,6 +29,7 @@ import {
   fullPrompt,
   graphqlMerges,
   graphqlRefWrites,
+  graphqlReleaseRefusal,
   inlineComment,
   mergeCommand,
   outcomeSummary,
@@ -41,6 +43,9 @@ import {
   type PullRequest,
   type ReadyTarget,
   readyTarget,
+  type ReleaseCommand,
+  releaseCommand,
+  RELEASE_GRANT,
   REVIEW_SCHEMA,
   type Review,
   reviewBody,
@@ -424,26 +429,204 @@ export const gatePush = async (io: ReviewIo, branches: readonly string[]): Promi
  * `agent-gh guard pre-push` in an agent session: git's remote URL argument
  * and the hook's stdin. A push that moves a held branch on GitHub is
  * refused, and so is one whose repository or rules cannot be determined. A
- * remote on a local path is not GitHub, and is not held.
+ * new tag needs John's grant (`gateRelease`), at the commit it points at;
+ * deleting or moving a tag is always refused. A remote on a local path is
+ * not GitHub, and is not held.
  */
 export const guardPush = async (
   url: string | undefined,
   stdin: string,
   deps: Pick<GhDispatch, "withToken" | "io">,
 ): Promise<void> => {
-  const branches = pushedBranches(stdin);
-  if (branches === undefined) throw new Failure(PUSH_STAGE, "git's pre-push lines are not in the form agent-gh reads");
-  if (branches.length === 0) return;
+  const refs = pushedRefs(stdin);
+  if (refs === undefined) throw new Failure(PUSH_STAGE, "git's pre-push lines are not in the form agent-gh reads");
+  const tags = refs.tags.filter((tag) => tag.local !== tag.remote);
+  if (refs.branches.length === 0 && tags.length === 0) return;
   if (url === undefined) throw new Failure(PUSH_STAGE, "the pre-push hook passed no remote URL; run `agent-gh guard pre-push \"$@\"` from it");
   const repo = parseRemoteUrl(url);
   if (repo === undefined) {
     if (url.startsWith("/") || url.startsWith(".") || url.startsWith("file://")) return;
     throw new Failure(PUSH_STAGE, "cannot tell which GitHub repository this push goes to; use a https://github.com/ or git@github.com: remote");
   }
+  for (const tag of tags) {
+    if (absent(tag.local)) throw new Failure(RELEASE_STAGE, tagRefusal(tag.tag, repo, "delete"));
+    if (!absent(tag.remote)) throw new Failure(RELEASE_STAGE, `\`${tag.tag}\` already exists in ${slug(repo)}, and ${tagRefusal(tag.tag, repo, "move")}`);
+  }
   await deps.withToken(repo, async (env) => {
-    await gatePush(deps.io(repo, env), branches);
+    const io = deps.io(repo, env);
+    await gatePush(io, refs.branches);
+    for (const tag of tags) await gateRelease(io, tag.tag, () => localCommit(io, tag));
     return 0;
   });
+};
+
+const RELEASE_STAGE = "checking the release";
+
+/** Why an agent never moves or deletes a tag, naming what a grant does allow. */
+const tagRefusal = (tag: string, repo: Repo | undefined, what: "move" | "delete" | "move or delete"): string =>
+  `agents never ${what} a tag, grant or not (\`${tag}\`${repo === undefined ? "" : ` in ${slug(repo)}`}): \`${grantCommand(tag, repo)}\` lets them create a new tag once and write its release; ask John to ${what} this one himself`;
+
+/** The commit a pushed tag points at, peeled from the local object git sends. */
+const localCommit = async (io: ReviewIo, tag: PushedTag): Promise<string> => {
+  const commit = await io.git(["rev-parse", "--verify", "--quiet", `${tag.local}^{commit}`]);
+  if (commit === undefined || !/^[0-9a-f]{40}$/i.test(commit)) throw new Failure(RELEASE_STAGE, `cannot tell which commit tag \`${tag.tag}\` points at`);
+  return commit.toLowerCase();
+};
+
+/**
+ * Passes only when John has granted `tag` in the io's repository (allow.ts):
+ * an open issue labelled GRANT_LABEL, opened by the repository's owner with
+ * no App under GRANT_HOURS ago, never edited, closed, or transferred since,
+ * whose marker names the tag and, when it names a commit, the one `commit`
+ * gives for it (where the tag points or will point; omitted for a write that
+ * places no tag). Returns that grant; otherwise refuses, naming the command
+ * John runs.
+ */
+export const gateRelease = async (io: ReviewIo, tag: string, commit?: (granted: string) => Promise<string>): Promise<GrantMarker> => {
+  const stage = RELEASE_STAGE;
+  const owner = await repoOwner(io, stage);
+  const issues = await everyPage(io, stage, `${repoPath(io)}/issues?state=open&labels=${encodeURIComponent(GRANT_LABEL)}&creator=${encodeURIComponent(owner)}`, 10);
+  const reasons: string[] = [];
+  for (const issue of issues.map(record)) {
+    const grant = parseGrant(text(issue.body));
+    if (grant === undefined || grant.tag !== tag || !Number.isSafeInteger(issue.number)) continue;
+    const number = issue.number as number;
+    const problem = grantProblem(issue, owner, Date.now()) ?? (await historyProblem(io, number));
+    if (problem !== undefined) {
+      reasons.push(`#${number} ${problem}`);
+      continue;
+    }
+    if (grant.sha !== null && commit !== undefined) {
+      const at = await commit(grant.sha);
+      if (at !== grant.sha) {
+        reasons.push(`#${number} grants it at ${grant.sha.slice(0, 8)}, but it points at ${at.slice(0, 8)}`);
+        continue;
+      }
+    }
+    io.print(`agent-gh: John's grant #${number} allows \`${tag}\` in ${slug(io.repo)}`);
+    return grant;
+  }
+  throw new Failure(
+    stage,
+    `John has not granted \`${tag}\` in ${slug(io.repo)}${reasons.length === 0 ? "" : ` (${reasons.join("; ")})`}, and agents push a tag or write a release only with his grant; ask John to run \`${grantCommand(tag, io.repo)}\``,
+  );
+};
+
+/** Why a grant issue's history voids it: an edit to its body, or a close, reopen, or transfer since it was opened. */
+const historyProblem = async (io: ReviewIo, number: number): Promise<string | undefined> => {
+  const query =
+    "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){lastEditedAt history:timelineItems(itemTypes:[CLOSED_EVENT,REOPENED_EVENT,TRANSFERRED_EVENT],first:1){totalCount}}}}";
+  const { value } = await call(io, RELEASE_STAGE, "POST", "/graphql", { query, variables: { owner: io.repo.owner, name: io.repo.name, number } });
+  const issue = record(record(record(value).data).repository).issue;
+  const count = record(record(issue).history).totalCount;
+  if (typeof issue !== "object" || issue === null || !Number.isSafeInteger(count)) throw new Failure(RELEASE_STAGE, `cannot read the history of grant #${number}`);
+  if (record(issue).lastEditedAt !== null) return "was edited after it was opened";
+  if ((count as number) > 0) return "was closed, reopened, or transferred since it was opened";
+  return undefined;
+};
+
+const HEX = /^[0-9a-f]{40}$/i;
+
+/** The commit a tag object or commit `sha` names, peeling annotated tags. */
+const peel = async (io: ReviewIo, type: unknown, sha: string, name: string): Promise<string> => {
+  let [kind, at] = [type, sha];
+  for (let depth = 0; kind === "tag" && HEX.test(at) && depth < 10; depth++) {
+    const object = record(record((await call(io, RELEASE_STAGE, "GET", `${repoPath(io)}/git/tags/${at}`)).value).object);
+    [kind, at] = [object.type, text(object.sha)];
+  }
+  if (kind !== "commit" || !HEX.test(at)) throw new Failure(RELEASE_STAGE, `\`${name}\` in ${slug(io.repo)} does not point at a commit agent-gh can find`);
+  return at.toLowerCase();
+};
+
+/** Where `tag` points on GitHub, as a commit; undefined when GitHub has no such tag. */
+const tagCommit = async (io: ReviewIo, tag: string): Promise<string | undefined> => {
+  const { status, value } = await call(io, RELEASE_STAGE, "GET", `${repoPath(io)}/git/ref/tags/${branchPath(tag)}`, undefined, [404, 409]);
+  if (status === 404 || status === 409) return undefined;
+  const ref = record(value);
+  const object = record(ref.object);
+  if (ref.ref !== `refs/tags/${tag}` || typeof object.sha !== "string") throw new Failure(RELEASE_STAGE, `cannot read where \`${tag}\` points in ${slug(io.repo)}`);
+  return peel(io, object.type, object.sha, tag);
+};
+
+/** The commit an object id names (an annotated tag's, peeled), where a new tag would point; refused when it names neither. */
+const objectCommit = async (io: ReviewIo, sha: string, tag: string): Promise<string> => {
+  if (!HEX.test(sha)) throw new Failure(RELEASE_STAGE, `cannot read the commit \`${tag}\` would point at; give its full sha`);
+  const annotated = await call(io, RELEASE_STAGE, "GET", `${repoPath(io)}/git/tags/${sha}`, undefined, [404, 422]);
+  if (annotated.status === 200) {
+    const object = record(record(annotated.value).object);
+    return peel(io, object.type, text(object.sha), tag);
+  }
+  const commit = await call(io, RELEASE_STAGE, "GET", `${repoPath(io)}/git/commits/${sha}`, undefined, [404, 422]);
+  if (commit.status === 200 && text(record(commit.value).sha).toLowerCase() === sha.toLowerCase()) return sha.toLowerCase();
+  throw new Failure(RELEASE_STAGE, `${sha.slice(0, 8)}, where \`${tag}\` would point, is no commit or tag in ${slug(io.repo)}`);
+};
+
+/** The commit a branch or commit names on GitHub, as a release's `--target` does. */
+const resolveCommit = async (io: ReviewIo, ref: string): Promise<string> => {
+  if (HEX.test(ref)) return ref.toLowerCase();
+  const found = validTag(ref) ? await call(io, RELEASE_STAGE, "GET", `${repoPath(io)}/commits/${branchPath(ref)}`, undefined, [404, 422]) : undefined;
+  const sha = text(record(found?.value).sha);
+  if (found?.status !== 200 || !HEX.test(sha)) throw new Failure(RELEASE_STAGE, `cannot find the commit \`${ref}\` names in ${slug(io.repo)}`);
+  return sha.toLowerCase();
+};
+
+/**
+ * The release guard for a write that names `tag`: John's grant must hold,
+ * and when it names a commit the tag must point there: where it points on
+ * GitHub, or, when the tag does not exist yet and the write can create it,
+ * where `creates` says it will (given the granted commit). Returns the
+ * granted commit to pin a new tag to, if any.
+ */
+const gateTag = async (io: ReviewIo, tag: string, creates?: (granted: string) => Promise<string>): Promise<string | undefined> => {
+  const existing = await tagCommit(io, tag);
+  if (existing !== undefined || creates === undefined) {
+    await gateRelease(io, tag, existing === undefined ? undefined : async () => existing);
+    return undefined;
+  }
+  return (await gateRelease(io, tag, creates)).sha ?? undefined;
+};
+
+/**
+ * `gh release` behind the release guard: a read runs as it is; `create`,
+ * `edit`, `upload`, and `delete-asset` need John's grant for their tag (and
+ * for the tag `edit --tag` moves the release to), and a tag they create is
+ * pinned to the granted commit with `--target`; `delete`, and a subcommand
+ * this release does not know, are refused.
+ */
+const dispatchRelease = async (args: readonly string[], release: ReleaseCommand, repo: Repo | undefined, deps: GhDispatch): Promise<number> => {
+  if (release.kind === "read") return deps.run(args);
+  const target = release.repo === undefined ? repo : parseRepo(release.repo);
+  if (target === undefined) throw new Failure(RELEASE_STAGE, `cannot tell which repository \`gh release\` writes to; pass -R OWNER/REPO (a release write needs ${RELEASE_GRANT})`);
+  if (release.kind === "unknown") {
+    throw new Failure(RELEASE_STAGE, `agent-gh does not know what \`gh release ${release.subcommand}\` writes, so it refuses it; create, edit, upload, and delete-asset run with ${RELEASE_GRANT}`);
+  }
+  const tag = release.tag;
+  if (release.subcommand === "delete") {
+    throw new Failure(RELEASE_STAGE, `agents never delete a release, grant or not${tag === undefined ? "" : ` (\`${tag}\` in ${slug(target)})`}: \`${grantCommand(tag ?? "<tag>", target)}\` lets them create and edit one; ask John to delete it himself`);
+  }
+  if (tag === undefined) {
+    throw new Failure(RELEASE_STAGE, `cannot read which tag \`gh release ${release.subcommand}\` names; give it first, as \`gh release ${release.subcommand} <tag>\` (it needs ${RELEASE_GRANT})`);
+  }
+  return deps.withToken(target, async (env) => {
+    const io = deps.io(target, env);
+    let pin: string | undefined;
+    if (release.subcommand === "create" || release.subcommand === "edit") {
+      const final = release.newTag ?? tag;
+      // An edit that moves the release to another tag needs a grant for both.
+      if (final !== tag) await gateTag(io, tag);
+      pin = await gateTag(io, final, async (granted) => (release.target === undefined ? granted : resolveCommit(io, release.target)));
+    } else await gateTag(io, tag);
+    return deps.runWith(pin === undefined ? args : withFlags(args, ["--target", pin]), env);
+  });
+};
+
+/** A release's tag and target, by its id, for a REST write to it. */
+const releaseOf = async (io: ReviewIo, id: number): Promise<{ readonly tag: string; readonly target: string | undefined }> => {
+  const { status, value } = await call(io, RELEASE_STAGE, "GET", `${repoPath(io)}/releases/${id}`, undefined, [404]);
+  const tag = text(record(value).tag_name);
+  if (status === 404 || tag === "") throw new Failure(RELEASE_STAGE, `cannot find release ${id} in ${slug(io.repo)}, whose tag needs ${RELEASE_GRANT}`);
+  const target = text(record(value).target_commitish);
+  return { tag, target: target === "" ? undefined : target };
 };
 
 /** Every item of a paginated response that reports its `total_count`, refusing one too long, or too short, to trust. */
@@ -489,14 +672,17 @@ export interface GhDispatch {
 
 /**
  * Runs a gh command, holding `gh pr ready` until its pull request's head is
- * reviewed and `gh pr merge` until its required checks pass. The gh shim
- * sends only agent sessions' gh here; a person's gh never reaches it.
+ * reviewed, `gh pr merge` until its required checks pass, and a release
+ * write until John grants its tag. The gh shim sends only agent sessions' gh
+ * here; a person's gh never reaches it.
  */
 export const dispatchGh = async (args: readonly string[], repo: Repo | undefined, deps: GhDispatch): Promise<number> => {
   const ready = readyTarget(args);
   const merge = ready === undefined ? mergeCommand(args) : undefined;
   const target = ready ?? merge?.target;
   if (target === undefined) {
+    const release = releaseCommand(args);
+    if (release !== undefined) return dispatchRelease(args, release, repo, deps);
     const api = apiCall(args);
     return api === undefined ? deps.run(args) : dispatchApi(args, api, repo, deps);
   }
@@ -528,22 +714,38 @@ const withFlags = (args: readonly string[], extra: readonly string[]): string[] 
 };
 
 /**
- * `gh api` behind the merge guard: a REST or GraphQL call that merges a pull
- * request runs only when `gh pr merge` would; one that merges outside a pull
- * request, or that the guard cannot read, is refused.
+ * `gh api` behind the merge and release guards: a REST or GraphQL call that
+ * merges a pull request runs only when `gh pr merge` would, and one that
+ * creates a tag or writes a release only when John has granted its tag; one
+ * that merges outside a pull request, moves or deletes a tag, approves a
+ * deployment, or that the guards cannot read, is refused.
  */
 const dispatchApi = async (args: readonly string[], api: ApiCall, repo: Repo | undefined, deps: GhDispatch): Promise<number> => {
   const plan = apiMerge(api);
   if (plan.kind === "none") return deps.run(args);
-  if (plan.kind === "refuse") throw new Failure(MERGE_STAGE, plan.reason);
+  if (plan.kind === "refuse") throw new Failure(plan.release === true ? RELEASE_STAGE : MERGE_STAGE, plan.reason);
+  if (plan.kind === "tag") {
+    const target = plan.repo === undefined ? repo : parseRepo(plan.repo);
+    if (plan.tag === "") throw new Failure(RELEASE_STAGE, `cannot tell which tag \`gh api\` writes to; agents never move or delete a tag, and a new one needs ${RELEASE_GRANT}`);
+    throw new Failure(RELEASE_STAGE, tagRefusal(plan.tag, target, "move or delete"));
+  }
+  if (plan.kind === "release") return dispatchReleaseApi(args, api, plan, repo, deps);
   if (plan.kind === "ref" || plan.kind === "ref-field") {
     const target = plan.repo === undefined ? repo : parseRepo(plan.repo);
     if (target === undefined) throw new Failure(PUSH_STAGE, "cannot tell which repository `gh api` writes to; name it in the endpoint");
     const named = plan.kind === "ref" ? plan.branch : await bodyField(api, plan.field, deps.readFile);
-    // A new ref that is not a branch carries no required checks.
+    // A new ref that is not a branch carries no required checks; a new tag needs John's grant.
     if (plan.kind === "ref-field" && plan.field === "ref" && !named?.startsWith("refs/heads/")) {
       if (named === undefined) throw new Failure(PUSH_STAGE, "cannot read the ref `gh api` creates");
-      return deps.run(args);
+      if (!/^refs\/tags\//i.test(named)) return deps.run(args);
+      const tag = named.slice("refs/tags/".length);
+      const sha = await bodyField(api, "sha", deps.readFile, RELEASE_STAGE);
+      if (tag === "" || sha === undefined) throw new Failure(RELEASE_STAGE, `cannot read the tag \`gh api\` creates, or its sha; give them with -f ref=refs/tags/<tag> -f sha=<sha> (it needs ${RELEASE_GRANT})`);
+      return deps.withToken(target, async (env) => {
+        const io = deps.io(target, env);
+        await gateRelease(io, tag, () => objectCommit(io, sha, tag));
+        return deps.runWith(args, env);
+      });
     }
     return deps.withToken(target, async (env) => {
       const io = deps.io(target, env);
@@ -566,14 +768,23 @@ const dispatchApi = async (args: readonly string[], api: ApiCall, repo: Repo | u
   const request = await graphqlRequest(api, deps.readFile);
   const merges = graphqlMerges(request.query, request.variables);
   if ("refuse" in merges) throw new Failure(MERGE_STAGE, merges.refuse);
+  const released = graphqlReleaseRefusal(request.query);
+  if (released !== undefined) throw new Failure(RELEASE_STAGE, released);
   const writes = graphqlRefWrites(request.query, request.variables);
   if ("refuse" in writes) throw new Failure(PUSH_STAGE, writes.refuse);
   if (merges.length === 0 && writes.length === 0) return deps.run(args);
   return deps.withToken(repo, async (env) => {
+    // A node lookup is GraphQL, which names no repository; this io's own is unused.
+    const anywhere = () => deps.io(repo ?? { owner: "-", name: "-" }, env);
     for (const write of writes) {
-      // The node lookup is GraphQL, which names no repository; the io's own is unused.
-      const target = "node" in write ? await refForNode(deps.io(repo ?? { owner: "-", name: "-" }, env), write.node) : { repo: parseRepo(write.repo), branch: write.branch };
+      if ("tag" in write) {
+        const io = deps.io(await repoForNode(anywhere(), write.repositoryId), env);
+        await gateRelease(io, write.tag, () => objectCommit(io, write.oid, write.tag));
+        continue;
+      }
+      const target = "node" in write ? await refForNode(anywhere(), write.node) : { repo: parseRepo(write.repo), branch: write.branch, tag: undefined };
       if (target.repo === undefined) throw new Failure(PUSH_STAGE, "cannot tell which repository a GraphQL ref write moves a branch in");
+      if (target.tag !== undefined) throw new Failure(RELEASE_STAGE, tagRefusal(target.tag, target.repo, "move or delete"));
       if (target.branch !== undefined) await gatePush(deps.io(target.repo, env), [target.branch]);
     }
     for (const merge of merges) {
@@ -584,6 +795,42 @@ const dispatchApi = async (args: readonly string[], api: ApiCall, repo: Repo | u
         throw new Failure(MERGE_STAGE, `a GraphQL merge of #${pr.number} must give expectedHeadOid: "${head}", the head whose checks passed, so a later push is not merged in its place`);
       }
     }
+    return deps.runWith(args, env);
+  });
+};
+
+/**
+ * A REST release write behind the release guard: a new release needs John's
+ * grant for its `tag_name`; an edit, a deletion, or an asset upload needs it
+ * for the release's own tag, read from GitHub, and an edit that renames the
+ * tag for the new one too. A write that can create a tag that does not exist
+ * yet (a new release, or an edit, which may publish a draft) must give the
+ * granted commit as `target_commitish` when the grant names one, since a
+ * branch could move before GitHub tags it.
+ */
+const dispatchReleaseApi = async (args: readonly string[], api: ApiCall, plan: { readonly repo: string | undefined; readonly id: number | undefined }, repo: Repo | undefined, deps: GhDispatch): Promise<number> => {
+  const target = plan.repo === undefined ? repo : parseRepo(plan.repo);
+  if (target === undefined) throw new Failure(RELEASE_STAGE, `cannot tell which repository \`gh api\` writes a release in; name it in the endpoint (it needs ${RELEASE_GRANT})`);
+  const creates = plan.id === undefined || api.method === "PATCH";
+  const named = creates ? await bodyField(api, "tag_name", deps.readFile, RELEASE_STAGE) : undefined;
+  const commitish = creates ? await bodyField(api, "target_commitish", deps.readFile, RELEASE_STAGE) : undefined;
+  if (plan.id === undefined && named === undefined) throw new Failure(RELEASE_STAGE, `cannot read the tag of the release \`gh api\` creates; give it with -f tag_name=<tag> (it needs ${RELEASE_GRANT})`);
+  return deps.withToken(target, async (env) => {
+    const io = deps.io(target, env);
+    const release = plan.id === undefined ? undefined : await releaseOf(io, plan.id);
+    const tag = named ?? (release?.tag as string);
+    if (release !== undefined && release.tag !== tag) await gateTag(io, release.tag);
+    const where = commitish ?? release?.target;
+    await gateTag(
+      io,
+      tag,
+      creates
+        ? async (granted) => {
+            if (where !== undefined && HEX.test(where)) return where.toLowerCase();
+            throw new Failure(RELEASE_STAGE, `\`${tag}\` does not exist in ${slug(io.repo)} yet, and John granted it at ${granted}: give -f target_commitish=${granted}, so GitHub tags that commit`);
+          }
+        : undefined,
+    );
     return deps.runWith(args, env);
   });
 };
@@ -659,17 +906,26 @@ const setVariable = (variables: Record<string, unknown>, name: string, value: st
   into[keys.at(-1) as string] = value;
 };
 
-/** The branch (undefined for a tag or other ref) and repository a GraphQL ref node id names; refused when it names no ref. */
-const refForNode = async (io: ReviewIo, id: string): Promise<{ readonly repo: Repo | undefined; readonly branch: string | undefined }> => {
+/** The branch or tag (neither, for another ref) and repository a GraphQL ref node id names; refused when it names no ref. */
+const refForNode = async (io: ReviewIo, id: string): Promise<{ readonly repo: Repo | undefined; readonly branch: string | undefined; readonly tag: string | undefined }> => {
   const query = "query($id:ID!){node(id:$id){... on Ref{name prefix repository{nameWithOwner}}}}";
   const node = record(record(record((await call(io, PUSH_STAGE, "POST", "/graphql", { query, variables: { id } })).value).data).node);
   const repo = parseRepo(text(record(node.repository).nameWithOwner));
   if (text(node.name) === "" || repo === undefined) throw new Failure(PUSH_STAGE, "a GraphQL ref write names a node that is not a ref agent-gh can find");
-  return { repo, branch: node.prefix === "refs/heads/" ? text(node.name) : undefined };
+  return { repo, branch: node.prefix === "refs/heads/" ? text(node.name) : undefined, tag: node.prefix === "refs/tags/" ? text(node.name) : undefined };
+};
+
+/** The repository a GraphQL node id names; refused when it names none. */
+const repoForNode = async (io: ReviewIo, id: string): Promise<Repo> => {
+  const query = "query($id:ID!){node(id:$id){... on Repository{nameWithOwner}}}";
+  const node = record(record(record((await call(io, RELEASE_STAGE, "POST", "/graphql", { query, variables: { id } })).value).data).node);
+  const repo = parseRepo(text(node.nameWithOwner));
+  if (repo === undefined) throw new Failure(RELEASE_STAGE, "a GraphQL createRef names a node that is not a repository agent-gh can find");
+  return repo;
 };
 
 /** A string field of a REST write's body: from its fields, else its `--input` JSON; undefined when absent, refused when unreadable. */
-const bodyField = async (api: ApiCall, name: string, readFile: (path: string) => Promise<string | undefined>): Promise<string | undefined> => {
+const bodyField = async (api: ApiCall, name: string, readFile: (path: string) => Promise<string | undefined>, stage: Stage = PUSH_STAGE): Promise<string | undefined> => {
   if (api.input !== undefined) {
     const content = api.input === "-" ? undefined : await readFile(api.input);
     let value: unknown;
@@ -677,13 +933,13 @@ const bodyField = async (api: ApiCall, name: string, readFile: (path: string) =>
       if (content === undefined) throw new Error();
       value = own(record(JSON.parse(content)), name);
     } catch {
-      throw new Failure(PUSH_STAGE, `cannot read the body \`gh api --input\` sends; agents give a branch write's \`${name}\` with -f`);
+      throw new Failure(stage, `cannot read the body \`gh api --input\` sends; agents give a ${stage === PUSH_STAGE ? "branch" : "release or tag"} write's \`${name}\` with -f`);
     }
-    if (value !== undefined && typeof value !== "string") throw new Failure(PUSH_STAGE, `cannot read the \`${name}\` \`gh api\` sends`);
+    if (value !== undefined && typeof value !== "string") throw new Failure(stage, `cannot read the \`${name}\` \`gh api\` sends`);
     return value;
   }
   const field = api.fields.findLast((candidate) => candidate.name === name);
-  if (field !== undefined && !field.raw && field.value.startsWith("@")) throw new Failure(PUSH_STAGE, `give \`${name}\` with -f ${name}=<value>`);
+  if (field !== undefined && !field.raw && field.value.startsWith("@")) throw new Failure(stage, `give \`${name}\` with -f ${name}=<value>`);
   return field?.value;
 };
 
