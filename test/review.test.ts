@@ -7,6 +7,8 @@ import {
   apiCall,
   apiMerge,
   authorFamily,
+  type BlockOn,
+  checksBlock,
   diffLines,
   effortFor,
   graphqlMerges,
@@ -119,21 +121,56 @@ test("a config with a typo is refused with the field to fix, and defaults fill w
   expect(refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, status_writer: "ci" })))).toBe('.github/agent-review.json: status_writer must be "agent" or "actions"');
 });
 
+/** A config's policy: its block_on, and checks it names, if any. */
+const policy = (blockOn: BlockOn, checks: readonly string[] = []) => ({ blockOn, checks });
+
 test("block_on changes_requested fails on the verdict; a priority fails on any finding at it or above, whatever the verdict", () => {
-  expect(reviewState({ verdict: "changes_requested", priorities: ["P3"] }, "changes_requested")).toBe("failure");
-  expect(reviewState({ verdict: "approve", priorities: ["P0"] }, "changes_requested")).toBe("success");
-  expect(reviewState({ verdict: "approve" }, "changes_requested")).toBe("success");
-  expect(reviewState({ verdict: "changes_requested", priorities: ["P3", "P3"] }, "P2")).toBe("success");
-  expect(reviewState({ verdict: "approve", priorities: ["P3", "P2"] }, "P2")).toBe("failure");
-  expect(reviewState({ verdict: "approve", priorities: ["P0"] }, "P2")).toBe("failure");
-  expect(reviewState({ verdict: "approve", priorities: [] }, "P2")).toBe("success");
-  expect(reviewState({ verdict: "approve", priorities: ["P2"] }, "P1")).toBe("success");
-  expect(reviewState({ verdict: "approve", priorities: ["P3"] }, "P3")).toBe("failure");
+  const ok = { checks: "passed" } as const;
+  expect(reviewState({ ...ok, verdict: "changes_requested", priorities: ["P3"] }, policy("changes_requested"))).toBe("failure");
+  expect(reviewState({ ...ok, verdict: "approve", priorities: ["P0"] }, policy("changes_requested"))).toBe("success");
+  expect(reviewState({ ...ok, verdict: "approve" }, policy("changes_requested"))).toBe("success");
+  expect(reviewState({ ...ok, verdict: "changes_requested", priorities: ["P3", "P3"] }, policy("P2"))).toBe("success");
+  expect(reviewState({ ...ok, verdict: "approve", priorities: ["P3", "P2"] }, policy("P2"))).toBe("failure");
+  expect(reviewState({ ...ok, verdict: "approve", priorities: ["P0"] }, policy("P2"))).toBe("failure");
+  expect(reviewState({ ...ok, verdict: "approve", priorities: [] }, policy("P2"))).toBe("success");
+  expect(reviewState({ ...ok, verdict: "approve", priorities: ["P2"] }, policy("P1"))).toBe("success");
+  expect(reviewState({ ...ok, verdict: "approve", priorities: ["P3"] }, policy("P3"))).toBe("failure");
   // A marker from before priorities were recorded cannot be judged against a priority, so it fails.
-  expect(reviewState({ verdict: "approve" }, "P2")).toBe("failure");
-  expect(outcomeSummary({ verdict: "changes_requested", priorities: ["P3"] }, "P2")).toBe("changes requested; 0 finding(s) at P2 or above");
-  expect(outcomeSummary({ verdict: "approve" }, "P2")).toBe("approved; the review records no finding priorities, which block_on P2 needs: review again");
-  expect(outcomeSummary({ verdict: "approve", priorities: ["P1"] }, "changes_requested")).toBe("approved");
+  expect(reviewState({ ...ok, verdict: "approve" }, policy("P2"))).toBe("failure");
+  expect(outcomeSummary({ ...ok, verdict: "changes_requested", priorities: ["P3"] }, policy("P2"), "checks passed")).toBe("changes requested; 0 finding(s) at P2 or above; checks passed");
+  expect(outcomeSummary({ ...ok, verdict: "approve" }, policy("P2"), "checks passed")).toBe(
+    "approved; the review records no finding priorities, which block_on P2 needs: review again; checks passed",
+  );
+  expect(outcomeSummary({ ...ok, verdict: "approve", priorities: ["P1"] }, policy("changes_requested"), "checks passed")).toBe("approved; checks passed");
+});
+
+test("checks that failed, timed out, or did not run fail the status whatever the verdict; a repository that names no checks is unaffected", () => {
+  const approved = { verdict: "approve", priorities: [] } as const;
+  const checked = policy("changes_requested", ["make check"]);
+  expect(reviewState({ ...approved, checks: "passed" }, checked)).toBe("success");
+  expect(reviewState({ ...approved, checks: "failed" }, checked)).toBe("failure");
+  expect(reviewState({ ...approved, checks: "timed out" }, checked)).toBe("failure");
+  // Checks the config names that never ran verified nothing.
+  expect(reviewState({ ...approved, checks: "not run" }, checked)).toBe("failure");
+  expect(reviewState({ ...approved, checks: "timed out" }, policy("P2", ["make check"]))).toBe("failure");
+  // No checks configured: none ran, and the verdict alone decides.
+  expect(reviewState({ ...approved, checks: "not run" }, policy("changes_requested"))).toBe("success");
+  expect(reviewState({ ...approved, checks: "not run" }, policy("P2"))).toBe("success");
+  // A recorded failure or timeout is never excused, even once the config names no checks.
+  expect(reviewState({ ...approved, checks: "timed out" }, policy("changes_requested"))).toBe("failure");
+  expect(reviewState({ ...approved, checks: "failed" }, policy("changes_requested"))).toBe("failure");
+  expect(checksBlock("passed", true)).toBeUndefined();
+  expect(checksBlock("not run", false)).toBeUndefined();
+  expect(outcomeSummary({ ...approved, checks: "timed out" }, checked, "checks timed out (`make check` ran over 30 min)")).toBe(
+    "checks unverified: approved, but checks timed out (`make check` ran over 30 min)",
+  );
+  expect(outcomeSummary({ ...approved, checks: "not run" }, checked, "checks not run")).toBe("checks unverified: approved, but checks not run");
+  expect(outcomeSummary({ ...approved, checks: "failed" }, checked, "checks failed (`make check` exited 2)")).toBe("approved, but checks failed (`make check` exited 2)");
+  expect(outcomeSummary({ ...approved, checks: "timed out" }, policy("P2", ["make check"]), "checks timed out")).toBe(
+    "checks unverified: approved; 0 finding(s) at P2 or above, but checks timed out",
+  );
+  // A blocking verdict needs no lead: the verdict already fails it.
+  expect(outcomeSummary({ verdict: "changes_requested", checks: "timed out" }, checked, "checks timed out")).toBe("changes requested; checks timed out");
 });
 
 test("the review marker is one JSON object a workflow can read back, and a malformed one reads as none", () => {
@@ -438,7 +475,7 @@ test("the gate refuses gh pr ready until the head is reviewed, and passes once i
 test("a review that requested changes blocks gh pr ready, naming the verdict and the next step", async () => {
   const blocked = world({ status: [{ context: "agent-review", state: "failure", description: "changes requested; checks passed: 2 finding(s) by gpt-6-astra at high" }] });
   expect(await gateRefusal(gateReady(blocked.io, { number: 12 }))).toBe(
-    "pull request #12's head aaaaaaaa was reviewed and blocked (changes requested; checks passed: 2 finding(s) by gpt-6-astra at high); answer each finding with `agent-gh reply`, push a fix, and run `agent-gh review full` on the new head, or ask John to add the `review-waived` label",
+    "pull request #12's head aaaaaaaa was reviewed and blocked (changes requested; checks passed: 2 finding(s) by gpt-6-astra at high); answer each finding with `agent-gh reply`, push a fix, and run `agent-gh review full` on the new head (on this head again when only its checks timed out), or ask John to add the `review-waived` label",
   );
   // John's waiver still passes it.
   await gateReady(world({ status: [{ context: "agent-review", state: "failure" }], labels: ["review-waived"], events: [labeled("johnrees", null)] }).io, { number: 12 });
@@ -685,7 +722,23 @@ test("a check that runs out of time stops the rest; the checks count as timed ou
   expect(w.checks.map(({ command, timeoutMs }) => ({ command, timeoutMs }))).toEqual([{ command: "make check", timeoutMs: 300_000 }]);
   expect(w.commands[0]?.stdin).toContain("checks timed out (`make check` ran over 5 min).\nThe last lines of their output:\n```\n$ make check\ncompiling\n```\nReport a failure");
   expect(parseMarker(posted(w.fake, `${REPO}/pulls/12/reviews`)[0]?.body as string)?.checks).toBe("timed out");
-  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)[0]?.description).toBe("approved; checks timed out (`make check` ran over 5 min): 0 finding(s) by gpt-6-astra at xhigh");
+  // An approval whose checks never finished verified nothing: the status fails, says why, and the agent is told to run them again.
+  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)[0]).toMatchObject({
+    state: "failure", description: "checks unverified: approved, but checks timed out (`make check` ran over 5 min): 0 finding(s) by gpt-6-astra at xhigh",
+  });
+  expect(w.printed).toContain(
+    "agent-gh: checks timed out (`make check` ran over 5 min), so agent-review fails whatever the verdict; run `agent-gh review full` again once the machine is less loaded, or raise checks_timeout_minutes",
+  );
+});
+
+test("an approval whose checks failed fails the status", async () => {
+  const w = world({ checkResults: [{ code: 1, output: "boom\n" }], answer: { verdict: "approve", spec: "Fine.", findings: [] } });
+  await reviewFull(w.io, {});
+  expect(parseMarker(posted(w.fake, `${REPO}/pulls/12/reviews`)[0]?.body as string)).toMatchObject({ verdict: "approve", checks: "failed" });
+  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)[0]).toMatchObject({
+    state: "failure", description: "approved, but checks failed (`make check` exited 1): 0 finding(s) by gpt-6-astra at xhigh",
+  });
+  expect(w.printed).toContain("agent-gh: checks failed (`make check` exited 1), so agent-review fails whatever the verdict; fix them, push, and review the new head");
 });
 
 test("a repository with no checks reviews with checks not run", async () => {

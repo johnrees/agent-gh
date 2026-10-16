@@ -4,7 +4,7 @@ import { request } from "./github.ts";
 import { markerPosts, pull, pullDiff, readReviewConfig, type ReviewIo, waiver } from "./review-run.ts";
 import { slug } from "./repo.ts";
 import { agentPull, carryCandidate, eventTarget, type FoundMarker, markerFor, passes, reviewStatus, type Status, validMarkers } from "./status.ts";
-import { type BlockOn, STATUS_CONTEXT, statusDescription } from "./review.ts";
+import { type ReviewPolicy, STATUS_CONTEXT, statusDescription } from "./review.ts";
 import { THREADS_CONTEXT, threadsStatus } from "./threads.ts";
 import { type ApiIo, everyPage, get, pullThreads, repoOwner } from "./threads-run.ts";
 
@@ -49,12 +49,13 @@ const names = async (io: StatusIo, from: string, to: string): Promise<string[] |
 
 /**
  * A passing review carried forward to `head`, which has no review of its own:
- * the latest marker for the same patch passes `block_on`, and the base's changes since
- * that marker's merge base touch none of the patch's files. Anything git
- * cannot show (a commit it cannot fetch) carries nothing.
+ * the latest marker for the same patch passes `block_on` and its checks,
+ * and the base's changes since that marker's merge base touch none of the
+ * patch's files. Anything git cannot show (a commit it cannot fetch) carries
+ * nothing.
  */
-const carriedForward = async (io: StatusIo, number: number, base: string, head: string, markers: readonly FoundMarker[], blockOn: BlockOn): Promise<FoundMarker | undefined> => {
-  if (!markers.some((found) => passes(found, blockOn))) return undefined;
+const carriedForward = async (io: StatusIo, number: number, base: string, head: string, markers: readonly FoundMarker[], policy: ReviewPolicy): Promise<FoundMarker | undefined> => {
+  if (!markers.some((found) => passes(found, policy))) return undefined;
   const compare = record(await get(io, STAGE, `${repoPath(io)}/compare/${encodeURIComponent(base)}...${head}`));
   const mergeBase = text(record(compare.merge_base_commit).sha);
   if (!/^[0-9a-f]{40}$/.test(mergeBase)) return undefined;
@@ -62,7 +63,7 @@ const carriedForward = async (io: StatusIo, number: number, base: string, head: 
   if (!(await fetched(io, [`refs/pull/${number}/head`, mergeBase], head)) && !(await fetched(io, [head, mergeBase], head))) return undefined;
   if ((await io.git(["cat-file", "-e", `${mergeBase}^{commit}`])) === undefined) return undefined;
   const { patchId } = await pullDiff(io, mergeBase, head);
-  const candidate = carryCandidate(markers, patchId, blockOn);
+  const candidate = carryCandidate(markers, patchId, policy);
   if (candidate === undefined) return undefined;
   if (candidate.marker.merge_base === mergeBase) return candidate;
   if (!(await fetched(io, [candidate.marker.merge_base], candidate.marker.merge_base))) return undefined;
@@ -95,14 +96,14 @@ export const deriveStatuses = async (io: StatusIo, number: number): Promise<{ re
   );
   if (!agent) {
     const skip = (context: string): Status => ({ context, state: "success", description: "not an agent PR", targetUrl: undefined });
-    return { head: pr.head, statuses: [reviewStatus({ number, agent, waivedBy: undefined, current: undefined, carried: undefined, blockOn: config.blockOn }), skip(THREADS_CONTEXT)] };
+    return { head: pr.head, statuses: [reviewStatus({ number, agent, waivedBy: undefined, current: undefined, carried: undefined, policy: config }), skip(THREADS_CONTEXT)] };
   }
   const owner = await repoOwner(io, STAGE);
   const waivedBy = await waiver(io, STAGE, pr, config);
   const markers = validMarkers(await markerPosts(io, STAGE, number), owner, apps);
   const current = markerFor(markers, pr.head);
-  const carried = current === undefined && waivedBy === undefined ? await carriedForward(io, number, pr.base, pr.head, markers, config.blockOn) : undefined;
-  const review = reviewStatus({ number, agent, waivedBy, current, carried, blockOn: config.blockOn });
+  const carried = current === undefined && waivedBy === undefined ? await carriedForward(io, number, pr.base, pr.head, markers, config) : undefined;
+  const review = reviewStatus({ number, agent, waivedBy, current, carried, policy: config });
   const threads = threadsStatus(await pullThreads(io, STAGE, pr, owner));
   return { head: pr.head, statuses: [review, { context: THREADS_CONTEXT, ...threads }] };
 };

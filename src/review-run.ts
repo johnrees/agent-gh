@@ -18,6 +18,7 @@ import {
   apiMerge,
   authorFamily,
   type ChecksResult,
+  checksBlock,
   checksSummary,
   CONFIG_PATH,
   diffLines,
@@ -293,7 +294,7 @@ const gateUnreviewed = async (io: ReviewIo, stage: Stage, pr: Pull, config: Revi
   if (status?.state === "failure") {
     throw new Failure(
       stage,
-      `pull request #${number}'s head ${pr.head.slice(0, 8)} was reviewed and blocked (${status.description}); answer each finding with \`agent-gh reply\`, push a fix, and run \`agent-gh review full\` on the new head, ${waive}`,
+      `pull request #${number}'s head ${pr.head.slice(0, 8)} was reviewed and blocked (${status.description}); answer each finding with \`agent-gh reply\`, push a fix, and run \`agent-gh review full\` on the new head (on this head again when only its checks timed out), ${waive}`,
     );
   }
   throw new Failure(
@@ -965,8 +966,8 @@ const awaitWorkflowStatus = async (io: ReviewIo, head: string, before: CommitSta
  * family than its author's against the issue it closes. agent-gh runs the
  * config's checks in a throwaway clone of the head, then the reviewer reads
  * it, read-only. Posts the findings as a pull request review and sets the
- * agent-review status on that head from the verdict; prints the findings as
- * JSON. A waiver a person added sets the status without a review, and one
+ * agent-review status on that head from the verdict and the checks; prints
+ * the findings as JSON. A waiver a person added sets the status without a review, and one
  * added while the review ran is never overwritten. With `status_writer:
  * "actions"`, the repository's agent-review workflow sets the status from
  * the review's marker instead, and this waits for it and prints it.
@@ -1027,10 +1028,15 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   };
   const before = actions ? await headStatus(io, head) : undefined;
   await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined }, outside));
-  if (actions) await awaitWorkflowStatus(io, head, before);
   // A waiver John added while the review ran stands: the labels are read afresh, and the verdict never overwrites it.
-  else if ((await recordWaiver(await pull(io, stage, number))) === undefined) {
-    await setStatus(io, head, reviewState(marker, config.blockOn), `${outcomeSummary(marker, config.blockOn)}; ${checksSummary(checks)}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
+  const waived = actions ? undefined : await recordWaiver(await pull(io, stage, number));
+  if (actions) await awaitWorkflowStatus(io, head, before);
+  else if (waived === undefined) {
+    await setStatus(io, head, reviewState(marker, config), `${outcomeSummary(marker, config, checksSummary(checks))}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
+  }
+  if (waived === undefined && checksBlock(checks.state, config.checks.length > 0) !== undefined) {
+    const next = checks.state === "timed out" ? "run `agent-gh review full` again once the machine is less loaded, or raise checks_timeout_minutes" : "fix them, push, and review the new head";
+    io.print(`agent-gh: ${checksSummary(checks)}, so ${STATUS_CONTEXT} fails whatever the verdict; ${next}`);
   }
   if (review.findings.length > 0) io.print('agent-gh: answer each finding with `agent-gh reply <id> --applied <sha>` or `agent-gh reply <id> --declined "<why>"`');
   io.out(`${JSON.stringify(review, null, 2)}\n`);
