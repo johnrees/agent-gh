@@ -1,0 +1,95 @@
+{
+  "v": 1,
+  "repo": "johnrees/widget",
+  "fetched_at": "2026-10-21T12:00:00Z",
+  "queue": null,
+  "label": "ready",
+  "milestones": [
+    { "number": 1, "title": "M1", "description": "", "state": "open", "open": 4, "closed": 2 },
+    { "number": 2, "title": "M2 <b>bold</b>", "description": "", "state": "open", "open": 7, "closed": 0 }
+  ],
+  "issues": [
+    {
+      "issue": 1, "title": "Set up the repository", "url": "https://github.com/johnrees/widget/issues/1", "state": "closed", "milestone": "M1",
+      "labels": ["ready"], "priority": null, "queued": null, "blocked_by": [], "wave": null, "status": "merged", "skipped_by": null, "claim": null,
+      "pr": { "number": 20, "url": "https://github.com/johnrees/widget/pull/20", "draft": false, "state": "merged", "merged_at": "2026-10-18T09:00:00Z", "review_decision": null, "statuses": { "agent-review": null, "agent-threads": null, "agent-hold": null }, "checks": null },
+      "updated_at": "2026-10-18T09:00:00Z"
+    },
+    {
+      "issue": 2, "title": "Drop the old parser", "url": "https://github.com/johnrees/widget/issues/2", "state": "closed", "milestone": "M1",
+      "labels": [], "priority": null, "queued": null, "blocked_by": [], "wave": null, "status": "closed", "skipped_by": null, "claim": null, "pr": null,
+      "updated_at": "2026-10-17T09:00:00Z"
+    },
+    {
+      "issue": 3, "title": "Parse the config file", "url": "https://github.com/johnrees/widget/issues/3", "state": "open", "milestone": "M1",
+      "labels": ["ready"], "priority": null, "queued": null, "blocked_by": [{ "issue": 1, "repo": null, "open": false }], "wave": 1, "status": "ready", "skipped_by": null,
+      "claim": { "kind": "pr", "pr": 30, "url": "https://github.com/johnrees/widget/pull/30", "author": "johnrees", "family": "claude", "session": "s-3", "branch": "claude/3-parse", "created_at": "2026-10-20T12:00:00Z", "last_push_at": "2026-10-21T09:00:00Z", "last_comment_at": "2026-10-21T11:55:00Z" },
+      "pr": { "number": 30, "url": "https://github.com/johnrees/widget/pull/30", "draft": false, "state": "open", "merged_at": null, "review_decision": null, "statuses": { "agent-review": "success", "agent-threads": "success", "agent-hold": null }, "checks": "passed" },
+      "updated_at": "2026-10-21T11:55:00Z"
+    },
+    {
+      "issue": 4, "title": "Read the lockfile", "url": "https://github.com/johnrees/widget/issues/4", "state": "open", "milestone": "M1",
+      "labels": ["ready"], "priority": null, "queued": null, "blocked_by": [{ "issue": 1, "repo": null, "open": false }], "wave": 1, "status": "in_review", "skipped_by": null,
+      "claim": { "kind": "pr", "pr": 31, "url": "https://github.com/johnrees/widget/pull/31", "author": "johnrees", "family": "deepseek", "session": "s-4", "branch": "deepseek/4-lockfile", "created_at": "2026-10-19T12:00:00Z", "last_push_at": "2026-10-21T08:00:00Z", "last_comment_at": null },
+      "pr": { "number": 31, "url": "https://github.com/johnrees/widget/pull/31", "draft": false, "state": "open", "merged_at": null, "review_decision": "review_required", "statuses": { "agent-review": "pending", "agent-threads": null, "agent-hold": null }, "checks": "pending" },
+      "updated_at": "2026-10-21T08:00:00Z"
+    },
+    {
+      "issue": 5, "title": "Name the cache directory", "url": "https://github.com/johnrees/widget/issues/5", "state": "open", "milestone": "M1",
+      "labels": ["ready"], "priority": null, "queued": null, "blocked_by": [], "wave": 1, "status": "claimed", "skipped_by": null,
+      "claim": { "kind": "comment", "pr": null, "url": "https://github.com/johnrees/widget/issues/5#issuecomment-1", "author": "johnrees", "family": null, "session": null, "branch": null, "created_at": "2026-10-21T11:40:00Z", "last_push_at": null, "last_comment_at": null },
+      "pr": null,
+      "updated_at": "2026-10-21T11:40:00Z"
+    },
+    {
+      "issue": 6, "title": "Write the new parser", "url": "https://github.com/johnrees/widget/issues/6", "state": "open", "milestone": "M2 <b>bold</b>",
+      "labels": ["priority:high", "ready"], "priority": "priority:high", "queued": null, "blocked_by": [{ "issue": 2, "repo": null, "open": false }], "wave": 1, "status": "workable", "skipped_by": null, "claim": null, "pr": null,
+      "updated_at": "2026-10-20T10:00:00Z"
+    },
+    {
+      "issue": 7, "title": "Install from the lockfile", "url": "https://github.com/johnrees/widget/issues/7", "state": "open", "milestone": "M2 <b>bold</b>",
+      "labels": ["ready"], "priority": null, "queued": null,
+      "blocked_by": [{ "issue": 3, "repo": null, "open": true }, { "issue": 4, "repo": null, "open": true }, { "issue": 9, "repo": "johnrees/other", "open": false }],
+      "wave": 2, "status": "blocked", "skipped_by": null, "claim": null, "pr": null,
+      "updated_at": "2026-10-20T10:00:00Z"
+    },
+    {
+      "issue": 8, "title": "Validate the config", "url": "https://github.com/johnrees/widget/issues/8", "state": "open", "milestone": "M2 <b>bold</b>",
+      "labels": ["ready"], "priority": null, "queued": null, "blocked_by": [{ "issue": 3, "repo": null, "open": true }], "wave": 2, "status": "blocked", "skipped_by": null, "claim": null, "pr": null,
+      "updated_at": "2026-10-20T10:00:00Z"
+    },
+    {
+      "issue": 9, "title": "</script><script>alert(1)</script>", "url": "https://github.com/johnrees/widget/issues/9", "state": "open", "milestone": null,
+      "labels": [], "priority": null, "queued": null, "blocked_by": [], "wave": 1, "status": "not_dispatched", "skipped_by": null, "claim": null, "pr": null,
+      "updated_at": "2026-10-20T10:00:00Z"
+    },
+    {
+      "issue": 10, "title": "Quote \" and ' and & here", "url": "https://github.com/johnrees/widget/issues/10", "state": "open", "milestone": "M2 <b>bold</b>",
+      "labels": ["needs-human", "ready"], "priority": null, "queued": null, "blocked_by": [], "wave": 1, "status": "skipped",
+      "skipped_by": { "rule": "hold.label", "pattern": "needs-human", "label": "needs-human" }, "claim": null, "pr": null,
+      "updated_at": "2026-10-20T10:00:00Z"
+    },
+    {
+      "issue": 11, "title": "<img src=x onerror=alert(1)>", "url": "https://github.com/johnrees/widget/issues/11", "state": "open", "milestone": "M2 <b>bold</b>",
+      "labels": ["ready"], "priority": null, "queued": null, "blocked_by": [{ "issue": 5, "repo": "johnrees/other", "open": true }], "wave": null, "status": "stuck", "skipped_by": null, "claim": null, "pr": null,
+      "updated_at": "2026-10-20T10:00:00Z"
+    },
+    {
+      "issue": 12, "title": "Cache the parse", "url": "https://github.com/johnrees/widget/issues/12", "state": "open", "milestone": "M2 <b>bold</b>",
+      "labels": ["ready"], "priority": null, "queued": null, "blocked_by": [{ "issue": 13, "repo": null, "open": true }], "wave": null, "status": "stuck", "skipped_by": null, "claim": null, "pr": null,
+      "updated_at": "2026-10-20T10:00:00Z"
+    },
+    {
+      "issue": 13, "title": "Invalidate the cache", "url": "https://github.com/johnrees/widget/issues/13", "state": "open", "milestone": "M2 <b>bold</b>",
+      "labels": ["ready"], "priority": null, "queued": null, "blocked_by": [{ "issue": 12, "repo": null, "open": true }], "wave": null, "status": "stuck", "skipped_by": null, "claim": null, "pr": null,
+      "updated_at": "2026-10-20T10:00:00Z"
+    },
+    {
+      "issue": 14, "title": "Clean the cache directory", "url": "https://github.com/johnrees/widget/issues/14", "state": "open", "milestone": "M1",
+      "labels": ["ready"], "priority": null, "queued": null, "blocked_by": [{ "issue": 5, "repo": null, "open": true }], "wave": 2, "status": "blocked", "skipped_by": null, "claim": null, "pr": null,
+      "updated_at": "2026-10-20T10:00:00Z"
+    }
+  ],
+  "stuck": [11, 12, 13],
+  "cycles": [[12, 13]]
+}

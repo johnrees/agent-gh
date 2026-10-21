@@ -276,6 +276,8 @@ Fields are named as in `next --waves --json` and `claims --json`. `blocked_by` i
 - `not_dispatched`: unclaimed and unblocked, but not `ready`, or not in the Queue.
 - `workable`: what `next` offers.
 
+A prototype timeline page draws the graph as a table, one row per issue with every blocker above what it blocks, and the `blocked_by` edges as lanes down the left: `agent-gh graph --json -R OWNER/REPO | bun scripts/timeline.ts > timeline.html` (or `bun scripts/timeline.ts graph.json`). The page is static and loads nothing remote.
+
 ## Releases
 
 Agents never cut, change, or approve a release unless John has granted that one tag. A tag ruleset does not stop them, since they act as John, its bypass actor, so the guard does, as the merge guard does for branches. In an agent session:
