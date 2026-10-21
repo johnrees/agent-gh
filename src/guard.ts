@@ -1,9 +1,11 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { type Claim, claimBranchIssue, describeClaim, mine } from "./claim.ts";
 import { readConfig, type Registry } from "./config.ts";
-import { NEXT_STEP } from "./failure.ts";
+import { Failure, NEXT_STEP } from "./failure.ts";
 import { trailerArgs, withoutAbsent } from "./git.ts";
 import { detectIdentity, type Env, inAgentSession } from "./harness.ts";
-import { type GitConfig, onGitHub } from "./target.ts";
+import type { Repo } from "./repo.ts";
+import { type GitConfig, githubRepo } from "./target.ts";
 
 export const UPDATE =
   "rerun the install line (curl -fsSL https://raw.githubusercontent.com/johnrees/agent-gh/main/install.sh | bash, with `-s -- --agent-machine` on an agent machine)";
@@ -70,36 +72,90 @@ export const stripsComments = (config: GitConfig, env: Env, text: string, prefix
 };
 
 /**
- * What a repository's git hook does, whichever tool ran git. In an agent
- * session, in a repository with a github.com remote, `commit-msg` credits the
- * session: it adds the Agent-* trailers the harness reports and the family
- * App as co-author with `git interpret-trailers` (as `git commit --trailer`
- * does, so comments and the `-v` scissors are respected). Otherwise it leaves
- * the message alone. It never refuses a commit for lacking them. `pre-push`
- * passes a person's push; an agent session's is checked by the CLI's
- * `guardPush`, which needs GitHub, before this runs. Anything this version
- * does not understand fails with exit 2, never a silent pass.
+ * What the commit hook's claim check reads: the branch HEAD is on (undefined
+ * when detached), the session's id as its claims carry it (`sessionId`), the
+ * claim holding an issue as `claims` judges it (a Failure when GitHub cannot
+ * say), and where a note to the committer goes.
  */
-export const guard = (
+export type ClaimCheck = {
+  readonly branch: () => string | undefined;
+  readonly session: { readonly id: string; readonly generated: boolean };
+  readonly holder: (repo: Repo, issue: number) => Promise<Claim | undefined>;
+  readonly print: (line: string) => void;
+};
+
+/**
+ * The refusal of a commit on another session's claim branch: HEAD is on
+ * `<family>/<N>-<slug>` and a claim this session does not hold has issue N.
+ * The holder is read from GitHub each time, as `claims` reads it. When
+ * GitHub cannot be read (a sandbox without network, a machine with no login),
+ * the commit passes with a note rather than stopping a session's work on its
+ * own branch: it still carries its Agent-Session trailer, and `review full`
+ * refuses a pull request whose commits are not its holder's, so a stray
+ * commit is still caught before it is reviewed. Undefined when the commit
+ * passes: a branch that is no claim's, an issue nothing holds, or this
+ * session's own claim.
+ */
+const foreignClaim = async (claims: ClaimCheck, repo: Repo, family: string): Promise<Verdict | undefined> => {
+  const branch = claims.branch();
+  const issue = claimBranchIssue(branch);
+  if (issue === undefined) return undefined;
+  let holder: Claim | undefined;
+  try {
+    holder = await claims.holder(repo, issue);
+  } catch (error) {
+    if (!(error instanceof Failure)) throw error;
+    claims.print(`agent-gh guard: could not check who holds #${issue} (${error.stage} failed: ${error.detail}); committing on ${branch} unchecked, and \`agent-gh review full\` refuses a commit that is not the claim holder's`);
+    return undefined;
+  }
+  if (holder === undefined || mine(holder, family, claims.session.id)) return undefined;
+  const who = claims.session.generated
+    ? "this session, which has no id in its environment (set AGENT_GH_SESSION to the id its claim printed)"
+    : `this ${family} session (${claims.session.id})`;
+  return {
+    code: 1,
+    message: `agent-gh guard: branch \`${branch}\` is #${issue}'s claim branch, and #${issue} is held by ${describeClaim(holder)}, not ${who}; commit on your own claim branch (\`agent-gh claim <n>\`).\n${NEXT_STEP}`,
+  };
+};
+
+/**
+ * What a repository's git hook does, whichever tool ran git. In an agent
+ * session, in a repository with a github.com remote, `commit-msg` first
+ * refuses a commit on another session's claim branch (`foreignClaim`), then
+ * credits the session: it adds the Agent-* trailers the harness reports, the
+ * session's id, and the family App as co-author with `git interpret-trailers`
+ * (as `git commit --trailer` does, so comments and the `-v` scissors are
+ * respected). Otherwise it leaves the message alone. It never refuses a
+ * commit for lacking them. `pre-push` passes a person's push; an agent
+ * session's is checked by the CLI's `guardPush`, which needs GitHub, before
+ * this runs. Anything this version does not understand fails with exit 2,
+ * never a silent pass.
+ */
+export const guard = async (
   args: readonly string[],
   env: Env,
   configDir: string,
   registry: Registry,
   repository: () => GitConfig,
-): Verdict => {
+  claims: ClaimCheck,
+): Promise<Verdict> => {
   const [hook, ...rest] = args;
   if (hook === "commit-msg") {
     const [file] = rest;
     if (file === undefined || rest.length !== 1) return unknown("commit-msg takes the message file git passes it");
     if (!inAgentSession(env)) return PASS;
     const config = repository();
-    if (!onGitHub(config)) return PASS;
+    const repo = githubRepo(config);
+    if (repo === undefined) return PASS;
     const text = readFileSync(file, "utf8");
     const prefix = commentPrefix(config, text);
     if (!hasMessage(text, prefix, stripsComments(config, env, text, prefix))) return PASS;
     const identity = detectIdentity(env);
+    const refused = await foreignClaim(claims, repo, identity.family);
+    if (refused !== undefined) return refused;
     const app = readConfig(configDir, identity.family, registry);
-    const result = Bun.spawnSync(["git", "interpret-trailers", "--in-place", "--no-divider", ...trailerArgs(identity, app), file], {
+    const session = claims.session.generated ? undefined : claims.session.id;
+    const result = Bun.spawnSync(["git", "interpret-trailers", "--in-place", "--no-divider", ...trailerArgs(identity, app, session), file], {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "pipe",

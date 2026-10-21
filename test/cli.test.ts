@@ -106,7 +106,11 @@ test("agent-gh git, from older releases, is plain git with a note, in or out of 
 
 test("review takes sweep or full and their own flags, and refuses anything else before any request", async () => {
   const agent = { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1", GH_REPO: "johnrees/penmon" };
-  for (const args of [["review"], ["review", "all"], ["review", "full", "--base", "main"], ["review", "full", "--pr", "x"], ["review", "sweep", "--effort", "huge"], ["review", "full", "--pr"]]) {
+  for (const args of [
+    ["review"], ["review", "all"], ["review", "full", "--base", "main"], ["review", "full", "--pr", "x"], ["review", "sweep", "--effort", "huge"], ["review", "full", "--pr"],
+    // --adopt stands alone, once, on full only.
+    ["review", "sweep", "--adopt"], ["review", "full", "--adopt", "--adopt"], ["review", "full", "--adopt", "yes"],
+  ]) {
     const result = await cli(args, agent);
     expect(result.code).toBe(1);
     expect(result.stderr).toStartWith("usage:");

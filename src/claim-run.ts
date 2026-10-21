@@ -115,6 +115,12 @@ const issueOf = async (io: ApiIo, stage: Stage, number: number): Promise<Record<
 export const claimState = async (io: ApiIo, stage: Stage, issue: Record<string, unknown>): Promise<Taken> =>
   taken(io.repo, issue, await openPulls(io, stage), await comments(io, stage, issue.number as number));
 
+/** The claim that holds issue `number` now, as `claims` judges it; undefined when nothing does, or there is no such open issue. */
+export const holderOf = async (io: ApiIo, stage: Stage, number: number): Promise<Claim | undefined> => {
+  const issue = await issueOf(io, stage, number);
+  return issue === undefined ? undefined : (await claimState(io, stage, issue)).holder;
+};
+
 /** Creates the label when it is missing, then adds it to `issue`; a refusal is reported, since the label only mirrors the claim. */
 const addLabel = async (io: ApiIo, stage: Stage, issue: number, label: string, print: (line: string) => void): Promise<void> => {
   const name = encodeURIComponent(label);

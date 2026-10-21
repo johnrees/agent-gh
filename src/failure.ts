@@ -43,6 +43,7 @@ export type Stage =
   | "reading a credential"
   | "reading the review config"
   | "checking the review"
+  | "checking the commit"
   | "checking the merge"
   | "checking the push"
   | "checking the release"

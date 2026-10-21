@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { type GrantMarker, GRANT_LABEL, grantCommand, grantProblem, parseGrant, validTag } from "./allow.ts";
+import { parseClaim } from "./claim.ts";
 import { agentApps, REGISTRY } from "./config.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { familyNames } from "./family.ts";
@@ -1204,7 +1205,57 @@ const headSha = async (io: ReviewIo): Promise<string> => {
   return head;
 };
 
-export type FullOptions = { readonly pr?: number; readonly issue?: number; readonly effort?: Effort };
+export type FullOptions = {
+  readonly pr?: number;
+  readonly issue?: number;
+  readonly effort?: Effort;
+  /** Review a claim pull request though commits on it are other sessions' (`--adopt`). */
+  readonly adopt?: boolean;
+};
+
+/** One commit since the merge base and the session its `Agent-Session` trailer names, if it has one. */
+export type CommitSession = { readonly sha: string; readonly session: string | undefined };
+
+/**
+ * Each commit since the merge base with the session that made it, as the
+ * commit-msg hook recorded it. A commit from before the hook wrote the
+ * trailer, a person's, or one by a session with no id names none.
+ */
+export const commitSessions = async (io: Pick<ReviewIo, "git">, mergeBase: string, head: string): Promise<CommitSession[]> => {
+  const log = await io.git(["log", "--no-merges", "--format=%H%x1f%(trailers:key=Agent-Session,valueonly,separator=%x1f)%x1e", `${mergeBase}..${head}`]);
+  // One entry per commit, each ended by \x1e: the sha, then any session values, separated by \x1f.
+  return (log ?? "").split("\x1e").slice(0, -1).map((entry) => {
+    const [sha, ...sessions] = entry.trim().split("\x1f").map((value) => value.trim());
+    return { sha: sha ?? "", session: sessions.find((value) => value !== "") };
+  });
+};
+
+/**
+ * A claim pull request's commits are its holder's. One whose Agent-Session
+ * trailer names another session (a session that committed onto this branch
+ * instead of its own claim's) stops the review until the holder drops or
+ * squashes it, or takes it on with `--adopt`, which the review's body then
+ * says. A pull request without a claim marker (a person's) has no holder, and
+ * a commit with no session trailer names nobody, so neither is held. Returns
+ * the commits adopted, for the body.
+ */
+const adoptedCommits = async (io: ReviewIo, pull: Pull, mergeBase: string, head: string, adopt: boolean): Promise<readonly string[]> => {
+  const holder = parseClaim(pull.body);
+  if (holder === undefined) return [];
+  const foreign = (await commitSessions(io, mergeBase, head)).filter((commit) => commit.session !== undefined && commit.session !== holder.session);
+  if (foreign.length === 0) return [];
+  const named = foreign.map((commit) => `${commit.sha.slice(0, 8)} (session ${commit.session})`);
+  if (adopt) {
+    io.print(`agent-gh: --adopt takes on ${foreign.length} commit(s) not by this claim's holder (${holder.session}): ${named.join(", ")}`);
+    return named;
+  }
+  const [first] = foreign as [CommitSession, ...CommitSession[]];
+  const [which, them] =
+    foreign.length === 1
+      ? [`commit ${first.sha.slice(0, 8)} is from session ${first.session}, not this claim's holder (${holder.session})`, "it"]
+      : [`commits ${named.join(", ")} are from other sessions than this claim's holder (${holder.session})`, "them"];
+  throw new Failure("reviewing", `${which}; drop or squash ${them}, or take ${them} on as the holder's with \`agent-gh review full --adopt\``);
+};
 
 /** Bot logins of the family Apps, as commits credit them: `johnrees-claude[bot]`. */
 const BOTS: Readonly<Record<string, string>> = Object.fromEntries(
@@ -1339,6 +1390,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const tick = await ticket(io, issue);
   const effort = options.effort ?? effortFor(config, tick.labels);
   const mergeBase = await mergeBaseOf(io, target.base, head);
+  const adopted = await adoptedCommits(io, target, mergeBase, head, options.adopt === true);
   const reviewer = reviewerFor(config, await authoredBy(io, mergeBase, head));
   const { diff, patchId } = await pullDiff(io, mergeBase, head);
   const dir = io.tempDir();
@@ -1359,7 +1411,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
     v: 1, head, merge_base: mergeBase, patch_id: patchId, verdict: review.verdict, checks: checks.state, reviewer: reviewer.family, priorities: review.findings.map((finding) => finding.priority),
   };
   const before = actions ? await headStatus(io, head) : undefined;
-  await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined }, outside));
+  await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
   // A waiver John added while the review ran stands: the labels are read afresh, and the verdict never overwrites it.
   let waived: string | undefined;
   if (actions) {

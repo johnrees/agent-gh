@@ -8,23 +8,26 @@ const CODEX: Identity = { harness: "codex", family: "codex" };
 const CO_AUTHOR = "Co-authored-by: johnrees-claude[bot] <123456+johnrees-claude[bot]@users.noreply.github.com>";
 
 test("the agent trailers replace any before them, marking what the harness does not report; the App is the co-author, once", () => {
-  expect(trailerArgs(OPUS, CONFIG)).toEqual([
+  expect(trailerArgs(OPUS, CONFIG, "1a811df7-f1a4")).toEqual([
     "--if-exists", "replace",
     "--trailer", "Agent-Model: claude-opus-5-5",
     "--trailer", "Agent-Harness: claude",
     "--trailer", "Agent-Effort: xhigh",
+    "--trailer", "Agent-Session: 1a811df7-f1a4",
     "--if-exists", "addIfDifferent",
     "--trailer", CO_AUTHOR,
   ]);
+  // A session with no id in its environment names none, rather than a fresh id per commit.
   expect(trailerArgs(CODEX, CONFIG)).toEqual([
     "--if-exists", "replace",
     "--trailer", `Agent-Model: ${ABSENT}`,
     "--trailer", "Agent-Harness: codex",
     "--trailer", `Agent-Effort: ${ABSENT}`,
+    "--trailer", `Agent-Session: ${ABSENT}`,
     "--if-exists", "addIfDifferent",
     "--trailer", CO_AUTHOR,
   ]);
-  expect(withoutAbsent(`x\n\nAgent-Model: ${ABSENT}\nAgent-Harness: codex\nAgent-Effort: ${ABSENT}\n${CO_AUTHOR}\n`)).toBe(
+  expect(withoutAbsent(`x\n\nAgent-Model: ${ABSENT}\nAgent-Harness: codex\nAgent-Effort: ${ABSENT}\nAgent-Session: ${ABSENT}\n${CO_AUTHOR}\n`)).toBe(
     `x\n\nAgent-Harness: codex\n${CO_AUTHOR}\n`,
   );
 });

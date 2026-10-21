@@ -1201,6 +1201,8 @@ export const reviewBody = (
     readonly marker: ReviewMarker; readonly reviewer: Reviewer; readonly effort: Effort; readonly issue: string; readonly checks: ChecksResult; readonly postOutput: boolean;
     /** The earlier head a re-review judged the changes since. */
     readonly since: string | undefined;
+    /** Commits by other sessions than the claim's holder, which `--adopt` took on, each "abc12345 (session …)". */
+    readonly adopted: readonly string[];
   },
   outside: readonly Finding[],
 ): string => {
@@ -1208,6 +1210,7 @@ export const reviewBody = (
   return [
     reviewMarker(meta.marker),
     `**${STATUS_CONTEXT}** of ${meta.marker.head.slice(0, 8)}${meta.since === undefined ? "" : ` (changes since ${meta.since.slice(0, 8)})`} against ${meta.issue} by ${meta.reviewer.model} (${meta.reviewer.family}) at ${meta.effort}: ${review.verdict === "approve" ? "approve" : "changes requested"}; ${checksSummary(meta.checks)}`,
+    ...(meta.adopted.length === 0 ? [] : ["", `Adopted as the claim holder's with \`--adopt\`: ${meta.adopted.join(", ")}.`]),
     "",
     inert(review.spec),
     ...(review.findings.length === 0
