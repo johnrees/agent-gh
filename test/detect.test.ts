@@ -1,8 +1,11 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { childEnv } from "../src/env.ts";
 import { Failure } from "../src/failure.ts";
 import { familyOfHost, familyOfModel, familyOfProvider } from "../src/family.ts";
-import { codexProviderOf, detectHarness, detectIdentity, type Env, inAgentSession } from "../src/harness.ts";
+import { codexProviderOf, detectHarness, detectIdentity, type Env, inAgentSession, piTranscriptModel } from "../src/harness.ts";
 import { parseRepo, repoFlag, resolveRepo } from "../src/repo.ts";
 
 const refusal = (run: () => unknown): string => {
@@ -17,8 +20,11 @@ const refusal = (run: () => unknown): string => {
 
 const CLAUDE: Env = { CLAUDECODE: "1", CLAUDE_CODE_CHILD_SESSION: "1" };
 const noCodexConfig = () => undefined;
-const identity = (env: Env, codexProvider: (env: Env) => string | undefined = noCodexConfig) =>
-  detectIdentity(env, codexProvider);
+const identity = (
+  env: Env,
+  codexProvider: (env: Env) => string | undefined = noCodexConfig,
+  piTranscript: (env: Env) => { readonly provider?: string; readonly model: string } | undefined = () => undefined,
+) => detectIdentity(env, codexProvider, piTranscript);
 
 test("each harness is detected by the variable it sets", () => {
   expect(detectHarness(CLAUDE)).toBe("claude");
@@ -132,6 +138,37 @@ test("pi reports its model, provider, and reasoning level", () => {
     "detecting the model: pi runs local/llama-9, which no family in agent-gh's table claims",
   );
   expect(refusal(() => identity({ PI_SESSION_ID: "p" }))).toBe("detecting the model: pi did not report its model (PI_MODEL is unset)");
+});
+
+test("pi's virtual model resolves to the physical model that answered it", () => {
+  const transcript = [
+    JSON.stringify({ type: "model_change", provider: "openrouter", modelId: "openrouter/auto" }),
+    JSON.stringify({ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-opus-5-5" } }),
+  ].join("\n");
+  expect(piTranscriptModel(transcript)).toEqual({ provider: "anthropic", model: "claude-opus-5-5" });
+
+  const file = join(mkdtempSync(join(tmpdir(), "agent-gh-pi-")), "session.jsonl");
+  writeFileSync(file, transcript);
+  expect(detectIdentity({ PI_SESSION_ID: "p", PI_MODEL: "openrouter/auto", PI_PROVIDER: "openrouter", PI_SESSION_FILE: file })).toEqual({
+    harness: "pi",
+    family: "claude",
+    model: "claude-opus-5-5",
+  });
+
+  // A model switch after the last answer names the selection, not that answer.
+  expect(
+    piTranscriptModel(
+      [transcript, JSON.stringify({ type: "model_change", provider: "openrouter", modelId: "z-ai/glm-5.3" })].join("\n"),
+    ),
+  ).toEqual({ provider: "openrouter", model: "z-ai/glm-5.3" });
+});
+
+test("a pi model the environment already places needs no transcript", () => {
+  expect(
+    identity({ PI_SESSION_ID: "p", PI_PROVIDER: "openrouter", PI_MODEL: "z-ai/glm-4.6" }, noCodexConfig, () => {
+      throw new Error("the transcript must not be read");
+    }).family,
+  ).toBe("glm");
 });
 
 test("AGENT_GH_MODEL never overrides a model the harness reports", () => {

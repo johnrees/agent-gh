@@ -1,4 +1,5 @@
 import { runChild } from "./child.ts";
+import { READ_APP } from "./config.ts";
 import { coAuthorTrailer, gitAuthor } from "./git.ts";
 import { type Repo, slug } from "./repo.ts";
 import { type Context, withToken } from "./run.ts";
@@ -7,19 +8,22 @@ import { type Context, withToken } from "./run.ts";
  * One check of the whole path: who is acting (harness, model, family, App),
  * then, with John's user token for that App: the acting user, that the token
  * belongs to the App (GitHub lists only the issuing App's installations for a
- * user token), John's git author, and git access to the repository. Exit 0
- * only if all hold.
+ * user token), John's git author, and git access to the repository. A person's
+ * shell has no harness or family, so it checks with the read App. Exit 0 only
+ * if all hold.
  */
 export const doctor = async (context: Context & { readonly repo: Repo }, print: (line: string) => void): Promise<number> => {
   const { identity } = context;
+  const person = identity.family === READ_APP;
   print(`harness: ${identity.harness}`);
+  if (person) print("mode: a person's shell; checks use the read App");
   print(`model: ${identity.model ?? "not reported"}`);
   if (identity.effort !== undefined) print(`effort: ${identity.effort}`);
   print(`family: ${identity.family}`);
   print(`repository: ${slug(context.repo)}`);
   return withToken(context, async (env, config) => {
     print(`app: ${config.slug}`);
-    print(`commits get: ${coAuthorTrailer(config)}`);
+    if (!person) print(`commits get: ${coAuthorTrailer(config)}`);
     const user = await runChild(["gh", "api", "user", "--jq", ".login"], env, true);
     const installs = await runChild(
       ["gh", "api", "user/installations", "--jq", ".installations[] | select(.app_slug == \"" + config.slug + "\") | .account.login"],

@@ -178,13 +178,76 @@ const claude = (env: Env): Identity => {
   };
 };
 
-const pi = (env: Env): Identity => {
-  const model = env.PI_MODEL;
-  const provider = env.PI_PROVIDER;
-  const family = agree([
-    ["PI_MODEL", set(model) ? familyOfModel(model) : undefined],
-    ["PI_PROVIDER", set(provider) ? familyOfProvider(provider) : undefined],
-  ]);
+type PiModel = { readonly provider?: string; readonly model: string };
+
+/**
+ * The model pi answered with, from its session transcript: a virtual model is
+ * what PI_MODEL selects, while the assistant messages name the physical model
+ * that actually ran. The latest model_change wins until an answer follows it.
+ */
+export const piTranscriptModel = (text: string): PiModel | undefined => {
+  let selected: PiModel | undefined;
+  let answered: PiModel | undefined;
+  for (const raw of text.split("\n")) {
+    if (raw.trim() === "") continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    if (record.type === "model_change" && typeof record.modelId === "string") {
+      selected = {
+        model: record.modelId,
+        ...(typeof record.provider === "string" ? { provider: record.provider } : {}),
+      };
+      answered = undefined;
+    } else if (record.type === "message" && typeof record.message === "object" && record.message !== null) {
+      const message = record.message as Record<string, unknown>;
+      if (message.role === "assistant" && typeof message.model === "string") {
+        answered = {
+          model: message.model,
+          ...(typeof message.provider === "string" ? { provider: message.provider } : {}),
+        };
+      }
+    }
+  }
+  return answered ?? selected;
+};
+
+/** Reads the model from pi's session file (PI_SESSION_FILE), when it can. */
+export type PiTranscript = (env: Env) => PiModel | undefined;
+
+export const readPiTranscript: PiTranscript = (env) => {
+  const path = env.PI_SESSION_FILE;
+  if (!set(path)) return undefined;
+  try {
+    return piTranscriptModel(readFileSync(path, "utf8"));
+  } catch {
+    return undefined;
+  }
+};
+
+const pi = (env: Env, transcript: PiTranscript): Identity => {
+  const from = (model: string | undefined, provider: string | undefined) =>
+    agree([
+      ["PI_MODEL", set(model) ? familyOfModel(model) : undefined],
+      ["PI_PROVIDER", set(provider) ? familyOfProvider(provider) : undefined],
+    ]);
+  let model = env.PI_MODEL;
+  let provider = env.PI_PROVIDER;
+  let family = from(model, provider);
+  if (family === undefined) {
+    // A virtual model's id claims no family; the transcript names the model that answered it.
+    const answered = transcript(env);
+    if (answered !== undefined) {
+      model = answered.model;
+      provider = answered.provider;
+      family = from(model, provider);
+    }
+  }
   if (family === undefined) {
     return refuse(
       set(model)
@@ -235,7 +298,11 @@ const declaredOnly = (harness: string, env: Env, hint: string): Identity => {
  * the model where the harness reports none (opencode, Codex with another
  * provider, a runner); where the harness does report one, it must agree.
  */
-export const detectIdentity = (env: Env, codexProvider: CodexProvider = readCodexProvider): Identity => {
+export const detectIdentity = (
+  env: Env,
+  codexProvider: CodexProvider = readCodexProvider,
+  piTranscript: PiTranscript = readPiTranscript,
+): Identity => {
   const harness = detectHarness(env);
   if (harness === "codex") return codex(env, codexProvider);
   if (harness === "opencode") {
@@ -248,7 +315,7 @@ export const detectIdentity = (env: Env, codexProvider: CodexProvider = readCode
   if (harness !== "claude" && harness !== "pi") {
     return declaredOnly(harness, env, `set AGENT_GH_MODEL to the model this ${harness} runner drives`);
   }
-  const identity = harness === "claude" ? claude(env) : pi(env);
+  const identity = harness === "claude" ? claude(env) : pi(env, piTranscript);
   const session = declared(env);
   if (session !== undefined && session.family !== identity.family) {
     return refuse(
