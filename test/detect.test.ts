@@ -5,7 +5,16 @@ import { join } from "node:path";
 import { childEnv } from "../src/env.ts";
 import { Failure } from "../src/failure.ts";
 import { familyOfHost, familyOfModel, familyOfProvider } from "../src/family.ts";
-import { codexProviderOf, detectHarness, detectIdentity, type Env, inAgentSession, piTranscriptModel } from "../src/harness.ts";
+import {
+  codexProviderOf,
+  detectHarness,
+  detectIdentity,
+  type Env,
+  inAgentSession,
+  personShell,
+  piAnswer,
+  type PiTranscript,
+} from "../src/harness.ts";
 import { parseRepo, repoFlag, resolveRepo } from "../src/repo.ts";
 
 const refusal = (run: () => unknown): string => {
@@ -23,7 +32,7 @@ const noCodexConfig = () => undefined;
 const identity = (
   env: Env,
   codexProvider: (env: Env) => string | undefined = noCodexConfig,
-  piTranscript: (env: Env) => { readonly provider?: string; readonly model: string } | undefined = () => undefined,
+  piTranscript: PiTranscript = () => undefined,
 ) => detectIdentity(env, codexProvider, piTranscript);
 
 test("each harness is detected by the variable it sets", () => {
@@ -44,6 +53,16 @@ test("a runner that names its harness is an agent session, so its commits are cr
   expect(inAgentSession({ AGENT_GH_HARNESS: "codex" })).toBe(true);
   expect(inAgentSession({ AGENT_GH_HARNESS: "nope" })).toBe(false);
   expect(inAgentSession({ AGENT_GH_HARNESS: "" })).toBe(false);
+});
+
+test("a person's shell is where no harness is found, not where detection fails", () => {
+  // pi's `!` commands carry none of its session variables; an IDE terminal sets CLAUDECODE alone.
+  expect(personShell({})).toBe(true);
+  expect(personShell({ CLAUDECODE: "1", AGENT_GH_HARNESS: "" })).toBe(true);
+  expect(personShell({ PI_SESSION_ID: "p" })).toBe(false);
+  expect(personShell({ ...CLAUDE, CODEX_THREAD_ID: "t" })).toBe(false);
+  expect(personShell({ AGENT_GH_HARNESS: "codex" })).toBe(false);
+  expect(personShell({ AGENT_GH_HARNESS: "nope" })).toBe(false);
 });
 
 test("no harness, or two, is refused", () => {
@@ -140,35 +159,69 @@ test("pi reports its model, provider, and reasoning level", () => {
   expect(refusal(() => identity({ PI_SESSION_ID: "p" }))).toBe("detecting the model: pi did not report its model (PI_MODEL is unset)");
 });
 
-test("pi's virtual model resolves to the physical model that answered it", () => {
-  const transcript = [
-    JSON.stringify({ type: "model_change", provider: "openrouter", modelId: "openrouter/auto" }),
-    JSON.stringify({ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-opus-5-5" } }),
-  ].join("\n");
-  expect(piTranscriptModel(transcript)).toEqual({ provider: "anthropic", model: "claude-opus-5-5" });
+/** Session entries as pi 1.3 writes them, trimmed to the fields agent-gh reads. */
+const entry = (value: unknown): string => JSON.stringify(value);
+const answer = (provider: string, model: string, thinkingLevel?: string) =>
+  entry({ type: "message", id: model, message: { role: "assistant", content: [], provider, model, thinkingLevel } });
+const SESSION = [
+  entry({ type: "session", version: 3, id: "s" }),
+  entry({ type: "model_change", provider: "openrouter", modelId: "auto" }),
+  entry({ type: "message", message: { role: "user", content: "the assistant model is claude-opus-5-5" } }),
+  answer("openrouter", "z-ai/glm-5.3", "low"),
+  entry({ type: "message", message: { role: "toolResult", content: [{ type: "text", text: '"role":"assistant"' }] } }),
+  answer("anthropic", "claude-opus-5-5", "high"),
+];
 
+test("pi's newest answer is the model that issued the command", () => {
+  expect(piAnswer(SESSION.join("\n"))).toEqual({ provider: "anthropic", model: "claude-opus-5-5", effort: "high" });
+  expect(piAnswer(`${SESSION.slice(0, 5).join("\n")}\n`)).toEqual({ provider: "openrouter", model: "z-ai/glm-5.3", effort: "low" });
+  // A torn last line, a line that only mentions an assistant, and no answer at all.
+  expect(piAnswer([...SESSION, '{"type":"message","message":{"role":"assistant"'].join("\n"))?.model).toBe("claude-opus-5-5");
+  expect(piAnswer([...SESSION, entry({ type: "custom", data: { role: "assistant", model: "deepseek-chat" } })].join("\n"))?.model).toBe(
+    "claude-opus-5-5",
+  );
+  expect(piAnswer(SESSION.slice(0, 3).join("\n"))).toBeUndefined();
+  expect(piAnswer("")).toBeUndefined();
+});
+
+test("pi's virtual model acts as the model and level its answer names", () => {
+  const VIRTUAL = { PI_SESSION_ID: "p", PI_PROVIDER: "openrouter", PI_MODEL: "auto", PI_REASONING_LEVEL: "off" };
   const file = join(mkdtempSync(join(tmpdir(), "agent-gh-pi-")), "session.jsonl");
-  writeFileSync(file, transcript);
-  expect(detectIdentity({ PI_SESSION_ID: "p", PI_MODEL: "openrouter/auto", PI_PROVIDER: "openrouter", PI_SESSION_FILE: file })).toEqual({
+  writeFileSync(file, `${SESSION.join("\n")}\n`);
+  expect(detectIdentity({ ...VIRTUAL, PI_SESSION_FILE: file })).toEqual({
+    harness: "pi",
+    family: "claude",
+    model: "claude-opus-5-5",
+    effort: "high",
+  });
+
+  // Listed under a family's provider, a virtual model still routes anywhere.
+  const routed = { provider: "anthropic", model: "claude-opus-5-5" };
+  expect(identity({ ...VIRTUAL, PI_PROVIDER: "openai-codex" }, noCodexConfig, () => routed)).toEqual({
     harness: "pi",
     family: "claude",
     model: "claude-opus-5-5",
   });
-
-  // A model switch after the last answer names the selection, not that answer.
-  expect(
-    piTranscriptModel(
-      [transcript, JSON.stringify({ type: "model_change", provider: "openrouter", modelId: "z-ai/glm-5.3" })].join("\n"),
-    ),
-  ).toEqual({ provider: "openrouter", model: "z-ai/glm-5.3" });
+  // With no transcript (an ephemeral session), the selection is all there is.
+  expect(identity({ ...VIRTUAL, PI_PROVIDER: "openai-codex" })).toEqual({ harness: "pi", family: "codex", model: "auto", effort: "off" });
+  expect(refusal(() => identity(VIRTUAL))).toBe("detecting the model: pi runs openrouter/auto, which no family in agent-gh's table claims");
+  expect(refusal(() => identity(VIRTUAL, noCodexConfig, () => ({ provider: "local", model: "llama-9" })))).toBe(
+    "detecting the model: pi runs openrouter/auto, answering with local/llama-9, which no family in agent-gh's table claims",
+  );
+  expect(refusal(() => identity(VIRTUAL, noCodexConfig, () => ({ provider: "zai", model: "deepseek-chat" })))).toBe(
+    "detecting the model: the signals disagree (PI_SESSION_FILE model: deepseek, PI_SESSION_FILE provider: glm); fix the session's model settings",
+  );
+  expect(refusal(() => identity({ ...VIRTUAL, AGENT_GH_MODEL: "glm-4.6" }, noCodexConfig, () => routed))).toBe(
+    "detecting the model: AGENT_GH_MODEL=glm-4.6 (glm) disagrees with the pi session's claude model",
+  );
 });
 
-test("a pi model the environment already places needs no transcript", () => {
-  expect(
-    identity({ PI_SESSION_ID: "p", PI_PROVIDER: "openrouter", PI_MODEL: "z-ai/glm-4.6" }, noCodexConfig, () => {
-      throw new Error("the transcript must not be read");
-    }).family,
-  ).toBe("glm");
+test("a pi model the environment places needs no transcript", () => {
+  const unread = () => {
+    throw new Error("the transcript must not be read");
+  };
+  expect(identity({ PI_SESSION_ID: "p", PI_PROVIDER: "openrouter", PI_MODEL: "z-ai/glm-4.6" }, noCodexConfig, unread).family).toBe("glm");
+  expect(identity({ PI_SESSION_ID: "p", PI_PROVIDER: "zai" }, noCodexConfig, unread)).toEqual({ harness: "pi", family: "glm" });
 });
 
 test("AGENT_GH_MODEL never overrides a model the harness reports", () => {

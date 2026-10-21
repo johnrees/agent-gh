@@ -16,12 +16,12 @@ import type { LabelRules } from "./next.ts";
 import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, wavesLines } from "./next-run.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
-import { doctor } from "./doctor.ts";
+import { doctor, PERSON } from "./doctor.ts";
 import { describe, Failure, NEXT_STEP } from "./failure.ts";
 import { GITHUB } from "./github.ts";
 import { guard } from "./guard.ts";
 import { familyNames } from "./family.ts";
-import { detectIdentity, inAgentSession, type Identity } from "./harness.ts";
+import { detectIdentity, inAgentSession, personShell } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
 import { parseThreadRef, sessionId } from "./notify.ts";
@@ -103,26 +103,6 @@ const openUrl = (url: string) => {
 };
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
-
-/**
- * `doctor` checks a person's shell too, with the read App; every other command
- * needs an agent session. A real detection failure (two harnesses, an unknown
- * AGENT_GH_HARNESS) is still reported.
- */
-const doctorIdentity = (env: NodeJS.ProcessEnv): Identity => {
-  try {
-    return detectIdentity(env);
-  } catch (error) {
-    if (
-      error instanceof Failure &&
-      error.stage === "detecting the harness" &&
-      error.detail.startsWith("no agent harness detected")
-    ) {
-      return { harness: "none", family: READ_APP };
-    }
-    throw error;
-  }
-};
 
 /** Apps setup, login, and settings accept: every family, and the read App. */
 const apps = (): string[] => [...familyNames(), READ_APP];
@@ -591,7 +571,8 @@ const main = async (argv: readonly string[]): Promise<number> => {
     console.error(USAGE);
     return 1;
   }
-  const identity = first === "doctor" ? doctorIdentity(env) : detectIdentity(env);
+  // doctor also checks a person's shell, with the read App; every other command needs an agent session.
+  const identity = first === "doctor" && personShell(env) ? PERSON : detectIdentity(env);
   const args = first === "gh" ? rest : argv;
   const local = first === "doctor" || first === "review" || first === "reply" || first === "notify";
   // Outside a clone, a reply or notify that names its thread by URL acts in that thread's repository.

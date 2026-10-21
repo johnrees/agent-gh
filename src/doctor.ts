@@ -1,25 +1,31 @@
 import { runChild } from "./child.ts";
 import { READ_APP } from "./config.ts";
 import { coAuthorTrailer, gitAuthor } from "./git.ts";
+import type { Identity } from "./harness.ts";
 import { type Repo, slug } from "./repo.ts";
 import { type Context, withToken } from "./run.ts";
+
+/** Who doctor checks as in a person's own shell, which has no harness, model, or family: the read App. */
+export const PERSON: Identity = { harness: "none", family: READ_APP };
 
 /**
  * One check of the whole path: who is acting (harness, model, family, App),
  * then, with John's user token for that App: the acting user, that the token
  * belongs to the App (GitHub lists only the issuing App's installations for a
- * user token), John's git author, and git access to the repository. A person's
- * shell has no harness or family, so it checks with the read App. Exit 0 only
- * if all hold.
+ * user token), John's git author, and git access to the repository. Exit 0
+ * only if all hold.
  */
 export const doctor = async (context: Context & { readonly repo: Repo }, print: (line: string) => void): Promise<number> => {
   const { identity } = context;
-  const person = identity.family === READ_APP;
-  print(`harness: ${identity.harness}`);
-  if (person) print("mode: a person's shell; checks use the read App");
-  print(`model: ${identity.model ?? "not reported"}`);
-  if (identity.effort !== undefined) print(`effort: ${identity.effort}`);
-  print(`family: ${identity.family}`);
+  const person = identity.family === PERSON.family;
+  if (person) {
+    print("harness: none, a person's shell; checks use the read App");
+  } else {
+    print(`harness: ${identity.harness}`);
+    print(`model: ${identity.model ?? "not reported"}`);
+    if (identity.effort !== undefined) print(`effort: ${identity.effort}`);
+    print(`family: ${identity.family}`);
+  }
   print(`repository: ${slug(context.repo)}`);
   return withToken(context, async (env, config) => {
     print(`app: ${config.slug}`);

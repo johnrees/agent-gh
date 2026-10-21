@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, Failure } from "../src/failure.ts";
 import { readConfig, type Registry } from "../src/config.ts";
-import { doctor } from "../src/doctor.ts";
+import { doctor, PERSON } from "../src/doctor.ts";
 import { type Context, runAs } from "../src/run.ts";
 import {
   ACCESS,
@@ -373,17 +373,17 @@ group("another machine needs only the committed registry and `agent-gh login`", 
     const read = { ...ENTRY, slug: "johnrees-read" };
     const machine = {
       ...context,
-      identity: { harness: "none", family: "read" },
+      identity: PERSON,
       configDir: dir,
       registry: { read },
       env: { ...context.env, PATH: `${bin}:${process.env.PATH}` },
     } satisfies Context;
     const lines: string[] = [];
     expect(await doctor(machine, (line) => lines.push(line))).toBe(0);
-    expect(lines).toContain("harness: none");
-    expect(lines).toContain("mode: a person's shell; checks use the read App");
-    expect(lines).toContain("family: read");
+    expect(lines).toContain("harness: none, a person's shell; checks use the read App");
+    expect(lines).toContain("app: johnrees-read");
     expect(lines).toContain("ok   token app: johnrees-read, installed on johnrees");
-    expect(lines.some((line) => line.startsWith("commits get:"))).toBe(false);
+    // A person has no model or family, and the read App credits no commit.
+    expect(lines.filter((line) => /^(model|family|commits get):/.test(line))).toEqual([]);
   });
 });

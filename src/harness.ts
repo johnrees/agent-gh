@@ -68,6 +68,14 @@ export const inAgentSession = (env: Env): boolean =>
   HARNESSES.some((harness) => detects(harness, env)) || harnessNames().includes(env.AGENT_GH_HARNESS ?? "");
 
 /**
+ * A person's own shell: no harness variable and no AGENT_GH_HARNESS, which is
+ * where detectHarness finds no harness. pi's `!` commands are one, since pi
+ * gives them none of its session variables.
+ */
+export const personShell = (env: Env): boolean =>
+  !HARNESSES.some((harness) => detects(harness, env)) && !set(env.AGENT_GH_HARNESS);
+
+/**
  * The harness this process runs under. `AGENT_GH_HARNESS` names one only when
  * no harness variable is present (a runner you control), never to override a
  * detected harness.
@@ -178,88 +186,86 @@ const claude = (env: Env): Identity => {
   };
 };
 
-type PiModel = { readonly provider?: string; readonly model: string };
+/** A model pi ran: its provider, its id, and its thinking level. */
+export type PiModel = { readonly provider?: string; readonly model?: string; readonly effort?: string };
+
+const nonBlank = (value: unknown): string | undefined => (typeof value === "string" && set(value) ? value.trim() : undefined);
 
 /**
- * The model pi answered with, from its session transcript: a virtual model is
- * what PI_MODEL selects, while the assistant messages name the physical model
- * that actually ran. The latest model_change wins until an answer follows it.
+ * The newest assistant message in pi's session transcript. pi appends the
+ * message that calls a tool before running it, so in a tool's command this is
+ * the message that issued the command, naming the physical model a virtual
+ * model routed it to (pi docs/virtual-models.md). Read from the end, since a
+ * session file grows with every tool output.
  */
-export const piTranscriptModel = (text: string): PiModel | undefined => {
-  let selected: PiModel | undefined;
-  let answered: PiModel | undefined;
-  for (const raw of text.split("\n")) {
-    if (raw.trim() === "") continue;
+export const piAnswer = (transcript: string): PiModel | undefined => {
+  let end = transcript.length;
+  while (end > 0) {
+    const start = transcript.lastIndexOf("\n", end - 1) + 1;
+    const line = transcript.slice(start, end);
+    end = start - 1;
+    if (!line.includes('"assistant"')) continue;
     let entry: unknown;
     try {
-      entry = JSON.parse(raw);
+      entry = JSON.parse(line);
     } catch {
       continue;
     }
     if (typeof entry !== "object" || entry === null) continue;
-    const record = entry as Record<string, unknown>;
-    if (record.type === "model_change" && typeof record.modelId === "string") {
-      selected = {
-        model: record.modelId,
-        ...(typeof record.provider === "string" ? { provider: record.provider } : {}),
-      };
-      answered = undefined;
-    } else if (record.type === "message" && typeof record.message === "object" && record.message !== null) {
-      const message = record.message as Record<string, unknown>;
-      if (message.role === "assistant" && typeof message.model === "string") {
-        answered = {
-          model: message.model,
-          ...(typeof message.provider === "string" ? { provider: message.provider } : {}),
-        };
-      }
-    }
+    const { type, message } = entry as { type?: unknown; message?: unknown };
+    if (type !== "message" || typeof message !== "object" || message === null) continue;
+    const { role, provider, model, thinkingLevel } = message as Record<string, unknown>;
+    const id = nonBlank(model);
+    if (role !== "assistant" || id === undefined) continue;
+    const from = nonBlank(provider);
+    const effort = nonBlank(thinkingLevel);
+    return { model: id, ...(from === undefined ? {} : { provider: from }), ...(effort === undefined ? {} : { effort }) };
   }
-  return answered ?? selected;
+  return undefined;
 };
 
-/** Reads the model from pi's session file (PI_SESSION_FILE), when it can. */
+/** The model that issued this command, from pi's session file, when it can tell. */
 export type PiTranscript = (env: Env) => PiModel | undefined;
 
 export const readPiTranscript: PiTranscript = (env) => {
   const path = env.PI_SESSION_FILE;
   if (!set(path)) return undefined;
   try {
-    return piTranscriptModel(readFileSync(path, "utf8"));
+    return piAnswer(readFileSync(path, "utf8"));
   } catch {
     return undefined;
   }
 };
 
 const pi = (env: Env, transcript: PiTranscript): Identity => {
-  const from = (model: string | undefined, provider: string | undefined) =>
-    agree([
-      ["PI_MODEL", set(model) ? familyOfModel(model) : undefined],
-      ["PI_PROVIDER", set(provider) ? familyOfProvider(provider) : undefined],
-    ]);
-  let model = env.PI_MODEL;
-  let provider = env.PI_PROVIDER;
-  let family = from(model, provider);
+  const selected: PiModel = {
+    ...(set(env.PI_PROVIDER) ? { provider: env.PI_PROVIDER.trim() } : {}),
+    ...(set(env.PI_MODEL) ? { model: env.PI_MODEL.trim() } : {}),
+    ...(set(env.PI_REASONING_LEVEL) ? { effort: env.PI_REASONING_LEVEL.trim() } : {}),
+  };
+  // PI_MODEL is the selected model. A virtual one names no family, even when it
+  // is listed under a provider that does (openai-codex/auto can route to any
+  // model), so the answer that issued this command names the model and level.
+  const ran = (selected.model !== undefined && familyOfModel(selected.model) === undefined && transcript(env)) || selected;
+  const [modelSource, providerSource] =
+    ran === selected ? ["PI_MODEL", "PI_PROVIDER"] : ["PI_SESSION_FILE model", "PI_SESSION_FILE provider"];
+  const family = agree([
+    [modelSource, ran.model === undefined ? undefined : familyOfModel(ran.model)],
+    [providerSource, ran.provider === undefined ? undefined : familyOfProvider(ran.provider)],
+  ]);
   if (family === undefined) {
-    // A virtual model's id claims no family; the transcript names the model that answered it.
-    const answered = transcript(env);
-    if (answered !== undefined) {
-      model = answered.model;
-      provider = answered.provider;
-      family = from(model, provider);
-    }
-  }
-  if (family === undefined) {
+    const name = (model: PiModel) => `${model.provider === undefined ? "" : `${model.provider}/`}${model.model}`;
     return refuse(
-      set(model)
-        ? `pi runs ${set(provider) ? `${provider.trim()}/` : ""}${model.trim()}, which no family in agent-gh's table claims`
-        : "pi did not report its model (PI_MODEL is unset)",
+      selected.model === undefined
+        ? "pi did not report its model (PI_MODEL is unset)"
+        : `pi runs ${name(selected)}${ran === selected ? "" : `, answering with ${name(ran)}`}, which no family in agent-gh's table claims`,
     );
   }
   return {
     harness: "pi",
     family,
-    ...(set(model) ? { model: model.trim() } : {}),
-    ...(set(env.PI_REASONING_LEVEL) ? { effort: env.PI_REASONING_LEVEL.trim() } : {}),
+    ...(ran.model === undefined ? {} : { model: ran.model }),
+    ...(ran.effort === undefined ? {} : { effort: ran.effort }),
   };
 };
 
