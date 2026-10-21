@@ -276,7 +276,7 @@ Fields are named as in `next --waves --json` and `claims --json`. `blocked_by` i
 - `not_dispatched`: unclaimed and unblocked, but not `ready`, or not in the Queue.
 - `workable`: what `next` offers.
 
-A prototype timeline page draws the graph as a table, one row per issue with every blocker above what it blocks, and the `blocked_by` edges as lanes down the left: `agent-gh graph --json -R OWNER/REPO | bun scripts/timeline.ts > timeline.html` (or `bun scripts/timeline.ts graph.json`). The page is static and loads nothing remote.
+A prototype timeline page draws the graph as a table, one row per issue with every blocker above what it blocks, and the `blocked_by` edges as lanes down the left: `agent-gh graph --json -R OWNER/REPO | bun scripts/timeline.ts > timeline.html` (or `bun scripts/timeline.ts graph.json`). The page is static and loads nothing remote. Its legend's checkboxes hide statuses, or the rows in other repositories, and lay the rest out again; the URL keeps the choice (`#hide=merged,closed`).
 
 ## Releases
 
