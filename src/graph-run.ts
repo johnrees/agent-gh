@@ -40,6 +40,8 @@ const graphql = async (io: ApiIo, query: string, variables: Record<string, unkno
   if (status < 200 || status >= 300) throw new Failure(STAGE, `HTTP ${status} from POST /graphql; graph reads through GitHub's GraphQL API, which some proxies (Claude cloud's) reject, so run it from a local session`);
   const errors = record(value).errors;
   if (Array.isArray(errors) && errors.length > 0) {
+    const rollup = errors.some((error) => text(record(error).type) === "FORBIDDEN" && Array.isArray(record(error).path) && (record(error).path as unknown[]).includes("statusCheckRollup"));
+    if (rollup) throw new Failure(STAGE, `the token cannot read commit statuses in ${slug(io.repo)}; give the App "Commit statuses: read" (agent-gh settings read prints its permissions page) and accept it on the installation`);
     const types = [...new Set(errors.map((error) => text(record(error).type)).filter((type) => /^[A-Z_]{1,40}$/.test(type)))];
     throw new Failure(STAGE, `GitHub's GraphQL API refused the request${types.length === 0 ? "" : ` (${types.join(", ")})`}`);
   }

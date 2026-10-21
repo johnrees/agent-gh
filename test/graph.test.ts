@@ -380,6 +380,18 @@ test("GraphQL that fails or is refused is reported by its status or error types,
   }
 });
 
+test("a FORBIDDEN on the rollup's status contexts names the missing Commit statuses permission", async () => {
+  const path = ["repository", "pullRequests", "nodes", 0, "commits", "nodes", 0, "commit", "statusCheckRollup", "contexts", "nodes", 0];
+  const { io } = world({
+    ...REPOSITORY,
+    graphql: () => reply(200, { data: { repository: { list: { pageInfo: { hasNextPage: false }, nodes: [] } } }, errors: [{ type: "FORBIDDEN", path, message: SECRET_BODY }] }),
+  });
+  const error = await readGraph(io, apiReader(io), { all: false }, NOW).catch((caught: unknown) => caught);
+  expect(error).toBeInstanceOf(Failure);
+  expect((error as Failure).detail).toBe('the token cannot read commit statuses in johnrees/widget; give the App "Commit statuses: read" (agent-gh settings read prints its permissions page) and accept it on the installation');
+  expect((error as Failure).detail).not.toContain(SECRET_BODY);
+});
+
 test("an issue with more blockers or labels than one read holds is refused, not judged on part of them", async () => {
   const { io } = world({
     ...REPOSITORY,
