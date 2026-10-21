@@ -16,12 +16,12 @@ import type { LabelRules } from "./next.ts";
 import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, wavesLines } from "./next-run.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
-import { doctor } from "./doctor.ts";
+import { doctor, PERSON } from "./doctor.ts";
 import { describe, Failure, NEXT_STEP } from "./failure.ts";
 import { GITHUB } from "./github.ts";
 import { guard } from "./guard.ts";
 import { familyNames } from "./family.ts";
-import { detectIdentity, inAgentSession } from "./harness.ts";
+import { detectIdentity, inAgentSession, personShell } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
 import { formatLine, latestRelease, machineDoctor, sshToGitHub } from "./machine.ts";
 import { parseThreadRef, sessionId } from "./notify.ts";
@@ -571,7 +571,8 @@ const main = async (argv: readonly string[]): Promise<number> => {
     console.error(USAGE);
     return 1;
   }
-  const identity = detectIdentity(env);
+  // doctor also checks a person's shell, with the read App; every other command needs an agent session.
+  const identity = first === "doctor" && personShell(env) ? PERSON : detectIdentity(env);
   const args = first === "gh" ? rest : argv;
   const local = first === "doctor" || first === "review" || first === "reply" || first === "notify";
   // Outside a clone, a reply or notify that names its thread by URL acts in that thread's repository.

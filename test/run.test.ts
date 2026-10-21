@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, Failure } from "../src/failure.ts";
 import { readConfig, type Registry } from "../src/config.ts";
-import { doctor } from "../src/doctor.ts";
+import { doctor, PERSON } from "../src/doctor.ts";
 import { type Context, runAs } from "../src/run.ts";
 import {
   ACCESS,
@@ -307,10 +307,10 @@ group("another machine needs only the committed registry and `agent-gh login`", 
   const ENTRY = { slug: CONFIG.slug, app_id: CONFIG.app_id, client_id: CONFIG.client_id, bot_user_id: CONFIG.bot_user_id };
 
   /** A config directory with a login and nothing else: no <family>.json, no key. */
-  const loginOnly = () => {
+  const loginOnly = (family = "claude") => {
     const dir = join(mkdtempSync(join(tmpdir(), "agent-gh-")), "config");
     mkdirSync(dir, { mode: 0o700 });
-    loggedIn(dir, NOW);
+    loggedIn(dir, NOW, {}, family);
     return dir;
   };
 
@@ -355,5 +355,35 @@ group("another machine needs only the committed registry and `agent-gh login`", 
     expect(lines).toContain("ok   acting user: johnrees");
     expect(lines).toContain("ok   token app: johnrees-claude, installed on johnrees");
     expect(existsSync(join(dir, "claude.pem"))).toBe(false);
+  });
+
+  test("a person's doctor says so, credits no commit, and checks with the read App", async () => {
+    const { context } = setup({
+      ...HAPPY,
+      "GET /user/installations": () =>
+        reply(200, { total_count: 1, installations: [{ id: 42, app_slug: "johnrees-read", account: { login: "johnrees" } }] }),
+    });
+    const dir = loginOnly("read");
+    const bin = mkdtempSync(join(tmpdir(), "agent-gh-bin-"));
+    const script = (name: string, body: string) => {
+      writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    };
+    script("gh", 'case "$2" in user) echo johnrees ;; user/installations) echo johnrees ;; esac');
+    script("git", 'case "$1" in var) echo "John Rees <john@example.com> 1800000000 +0000" ;; ls-remote) echo "0000 HEAD" ;; --version) echo "git version 2" ;; esac');
+    const read = { ...ENTRY, slug: "johnrees-read" };
+    const machine = {
+      ...context,
+      identity: PERSON,
+      configDir: dir,
+      registry: { read },
+      env: { ...context.env, PATH: `${bin}:${process.env.PATH}` },
+    } satisfies Context;
+    const lines: string[] = [];
+    expect(await doctor(machine, (line) => lines.push(line))).toBe(0);
+    expect(lines).toContain("harness: none, a person's shell; checks use the read App");
+    expect(lines).toContain("app: johnrees-read");
+    expect(lines).toContain("ok   token app: johnrees-read, installed on johnrees");
+    // A person has no model or family, and the read App credits no commit.
+    expect(lines.filter((line) => /^(model|family|commits get):/.test(line))).toEqual([]);
   });
 });

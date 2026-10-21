@@ -14,7 +14,7 @@ In your own terminal, on macOS or Linux (arm64 or x64); on a machine that only r
 curl -fsSL https://raw.githubusercontent.com/johnrees/agent-gh/main/install.sh | bash
 ```
 
-It installs the checked release and gitleaks in `~/.local/bin`, logs in each App (you enter the device-flow codes it prints), puts the gh shim first on PATH, tells the agent harnesses installed here how to reach it (below), and ends with `agent-gh doctor --machine`, whose every failure names its fix. A rerun updates everything. `agent-gh doctor`, from an agent session in a repository, checks who is acting and the App's access there. `AGENT_GH_FAMILIES=claude,codex` limits the logins.
+It installs the checked release and gitleaks in `~/.local/bin`, logs in each App (you enter the device-flow codes it prints), puts the gh shim first on PATH, tells the agent harnesses installed here how to reach it (below), and ends with `agent-gh doctor --machine`, whose every failure names its fix. A rerun updates everything. `agent-gh doctor`, in a repository, checks who is acting and the App's access there: from an agent session with its family App, and from a person's shell with the read App. `AGENT_GH_FAMILIES=claude,codex` limits the logins.
 
 ## Agents find the shim
 
@@ -33,7 +33,7 @@ The harness is found from a variable it sets for its tools, and the family from 
 | --- | --- | --- |
 | Claude Code | `CLAUDECODE=1` with `CLAUDE_CODE_CHILD_SESSION` | `ANTHROPIC_BASE_URL`, `ANTHROPIC_*_MODEL`; effort from `CLAUDE_EFFORT` |
 | Codex | `CODEX_THREAD_ID` or `CODEX_SESSION_ID` | openai, else `AGENT_GH_MODEL` via `shell_environment_policy` |
-| pi | `PI_SESSION_ID` | `PI_MODEL`, `PI_PROVIDER`; effort from `PI_REASONING_LEVEL` |
+| pi | `PI_SESSION_ID` | `PI_MODEL`, `PI_PROVIDER`; effort from `PI_REASONING_LEVEL`; a model id no family claims, as a virtual model's, takes the model and level from the answer in `PI_SESSION_FILE` that ran the command, and is refused without one |
 | opencode | `OPENCODE_TERMINAL=1` | `AGENT_GH_MODEL`, set when it starts |
 
 ## Repository hooks

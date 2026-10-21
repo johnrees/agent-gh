@@ -68,6 +68,14 @@ export const inAgentSession = (env: Env): boolean =>
   HARNESSES.some((harness) => detects(harness, env)) || harnessNames().includes(env.AGENT_GH_HARNESS ?? "");
 
 /**
+ * A person's own shell: no harness variable and no AGENT_GH_HARNESS, which is
+ * where detectHarness finds no harness. pi's `!` commands are one, since pi
+ * gives them none of its session variables.
+ */
+export const personShell = (env: Env): boolean =>
+  !HARNESSES.some((harness) => detects(harness, env)) && !set(env.AGENT_GH_HARNESS);
+
+/**
  * The harness this process runs under. `AGENT_GH_HARNESS` names one only when
  * no harness variable is present (a runner you control), never to override a
  * detected harness.
@@ -178,25 +186,90 @@ const claude = (env: Env): Identity => {
   };
 };
 
-const pi = (env: Env): Identity => {
-  const model = env.PI_MODEL;
-  const provider = env.PI_PROVIDER;
+/** A model pi ran: its provider, its id, and its thinking level. */
+export type PiModel = { readonly provider?: string; readonly model?: string; readonly effort?: string };
+
+const nonBlank = (value: unknown): string | undefined => (typeof value === "string" && set(value) ? value.trim() : undefined);
+
+/**
+ * The newest assistant message in pi's session transcript. pi appends the
+ * message that calls a tool before running it, so in a tool's command this is
+ * the message that issued the command, naming the physical model a virtual
+ * model routed it to (pi docs/virtual-models.md). Read from the end, since a
+ * session file grows with every tool output.
+ */
+export const piAnswer = (transcript: string): PiModel | undefined => {
+  let end = transcript.length;
+  while (end > 0) {
+    const start = transcript.lastIndexOf("\n", end - 1) + 1;
+    const line = transcript.slice(start, end);
+    end = start - 1;
+    if (!line.includes('"assistant"')) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof entry !== "object" || entry === null) continue;
+    const { type, message } = entry as { type?: unknown; message?: unknown };
+    if (type !== "message" || typeof message !== "object" || message === null) continue;
+    const { role, provider, model, thinkingLevel } = message as Record<string, unknown>;
+    const id = nonBlank(model);
+    if (role !== "assistant" || id === undefined) continue;
+    const from = nonBlank(provider);
+    const effort = nonBlank(thinkingLevel);
+    return { model: id, ...(from === undefined ? {} : { provider: from }), ...(effort === undefined ? {} : { effort }) };
+  }
+  return undefined;
+};
+
+/** The model that issued this command, from pi's session file, when it can tell. */
+export type PiTranscript = (env: Env) => PiModel | undefined;
+
+export const readPiTranscript: PiTranscript = (env) => {
+  const path = env.PI_SESSION_FILE;
+  if (!set(path)) return undefined;
+  try {
+    return piAnswer(readFileSync(path, "utf8"));
+  } catch {
+    return undefined;
+  }
+};
+
+const pi = (env: Env, transcript: PiTranscript): Identity => {
+  const selected: PiModel = {
+    ...(set(env.PI_PROVIDER) ? { provider: env.PI_PROVIDER.trim() } : {}),
+    ...(set(env.PI_MODEL) ? { model: env.PI_MODEL.trim() } : {}),
+    ...(set(env.PI_REASONING_LEVEL) ? { effort: env.PI_REASONING_LEVEL.trim() } : {}),
+  };
+  if (selected.model === undefined) return refuse("pi did not report its model (PI_MODEL is unset)");
+  const name = (model: PiModel) => `${model.provider === undefined ? "" : `${model.provider}/`}${model.model}`;
+  // PI_MODEL is the selected model. A virtual one names no family, and it can be
+  // listed under any provider, even one that serves a single family
+  // (openai-codex/auto can route to Claude), so neither PI_PROVIDER nor the
+  // selection says who ran: only the answer that issued this command does.
+  const ran = familyOfModel(selected.model) === undefined ? transcript(env) : selected;
+  if (ran === undefined) {
+    return refuse(
+      `pi runs ${name(selected)}, which no family in agent-gh's table claims, and no session file (PI_SESSION_FILE) names the model that answered; run a model id the table claims, or a saved session`,
+    );
+  }
+  const [modelSource, providerSource] =
+    ran === selected ? ["PI_MODEL", "PI_PROVIDER"] : ["PI_SESSION_FILE model", "PI_SESSION_FILE provider"];
   const family = agree([
-    ["PI_MODEL", set(model) ? familyOfModel(model) : undefined],
-    ["PI_PROVIDER", set(provider) ? familyOfProvider(provider) : undefined],
+    [modelSource, ran.model === undefined ? undefined : familyOfModel(ran.model)],
+    [providerSource, ran.provider === undefined ? undefined : familyOfProvider(ran.provider)],
   ]);
   if (family === undefined) {
-    return refuse(
-      set(model)
-        ? `pi runs ${set(provider) ? `${provider.trim()}/` : ""}${model.trim()}, which no family in agent-gh's table claims`
-        : "pi did not report its model (PI_MODEL is unset)",
-    );
+    const answered = name(ran) === name(selected) ? "" : `, answering with ${name(ran)}`;
+    return refuse(`pi runs ${name(selected)}${answered}, which no family in agent-gh's table claims`);
   }
   return {
     harness: "pi",
     family,
-    ...(set(model) ? { model: model.trim() } : {}),
-    ...(set(env.PI_REASONING_LEVEL) ? { effort: env.PI_REASONING_LEVEL.trim() } : {}),
+    ...(ran.model === undefined ? {} : { model: ran.model }),
+    ...(ran.effort === undefined ? {} : { effort: ran.effort }),
   };
 };
 
@@ -235,7 +308,11 @@ const declaredOnly = (harness: string, env: Env, hint: string): Identity => {
  * the model where the harness reports none (opencode, Codex with another
  * provider, a runner); where the harness does report one, it must agree.
  */
-export const detectIdentity = (env: Env, codexProvider: CodexProvider = readCodexProvider): Identity => {
+export const detectIdentity = (
+  env: Env,
+  codexProvider: CodexProvider = readCodexProvider,
+  piTranscript: PiTranscript = readPiTranscript,
+): Identity => {
   const harness = detectHarness(env);
   if (harness === "codex") return codex(env, codexProvider);
   if (harness === "opencode") {
@@ -248,7 +325,7 @@ export const detectIdentity = (env: Env, codexProvider: CodexProvider = readCode
   if (harness !== "claude" && harness !== "pi") {
     return declaredOnly(harness, env, `set AGENT_GH_MODEL to the model this ${harness} runner drives`);
   }
-  const identity = harness === "claude" ? claude(env) : pi(env);
+  const identity = harness === "claude" ? claude(env) : pi(env, piTranscript);
   const session = declared(env);
   if (session !== undefined && session.family !== identity.family) {
     return refuse(

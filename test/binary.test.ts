@@ -31,11 +31,13 @@ test("the compiled binary ignores the working directory's bunfig.toml and .env",
   writeFileSync(join(repo, ".env"), "PI_SESSION_ID=planted\nPI_PROVIDER=zai\nPI_MODEL=glm-4.6\n");
   const run = Bun.spawnSync([out, "doctor"], {
     cwd: repo,
-    env: { PATH: process.env.PATH ?? "", HOME: repo },
+    env: { PATH: process.env.PATH ?? "", HOME: repo, GH_REPO: "johnrees/agent-gh" },
     stdout: "pipe",
     stderr: "pipe",
   });
   const stderr = run.stderr.toString();
   expect(stderr).not.toContain("does-not-exist");
-  expect(stderr).toContain("no agent harness detected");
+  // Had the .env loaded, doctor would be the planted pi session's glm App, not a person's read App.
+  expect(stderr).toContain("no login for read");
+  expect(stderr).not.toContain("no login for glm");
 });

@@ -1,7 +1,12 @@
 import { runChild } from "./child.ts";
+import { READ_APP } from "./config.ts";
 import { coAuthorTrailer, gitAuthor } from "./git.ts";
+import type { Identity } from "./harness.ts";
 import { type Repo, slug } from "./repo.ts";
 import { type Context, withToken } from "./run.ts";
+
+/** Who doctor checks as in a person's own shell, which has no harness, model, or family: the read App. */
+export const PERSON: Identity = { harness: "none", family: READ_APP };
 
 /**
  * One check of the whole path: who is acting (harness, model, family, App),
@@ -12,14 +17,19 @@ import { type Context, withToken } from "./run.ts";
  */
 export const doctor = async (context: Context & { readonly repo: Repo }, print: (line: string) => void): Promise<number> => {
   const { identity } = context;
-  print(`harness: ${identity.harness}`);
-  print(`model: ${identity.model ?? "not reported"}`);
-  if (identity.effort !== undefined) print(`effort: ${identity.effort}`);
-  print(`family: ${identity.family}`);
+  const person = identity.family === PERSON.family;
+  if (person) {
+    print("harness: none, a person's shell; checks use the read App");
+  } else {
+    print(`harness: ${identity.harness}`);
+    print(`model: ${identity.model ?? "not reported"}`);
+    if (identity.effort !== undefined) print(`effort: ${identity.effort}`);
+    print(`family: ${identity.family}`);
+  }
   print(`repository: ${slug(context.repo)}`);
   return withToken(context, async (env, config) => {
     print(`app: ${config.slug}`);
-    print(`commits get: ${coAuthorTrailer(config)}`);
+    if (!person) print(`commits get: ${coAuthorTrailer(config)}`);
     const user = await runChild(["gh", "api", "user", "--jq", ".login"], env, true);
     const installs = await runChild(
       ["gh", "api", "user/installations", "--jq", ".installations[] | select(.app_slug == \"" + config.slug + "\") | .account.login"],

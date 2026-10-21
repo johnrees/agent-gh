@@ -51,6 +51,13 @@ test("outside a clone, gh runs with no repository, and doctor asks for one", asy
   );
 });
 
+test("a person's doctor checks with the read App, never the agent-session refusal", async () => {
+  const result = await cli(["doctor"], { GH_REPO: "johnrees/penmon" });
+  expect(result.code).toBe(1);
+  expect(result.stderr).toStartWith("agent-gh: reading the login failed: no login for read; run `agent-gh login read` in your own terminal");
+  expect(result.stderr).not.toContain("no agent harness detected");
+});
+
 test("an IDE terminal's CLAUDECODE is a person, and opencode must declare its model", async () => {
   expect((await cli(["pr", "view"], { CLAUDECODE: "1" })).stderr).toContain("no agent harness detected");
   const opencode = await cli(["pr", "view"], { OPENCODE_TERMINAL: "1", GH_REPO: "johnrees/penmon" });
