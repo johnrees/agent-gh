@@ -336,6 +336,8 @@ type World = {
   pullBody?: string;
   /** Each head commit's Agent-Session trailer, newest first; undefined for a commit without one. */
   sessions?: (string | undefined)[];
+  /** The reviewing session's id; null when its environment names none. */
+  session?: string | null;
 };
 
 /** The page of `items` a request asks for, as GitHub pages them (all of them when it names no page). */
@@ -357,7 +359,7 @@ const world = ({
   commitPulls = [{ number: 12, state: "open", head: { sha: HEAD } }], branchPulls = [{ number: 12, state: "open" }], family = "claude",
   coAuthors = [[bot("claude")], [bot("claude")]], checkResults = [], reviewReplies = [], rules = [], branch = { protected: false }, checkRuns = [], workflowRuns = [],
   statusLater = [], comments = [], issueComments = [{ id: 70, body: "Last word.", user: { login: "someone" }, created_at: "2026-10-01T00:00:00Z" }], reactions = {},
-  reviews = [], lineComments = [], ancestors = [], base = "main", issueLabels = ["model:fable-astra"], issueEvents = [], pullBody = "Closes #7.", sessions = [],
+  reviews = [], lineComments = [], ancestors = [], base = "main", issueLabels = ["model:fable-astra"], issueEvents = [], pullBody = "Closes #7.", sessions = [], session = "s-one",
 }: World = {}) => {
   let pullReads = 0;
   const statusReads = [...statusLater];
@@ -435,6 +437,7 @@ const world = ({
     token: "ghu_test",
     repo: { owner: "johnrees", name: "widget" },
     family,
+    ...(session === null ? {} : { session }),
     git: async (args, input) => {
       if (args[0] === "rev-parse" && args.at(-1) === "HEAD" && args.length === 2) return HEAD;
       if (args[0] === "rev-parse" && args.includes("@{upstream}")) return upstream ? "origin/feature" : undefined;
@@ -828,6 +831,14 @@ test("a claim pull request's commits must be its holder's: another session's sto
   const several = world({ pullBody: claimed, sessions: ["s-two", "s-three"], answer: approve });
   expect(await gateRefusal(reviewFull(several.io, {}))).toBe(
     `commits ${"1".repeat(8)} (session s-two), ${"2".repeat(8)} (session s-three) are from other sessions than this claim's holder (s-one); drop or squash them, or take them on as the holder's with \`agent-gh review full --adopt\``,
+  );
+  // Only the holder's own session adopts; another session, or one with no id, is refused the flag.
+  const other = world({ pullBody: claimed, sessions: ["s-one", "s-two"], answer: approve, session: "s-two" });
+  expect(await gateRefusal(reviewFull(other.io, { adopt: true }))).toBe(
+    `--adopt is the claim holder's to pass (a claude session, s-one), not this claude session (s-two); the holder adopts ${"2".repeat(8)} (session s-two), or drops them`,
+  );
+  expect(await gateRefusal(reviewFull(world({ pullBody: claimed, sessions: ["s-two"], answer: approve, session: null }).io, { adopt: true }))).toContain(
+    "not this session, which has no id in its environment (set AGENT_GH_SESSION to the id its claim printed)",
   );
   const adopted = world({ pullBody: claimed, sessions: ["s-one", "s-two"], answer: approve });
   await reviewFull(adopted.io, { adopt: true });
@@ -1549,9 +1560,16 @@ test("each head commit's session is read from its Agent-Session trailer, newest 
   const repo = realRepo();
   const base = repo.commit("a.txt", "a\n", "base");
   const one = repo.commit("b.txt", "b\n", `one\n\nAgent-Harness: claude\nAgent-Session: s-one\nCo-authored-by: ${bot("claude")}`);
-  const head = repo.commit("c.txt", "c\n", "two, by hand");
-  expect(await commitSessions(repo.io, base, head)).toEqual([{ sha: head, session: undefined }, { sha: one, session: "s-one" }]);
-  expect(await commitSessions(repo.io, head, head)).toEqual([]);
+  const two = repo.commit("c.txt", "c\n", "two, by hand");
+  expect(await commitSessions(repo.io, base, two)).toEqual([{ sha: two, session: undefined }, { sha: one, session: "s-one" }]);
+  expect(await commitSessions(repo.io, two, two)).toEqual([]);
+  // A merge commit counts too: its conflict resolution is that session's work.
+  repo.git(["checkout", "-q", "-b", "side", base]);
+  const side = repo.commit("d.txt", "d\n", "aside");
+  repo.git(["checkout", "-q", "-"]);
+  repo.git(["merge", "-q", "--no-ff", "-m", "merge side\n\nAgent-Session: s-two", "side"]);
+  const merge = repo.git(["rev-parse", "HEAD"]) as string;
+  expect(await commitSessions(repo.io, base, merge)).toEqual([{ sha: merge, session: "s-two" }, { sha: two, session: undefined }, { sha: side, session: undefined }, { sha: one, session: "s-one" }]);
 });
 
 test("the patch id names the change, not its base: a rebase over unrelated work keeps it", async () => {

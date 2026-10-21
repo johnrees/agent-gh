@@ -141,6 +141,7 @@ const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): Re
   token: env.GH_TOKEN ?? "",
   repo,
   family: context.identity.family,
+  ...(claimSession(context.env).generated ? {} : { session: claimSession(context.env).id }),
   git: async (args, input) => {
     const child = Bun.spawn(["git", ...args], { env, stdin: input === undefined ? "ignore" : new Blob([input]), stdout: "pipe", stderr: "ignore" });
     const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);

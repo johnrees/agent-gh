@@ -150,6 +150,14 @@ test("a commit on any other branch, on a claim branch nothing holds, or when Git
   expect(offline.message).toBe(`work\n\n${SESSION_TRAILERS("s-one")}\n`);
   // A session with no id writes no Agent-Session trailer.
   expect((await hookOn("main", undefined, { id: "f00d", generated: true })).message).toBe(`work\n\n${CLAUDE_TRAILERS}\n`);
+  // Offline and with no id, neither check could tell the commit from the holder's, so it is refused until the session says who it is.
+  const unknown = await hookOn("claude/64-fix", new Failure("checking the commit", "could not reach api.github.com", true), { id: "f00d", generated: true });
+  expect(unknown.verdict).toEqual({
+    code: 1,
+    message: `agent-gh guard: could not check who holds #64 (checking the commit failed: could not reach api.github.com), and this session has no id in its environment, so \`agent-gh review full\` could not tell its commit from the claim holder's either; set AGENT_GH_SESSION to the id its claim printed, then commit again.\n${NEXT_STEP}`,
+  });
+  expect(unknown.printed).toEqual([]);
+  expect(unknown.message).toBe("work\n");
 });
 
 test("through git, a session with an id is credited with it, and a claim branch whose holder cannot be read is noted, not refused", () => {

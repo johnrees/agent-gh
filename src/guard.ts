@@ -92,9 +92,11 @@ export type ClaimCheck = {
  * the commit passes with a note rather than stopping a session's work on its
  * own branch: it still carries its Agent-Session trailer, and `review full`
  * refuses a pull request whose commits are not its holder's, so a stray
- * commit is still caught before it is reviewed. Undefined when the commit
- * passes: a branch that is no claim's, an issue nothing holds, or this
- * session's own claim.
+ * commit is still caught before it is reviewed. A session with no id would
+ * write no trailer, so neither check could tell its commit apart: offline,
+ * it is refused until it says who it is. Undefined when the commit passes: a
+ * branch that is no claim's, an issue nothing holds, or this session's own
+ * claim.
  */
 const foreignClaim = async (claims: ClaimCheck, repo: Repo, family: string): Promise<Verdict | undefined> => {
   const branch = claims.branch();
@@ -105,7 +107,14 @@ const foreignClaim = async (claims: ClaimCheck, repo: Repo, family: string): Pro
     holder = await claims.holder(repo, issue);
   } catch (error) {
     if (!(error instanceof Failure)) throw error;
-    claims.print(`agent-gh guard: could not check who holds #${issue} (${error.stage} failed: ${error.detail}); committing on ${branch} unchecked, and \`agent-gh review full\` refuses a commit that is not the claim holder's`);
+    const unchecked = `agent-gh guard: could not check who holds #${issue} (${error.stage} failed: ${error.detail})`;
+    if (claims.session.generated) {
+      return {
+        code: 1,
+        message: `${unchecked}, and this session has no id in its environment, so \`agent-gh review full\` could not tell its commit from the claim holder's either; set AGENT_GH_SESSION to the id its claim printed, then commit again.\n${NEXT_STEP}`,
+      };
+    }
+    claims.print(`${unchecked}; committing on ${branch} unchecked, and \`agent-gh review full\` refuses a commit that is not the claim holder's`);
     return undefined;
   }
   if (holder === undefined || mine(holder, family, claims.session.id)) return undefined;

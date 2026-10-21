@@ -71,6 +71,8 @@ export type ReviewIo = {
   readonly repo: Repo;
   /** The session's family: its work is reviewed by another family. */
   readonly family: string;
+  /** The session's id as its claims carry it (`sessionId`); undefined when its environment names none. */
+  readonly session?: string;
   /** Runs git in the working tree, with `input` on stdin; its trimmed stdout, or undefined when it fails. */
   readonly git: (args: readonly string[], input?: string) => Promise<string | undefined>;
   /** Runs one of the config's checks, a shell command, in `cwd` with `env` added, stopping it after `timeoutMs`; its exit code and its stdout and stderr together. */
@@ -1217,12 +1219,13 @@ export type FullOptions = {
 export type CommitSession = { readonly sha: string; readonly session: string | undefined };
 
 /**
- * Each commit since the merge base with the session that made it, as the
- * commit-msg hook recorded it. A commit from before the hook wrote the
+ * Each commit since the merge base, merges included (a merge's conflict
+ * resolution is that session's work too), with the session that made it, as
+ * the commit-msg hook recorded it. A commit from before the hook wrote the
  * trailer, a person's, or one by a session with no id names none.
  */
 export const commitSessions = async (io: Pick<ReviewIo, "git">, mergeBase: string, head: string): Promise<CommitSession[]> => {
-  const log = await io.git(["log", "--no-merges", "--format=%H%x1f%(trailers:key=Agent-Session,valueonly,separator=%x1f)%x1e", `${mergeBase}..${head}`]);
+  const log = await io.git(["log", "--format=%H%x1f%(trailers:key=Agent-Session,valueonly,separator=%x1f)%x1e", `${mergeBase}..${head}`]);
   // One entry per commit, each ended by \x1e: the sha, then any session values, separated by \x1f.
   return (log ?? "").split("\x1e").slice(0, -1).map((entry) => {
     const [sha, ...sessions] = entry.trim().split("\x1f").map((value) => value.trim());
@@ -1234,10 +1237,11 @@ export const commitSessions = async (io: Pick<ReviewIo, "git">, mergeBase: strin
  * A claim pull request's commits are its holder's. One whose Agent-Session
  * trailer names another session (a session that committed onto this branch
  * instead of its own claim's) stops the review until the holder drops or
- * squashes it, or takes it on with `--adopt`, which the review's body then
- * says. A pull request without a claim marker (a person's) has no holder, and
- * a commit with no session trailer names nobody, so neither is held. Returns
- * the commits adopted, for the body.
+ * squashes it, or takes it on with `--adopt`, which only the holder's own
+ * session may pass, and which the review's body then says. A pull request
+ * without a claim marker (a person's) has no holder, and a commit with no
+ * session trailer names nobody, so neither is held. Returns the commits
+ * adopted, for the body.
  */
 const adoptedCommits = async (io: ReviewIo, pull: Pull, mergeBase: string, head: string, adopt: boolean): Promise<readonly string[]> => {
   const holder = parseClaim(pull.body);
@@ -1246,6 +1250,10 @@ const adoptedCommits = async (io: ReviewIo, pull: Pull, mergeBase: string, head:
   if (foreign.length === 0) return [];
   const named = foreign.map((commit) => `${commit.sha.slice(0, 8)} (session ${commit.session})`);
   if (adopt) {
+    if (holder.family !== io.family || holder.session !== io.session) {
+      const who = io.session === undefined ? "this session, which has no id in its environment (set AGENT_GH_SESSION to the id its claim printed)" : `this ${io.family} session (${io.session})`;
+      throw new Failure("reviewing", `--adopt is the claim holder's to pass (a ${holder.family} session, ${holder.session}), not ${who}; the holder adopts ${named.join(", ")}, or drops them`);
+    }
     io.print(`agent-gh: --adopt takes on ${foreign.length} commit(s) not by this claim's holder (${holder.session}): ${named.join(", ")}`);
     return named;
   }
