@@ -140,45 +140,89 @@ export const timelineLayout = (json: GraphJson, options: { readonly hidden?: Rea
   return { rows: ordered, edges: edges.map((edge) => ({ ...edge, lane: laneOf.get(edge.from) ?? null })), lanes: taken.length, spans };
 };
 
-export const ROW = 26;
-const GAP = 8;
-export const RADIUS = 4.5;
-const ARROW = 4;
+export const ROW = 36;
+const GAP = 10;
+export const RADIUS = 4;
 
-/** The lane column as SVG shapes: each edge's path and arrowhead, and each row's node. */
+/** The lane column as SVG shapes: one path per edge, and each row's node. */
 export type TimelineSvg = {
   readonly width: number;
   readonly height: number;
-  readonly edges: readonly { readonly from: number; readonly to: number; readonly open: boolean; readonly d: string; readonly arrow: string }[];
+  readonly edges: readonly { readonly from: number; readonly to: number; readonly d: string }[];
   readonly nodes: readonly { readonly row: number; readonly cx: number; readonly cy: number }[];
 };
 
 /**
  * Every node on one spine at the column's right; lane 0 is the nearest to
- * it. A spine edge is a short arrow down; a lane edge leaves its node to the
- * left, runs down (or up) its lane, and turns right into the target.
+ * it. No arrowheads: a blocker sits above what it blocks. A spine edge is a
+ * short segment down; a lane edge leaves its source node to the left, runs
+ * down (or up) its lane, and turns right into its own target, so the edges
+ * of a source with several targets overlap on its lane.
  */
 export const timelineSvg = (layout: TimelineLayout): TimelineSvg => {
   const spine = (layout.lanes + 1) * GAP + 4;
   const y = (row: number) => row * ROW + ROW / 2;
-  const tip = spine - RADIUS - 1;
   const edges = layout.edges.map((edge) => {
-    if (edge.lane === null) {
-      const end = y(edge.to) - RADIUS - 1;
-      return { from: edge.from, to: edge.to, open: edge.open, d: `M${spine} ${y(edge.from) + RADIUS + 1}V${end - ARROW}`, arrow: `${spine},${end} ${spine - 3},${end - ARROW} ${spine + 3},${end - ARROW}` };
-    }
+    if (edge.lane === null) return { from: edge.from, to: edge.to, d: `M${spine} ${y(edge.from) + RADIUS}V${y(edge.to) - RADIUS}` };
     const x = spine - (edge.lane + 1) * GAP - 2;
     // A self-loop leaves just above the node's middle and comes back just below.
     const [from, to] = edge.from === edge.to ? [y(edge.from) - 2, y(edge.to) + 2] : [y(edge.from), y(edge.to)];
-    const turn = Math.min(4, Math.abs(to - from) / 2);
+    const turn = Math.min(6, Math.abs(to - from) / 2);
     const down = to >= from ? 1 : -1;
-    return {
-      from: edge.from, to: edge.to, open: edge.open,
-      d: `M${spine - RADIUS} ${from}H${x + turn}Q${x} ${from} ${x} ${from + turn * down}V${to - turn * down}Q${x} ${to} ${x + turn} ${to}H${tip - ARROW}`,
-      arrow: `${tip},${to} ${tip - ARROW},${to - 3} ${tip - ARROW},${to + 3}`,
-    };
+    return { from: edge.from, to: edge.to, d: `M${spine - RADIUS} ${from}H${x + turn}Q${x} ${from} ${x} ${from + turn * down}V${to - turn * down}Q${x} ${to} ${x + turn} ${to}H${spine - RADIUS}` };
   });
   return { width: spine + RADIUS + 4, height: layout.rows.length * ROW, edges, nodes: layout.rows.map((_, row) => ({ row, cx: spine, cy: y(row) })) };
+};
+
+/**
+ * The rows `row` is transitively blocked by (`ancestors`) and that
+ * transitively wait on it (`descendants`), each with its shortest distance
+ * from `row` by breadth-first search over the laid-out edges, so a hidden row
+ * breaks the chain. A row on both sides, through a cycle, is an ancestor.
+ */
+export const related = (layout: TimelineLayout, row: number): { readonly ancestors: ReadonlyMap<number, number>; readonly descendants: ReadonlyMap<number, number> } => {
+  const ancestors = reach(layout, row, "up");
+  const descendants = reach(layout, row, "down");
+  for (const at of ancestors.keys()) descendants.delete(at);
+  return { ancestors, descendants };
+};
+
+/** Each row `row` reaches up its blockers or down its dependents, with its shortest distance; a visited set ends a cycle. */
+const reach = (layout: TimelineLayout, row: number, way: "up" | "down"): Map<number, number> => {
+  const depth = new Map<number, number>([[row, 0]]);
+  const queue = [row];
+  for (let at = queue.shift(); at !== undefined; at = queue.shift()) {
+    for (const edge of layout.edges) {
+      const step = way === "up" ? (edge.to === at ? edge.from : undefined) : edge.from === at ? edge.to : undefined;
+      if (step === undefined || depth.has(step)) continue;
+      depth.set(step, (depth.get(at) as number) + 1);
+      queue.push(step);
+    }
+  }
+  depth.delete(row);
+  return depth;
+};
+
+/**
+ * What hovering (or pinning) `row` shows. An edge is `blocker` (red) on an
+ * ancestor path: its source an ancestor, its target `row` or an ancestor; it
+ * is `child` (green) on a descendant path: its source `row` or a row `row`
+ * reaches downward (an ancestor too, on a cycle);
+ * any other edge is `faded`, and so is every row but `row` and its
+ * ancestors and descendants. Each of those has a badge: `↑2` two steps up
+ * the chain of blockers, `↓1` one step down.
+ */
+export const timelineHover = (
+  layout: TimelineLayout,
+  row: number,
+): { readonly edges: readonly ("blocker" | "child" | "faded")[]; readonly faded: ReadonlySet<number>; readonly badges: ReadonlyMap<number, string> } => {
+  const { ancestors, descendants } = related(layout, row);
+  const below = reach(layout, row, "down");
+  const edges = layout.edges.map((edge) =>
+    ancestors.has(edge.from) && (edge.to === row || ancestors.has(edge.to)) ? "blocker" : edge.from === row || below.has(edge.from) ? "child" : "faded",
+  );
+  const badges = new Map([...[...ancestors].map(([at, depth]) => [at, `↑${depth}`] as const), ...[...descendants].map(([at, depth]) => [at, `↓${depth}`] as const)]);
+  return { edges, faded: new Set(layout.rows.map((_, at) => at).filter((at) => at !== row && !badges.has(at))), badges };
 };
 
 export const NONE = "—";
@@ -212,23 +256,37 @@ export const rowText = (issue: Issue, now: string): { readonly milestone: string
   };
 };
 
-/** `#hide=merged,closed` as a set; an unknown name is ignored. */
-export const parseHide = (hash: string): Set<Hideable> => {
-  const match = /^#?hide=(.*)$/.exec(hash);
-  if (match === null) return new Set();
-  let names: string;
+/** What the page keeps in its URL's hash: the hidden statuses, and the pinned row's key. */
+export type PageState = { readonly hidden: ReadonlySet<Hideable>; readonly pin: string | undefined };
+
+const decode = (text: string): string | undefined => {
   try {
-    names = decodeURIComponent(match[1] as string);
+    return decodeURIComponent(text);
   } catch {
-    return new Set();
+    return undefined;
   }
-  return new Set(HIDEABLE.filter((name) => names.split(",").includes(name)));
 };
 
-/** The hash for a hidden set, in the legend's order; empty for none. */
-export const hideHash = (hidden: ReadonlySet<Hideable>): string => {
-  const names = HIDEABLE.filter((name) => hidden.has(name));
-  return names.length === 0 ? "" : `#hide=${names.join(",")}`;
+/** `#hide=merged,closed&pin=42` (`pin=` takes a row's key, `#` left off for an issue here); an unknown name or part is ignored. */
+export const parseHash = (hash: string): PageState => {
+  const parts = new Map(
+    hash
+      .replace(/^#/, "")
+      .split("&")
+      .filter((part) => part.includes("="))
+      .map((part) => [part.slice(0, part.indexOf("=")), decode(part.slice(part.indexOf("=") + 1))] as const)
+      .filter((part): part is readonly [string, string] => part[1] !== undefined),
+  );
+  const names = (parts.get("hide") ?? "").split(",");
+  const pin = parts.get("pin");
+  return { hidden: new Set(HIDEABLE.filter((name) => names.includes(name))), pin: pin === undefined || pin === "" ? undefined : /^\d+$/.test(pin) ? `#${pin}` : pin };
+};
+
+/** The hash for a state, statuses in the legend's order; empty for nothing hidden or pinned. */
+export const stateHash = (state: PageState): string => {
+  const names = HIDEABLE.filter((name) => state.hidden.has(name));
+  const parts = [...(names.length === 0 ? [] : [`hide=${names.join(",")}`]), ...(state.pin === undefined ? [] : [`pin=${encodeURIComponent(state.pin.replace(/^#(?=\d+$)/, ""))}`])];
+  return parts.length === 0 ? "" : `#${parts.join("&")}`;
 };
 
 const ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -240,32 +298,38 @@ const UNSAFE = new RegExp(`[<>&${String.fromCharCode(0x2028, 0x2029)}]`, "g");
 export const scriptJson = (json: GraphJson): string => JSON.stringify(json).replace(UNSAFE, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 
 const STYLE = `
-:root { color-scheme: light dark; --fg: #1f2328; --muted: #656d76; --bg: #ffffff; --line: #d0d7de; --hover: #f3f6fa; --edge: #8c959f; --hi: #0969da; }
-@media (prefers-color-scheme: dark) { :root { --fg: #e6edf3; --muted: #8d96a0; --bg: #0d1117; --line: #30363d; --hover: #161b22; --edge: #6e7681; --hi: #4493f8; } }
-body { margin: 16px; font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); }
-h1 { font-size: 15px; margin: 0 0 4px; }
+:root { color-scheme: light dark; --fg: #1f2328; --text: #424a53; --muted: #6e7781; --bg: #f6f8fa; --surface: #ffffff; --line: #d8dee4; --band: rgba(191, 135, 0, 0.14); --edge: #8b949e; --blocker: #cf222e; --child: #1a7f37; }
+@media (prefers-color-scheme: dark) { :root { --fg: #e6e6e6; --text: #b4b8bd; --muted: #7d8590; --bg: #0b0c0e; --surface: #17181b; --line: #26282c; --band: rgba(210, 170, 60, 0.16); --blocker: #f85149; --child: #3fb950; } }
+body { margin: 0; padding: 16px; font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); background: var(--bg); }
+main { display: inline-block; min-width: min(100%, 960px); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; box-sizing: border-box; }
+h1 { font-size: 15px; font-weight: 600; color: var(--fg); margin: 0 0 4px; }
 .meta { color: var(--muted); margin: 2px 0; }
 .legend label { margin-right: 12px; white-space: nowrap; cursor: pointer; }
 .legend input { margin: 0 4px 0 0; vertical-align: -2px; }
-a { color: inherit; }
-table { border-collapse: collapse; margin-top: 12px; }
-th { text-align: left; font-weight: 600; color: var(--muted); padding: 4px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-td { height: ${ROW}px; padding: 0 10px; white-space: nowrap; box-shadow: inset 0 -1px var(--line); }
-td.lanes { padding: 0; vertical-align: top; box-shadow: none; line-height: 0; }
-td.num { color: var(--muted); padding-right: 0; }
-tr.hi td:not(.lanes) { background: var(--hover); }
-tr.rel td:not(.lanes) { background: color-mix(in srgb, var(--hover) 50%, transparent); }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }
+a { color: inherit; text-decoration: none; }
+a:hover { text-decoration: underline; }
+table { border-collapse: separate; border-spacing: 0; margin-top: 12px; }
+th { text-align: left; font-weight: 500; color: var(--muted); padding: 4px 10px; white-space: nowrap; }
+td { height: ${ROW}px; padding: 0 10px; white-space: nowrap; }
+th.time, td.time { text-align: right; font-variant-numeric: tabular-nums; }
+td.lanes { padding: 0; vertical-align: top; line-height: 0; }
+td.title { color: var(--fg); padding-left: 6px; }
+td.num { color: var(--muted); padding-right: 0; font-variant-numeric: tabular-nums; }
+td.depth { min-width: 2.2em; padding: 0 0 0 4px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+tbody tr { cursor: default; }
+tr.hi td:not(.lanes) { background: var(--band); }
+tr.hi td:last-child { border-radius: 0 6px 6px 0; }
+tr.faded td:not(.lanes), .faded { opacity: 0.5; }
+.band { fill: transparent; }
+.band.on { fill: var(--band); }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }
 svg { display: block; }
 svg.ring { display: inline; vertical-align: -1px; margin-right: 4px; }
-.edge { color: var(--edge); }
-.edge path { fill: none; stroke: currentColor; stroke-width: 1.25; }
-.edge polygon { fill: currentColor; }
-.edge.done { opacity: 0.45; }
-.edge.hi { color: var(--hi); opacity: 1; }
-.edge.hi path { stroke-width: 2; }
-.node { stroke: var(--bg); stroke-width: 1.5; }
-.node.foreign { fill: var(--bg); stroke: var(--muted); stroke-dasharray: 2 1.5; }
+.edge { fill: none; stroke: var(--edge); stroke-width: 1.25; }
+.edge.blocker { stroke: var(--blocker); stroke-width: 2; }
+.edge.child { stroke: var(--child); stroke-width: 2; }
+.node { stroke: var(--surface); stroke-width: 1.5; }
+.node.foreign { fill: var(--surface); stroke: var(--muted); stroke-dasharray: 2 1.5; }
 .node.foreign.shut { fill: var(--line); }
 ${STATUSES.map(([status, colour]) => `.s-${status} { fill: ${colour}; background: ${colour}; }`).join("\n")}
 `;

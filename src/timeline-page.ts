@@ -3,11 +3,13 @@
  * The timeline page's script, bundled into the page by scripts/timeline.ts:
  * reads the graph from its JSON script element and draws it with DOM APIs,
  * every string from the JSON as `textContent`. A legend checkbox hides a
- * status (or the rows in another repository) and lays the rest out again;
- * the URL's hash keeps the choice.
+ * status (or the rows in another repository) and lays the rest out again.
+ * Hovering a row shows its chain of blockers in red and of dependents in
+ * green, each row with its distance; clicking pins that. The URL's hash
+ * keeps the toggles and the pin.
  */
 import type { GraphJson } from "./graph.ts";
-import { externalUrl, githubUrl, type Hideable, hideHash, NONE, parseHide, RADIUS, rowText, STATUSES, timelineLayout, timelineSvg } from "./timeline.ts";
+import { externalUrl, githubUrl, type Hideable, NONE, type PageState, parseHash, RADIUS, ROW, rowText, STATUSES, stateHash, timelineHover, timelineLayout, timelineSvg } from "./timeline.ts";
 
 const SVG = "http://www.w3.org/2000/svg";
 const json = JSON.parse(document.getElementById("graph")?.textContent ?? "null") as GraphJson;
@@ -33,7 +35,13 @@ const dot = (status: string) => element("span", { class: `dot s-${status}` });
 const ring = (open: boolean) => shape("svg", { class: "ring", width: 12, height: 12 }, shape("circle", { class: `node foreign${open ? "" : " shut"}`, cx: 6, cy: 6, r: RADIUS }));
 const words = (status: string) => status.replace("_", " ");
 
-let hidden = parseHide(location.hash);
+let state: PageState = parseHash(location.hash);
+const save = (next: PageState) => {
+  state = next;
+  const hash = stateHash(next);
+  history.replaceState(null, "", hash === "" ? location.pathname + location.search : hash);
+};
+
 const counts = new Map<Hideable, number>();
 for (const issue of json.issues) counts.set(issue.status, (counts.get(issue.status) ?? 0) + 1);
 counts.set("external", new Set(json.issues.flatMap((issue) => issue.blocked_by.filter((blocker) => blocker.repo !== null).map((blocker) => `${blocker.repo}#${blocker.issue}`))).size);
@@ -43,12 +51,10 @@ const boxes = new Map<Hideable, HTMLInputElement>();
 const toggle = (name: Hideable, label: (Node | string)[]) => {
   const box = element("input", { type: "checkbox" });
   box.addEventListener("change", () => {
-    const next = new Set(hidden);
-    if (box.checked) next.delete(name);
-    else next.add(name);
-    const hash = hideHash(next);
-    history.replaceState(null, "", hash === "" ? location.pathname + location.search : hash);
-    hidden = next;
+    const hidden = new Set(state.hidden);
+    if (box.checked) hidden.delete(name);
+    else hidden.add(name);
+    save({ ...state, hidden });
     draw();
   });
   boxes.set(name, box);
@@ -61,83 +67,140 @@ const legend = element(
   toggle("external", [ring(true), `other repos ${counts.get("external") ?? 0}`]),
 );
 const list = (numbers: readonly number[]) => (numbers.length === 0 ? NONE : numbers.map((number) => `#${number}`).join(", "));
-const head = element("tr", {}, ...["", "Issue", "Status", "Milestone", "Holder", "Claimed", "Quiet", "Pull request"].map((name, at) => element("th", at === 1 ? { colspan: "2" } : {}, name)));
+const COLUMNS: readonly (readonly [string, string])[] = [
+  ["", ""],
+  ["", ""],
+  ["Issue", ""],
+  ["Status", ""],
+  ["Milestone", ""],
+  ["Holder", ""],
+  ["Claimed", "time"],
+  ["Quiet", "time"],
+  ["Pull request", ""],
+];
+const head = element("tr", {}, ...COLUMNS.map(([name, kind]) => element("th", { ...(name === "Issue" ? { colspan: "2" } : {}), ...(kind === "" ? {} : { class: kind }) }, name)));
 const body = element("tbody");
 document.body.append(
-  element("h1", {}, String(json.repo)),
-  summary,
-  legend,
-  element("p", { class: "meta" }, `stuck: ${list(json.stuck)} · cycles: ${json.cycles.length === 0 ? NONE : json.cycles.map(list).join("; ")}`),
-  element("table", {}, element("thead", {}, head), body),
+  element(
+    "main",
+    {},
+    element("h1", {}, String(json.repo)),
+    summary,
+    legend,
+    element("p", { class: "meta" }, `stuck: ${list(json.stuck)} · cycles: ${json.cycles.length === 0 ? NONE : json.cycles.map(list).join("; ")} · click a row to pin its chain, Escape to unpin`),
+    element("table", {}, element("thead", {}, head), body),
+  ),
 );
 
+let layout = timelineLayout(json);
+let edges: SVGElement[] = [];
+let nodes: SVGElement[] = [];
+let band: SVGElement | undefined;
+let lit: number | undefined | null = null;
+
 function draw() {
-  for (const [name, box] of boxes) box.checked = !hidden.has(name);
-  const layout = timelineLayout(json, { hidden });
+  for (const [name, box] of boxes) box.checked = !state.hidden.has(name);
+  layout = timelineLayout(json, { hidden: state.hidden });
+  lit = null;
   const drawn = timelineSvg(layout);
   summary.textContent = `fetched ${json.fetched_at} · ${layout.rows.length} rows · ${layout.lanes} lanes`;
-  const svg = shape(
-    "svg",
-    { width: drawn.width, height: drawn.height, viewBox: `0 0 ${drawn.width} ${drawn.height}`, "aria-hidden": "true" },
-    ...drawn.edges.map((edge) => shape("g", { class: `edge${edge.open ? "" : " done"}`, "data-from": edge.from, "data-to": edge.to }, shape("path", { d: edge.d }), shape("polygon", { points: edge.arrow }))),
-    ...drawn.nodes.map((node) => {
-      const row = layout.rows[node.row];
-      const kind = row?.issue === undefined ? `foreign${row?.open ? "" : " shut"}` : `s-${row.issue.status}`;
-      return shape("circle", { class: `node ${kind}`, "data-row": node.row, cx: node.cx, cy: node.cy, r: RADIUS });
-    }),
-  );
+  band = shape("rect", { class: "band", x: 0, y: 0, width: drawn.width, height: ROW });
+  edges = drawn.edges.map((edge) => shape("path", { class: "edge", "data-from": edge.from, "data-to": edge.to, d: edge.d }));
+  nodes = drawn.nodes.map((node) => {
+    const row = layout.rows[node.row];
+    const kind = row?.issue === undefined ? `foreign${row?.open ? "" : " shut"}` : `s-${row.issue.status}`;
+    return shape("circle", { class: `node ${kind}`, "data-row": node.row, cx: node.cx, cy: node.cy, r: RADIUS });
+  });
+  const svg = shape("svg", { width: drawn.width, height: drawn.height, viewBox: `0 0 ${drawn.width} ${drawn.height}`, "aria-hidden": "true" }, band, shape("g", {}, ...edges), ...nodes);
   body.replaceChildren(
     ...layout.rows.map((row, at) => {
       const cells: HTMLElement[] = at === 0 ? [element("td", { class: "lanes", rowspan: String(layout.rows.length) }, svg)] : [];
+      cells.push(element("td", { class: "depth" }));
       const issue = row.issue;
       if (issue === undefined) {
-        cells.push(element("td", { class: "num" }), element("td", {}, link(row.repo === null ? null : externalUrl(row.repo, row.number), row.key)), ...Array.from({ length: 6 }, () => element("td", {}, NONE)));
+        cells.push(
+          element("td", { class: "num" }),
+          element("td", { class: "title" }, link(row.repo === null ? null : externalUrl(row.repo, row.number), row.key)),
+          ...COLUMNS.slice(3).map(([, kind]) => element("td", kind === "" ? {} : { class: kind }, NONE)),
+        );
       } else {
         const text = rowText(issue, json.fetched_at);
         cells.push(
           element("td", { class: "num" }, link(issue.url, `#${issue.issue}`)),
-          element("td", {}, link(issue.url, issue.title)),
+          element("td", { class: "title" }, link(issue.url, issue.title)),
           element("td", {}, dot(issue.status), words(issue.status)),
           element("td", {}, text.milestone),
           element("td", {}, text.holder),
-          element("td", {}, text.claimed),
-          element("td", {}, text.quiet),
+          element("td", { class: "time" }, text.claimed),
+          element("td", { class: "time" }, text.quiet),
           element("td", {}, ...(issue.pr === null ? [NONE] : [link(issue.pr.url, `#${issue.pr.number}`), ` · ${text.pull}`])),
         );
       }
       return element("tr", { "data-row": String(at), "data-key": row.key, "data-status": issue?.status ?? "" }, ...cells);
     }),
   );
+  light(pinned() ?? undefined);
 }
 
-// Hovering a row, or its node, lights the row, its edges in and out, and the rows at their other ends.
-const light = (at: string, on: boolean) => {
-  const rows = body.children;
-  rows[Number(at)]?.classList.toggle("hi", on);
-  for (const edge of body.querySelectorAll<SVGGElement>(".edge")) {
-    const { from, to } = edge.dataset;
-    if (from !== at && to !== at) continue;
-    edge.classList.toggle("hi", on);
-    if (on) edge.parentNode?.insertBefore(edge, edge.parentNode.querySelector("circle"));
-    rows[Number(from === at ? to : from)]?.classList.toggle("rel", on);
-  }
+/** The pinned row's index, or undefined when nothing is pinned or the pinned row is hidden. */
+const pinned = (): number | undefined => {
+  const at = state.pin === undefined ? -1 : layout.rows.findIndex((row) => row.key === state.pin);
+  return at === -1 ? undefined : at;
 };
-const rowOf = (event: Event): string | undefined => {
+
+// Lights a row's chain: its blockers' edges red, its dependents' green, each related row's distance in its badge, and the rest faded.
+function light(row: number | undefined) {
+  if (row === lit) return;
+  lit = row;
+  const hover = row === undefined ? undefined : timelineHover(layout, row);
+  const pin = pinned();
+  [...body.children].forEach((tr, at) => {
+    tr.classList.toggle("hi", at === row);
+    tr.classList.toggle("pinned", at === pin);
+    tr.classList.toggle("faded", hover?.faded.has(at) ?? false);
+    const badge = tr.querySelector("td.depth");
+    if (badge !== null) badge.textContent = hover?.badges.get(at) ?? "";
+    nodes[at]?.classList.toggle("faded", hover?.faded.has(at) ?? false);
+  });
+  band?.setAttribute("y", String((row ?? 0) * ROW));
+  band?.classList.toggle("on", row !== undefined);
+  edges.forEach((edge, at) => {
+    const kind = hover?.edges[at];
+    for (const name of ["blocker", "child", "faded"]) edge.classList.toggle(name, kind === name);
+    // Coloured edges go above the faded ones.
+    if (kind === "blocker" || kind === "child") edge.parentNode?.appendChild(edge);
+  });
+}
+
+const rowOf = (event: Event): number | undefined => {
   const target = event.target instanceof Element ? event.target : null;
   const node = target?.closest<SVGElement>("circle[data-row]");
-  if (node !== null && node !== undefined) return node.dataset.row;
-  return target?.closest("td.lanes") ? undefined : target?.closest<HTMLElement>("tbody tr")?.dataset.row;
+  const at = node !== null && node !== undefined ? node.dataset.row : target?.closest("td.lanes") ? undefined : target?.closest<HTMLElement>("tbody tr")?.dataset.row;
+  return at === undefined ? undefined : Number(at);
 };
 document.addEventListener("mouseover", (event) => {
-  const at = rowOf(event);
-  if (at !== undefined) light(at, true);
+  if (pinned() === undefined) light(rowOf(event));
 });
-document.addEventListener("mouseout", (event) => {
+document.documentElement.addEventListener("mouseleave", () => {
+  if (pinned() === undefined) light(undefined);
+});
+document.addEventListener("click", (event) => {
+  if (event.target instanceof Element && event.target.closest("a") !== null) return;
   const at = rowOf(event);
-  if (at !== undefined) light(at, false);
+  if (at === undefined) return;
+  const key = layout.rows[at]?.key;
+  save({ ...state, pin: key === state.pin ? undefined : key });
+  lit = null;
+  light(pinned() ?? at);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || state.pin === undefined) return;
+  save({ ...state, pin: undefined });
+  lit = null;
+  light(undefined);
 });
 addEventListener("hashchange", () => {
-  hidden = parseHide(location.hash);
+  state = parseHash(location.hash);
   draw();
 });
 draw();
