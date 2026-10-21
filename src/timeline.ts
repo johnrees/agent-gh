@@ -319,7 +319,7 @@ td.depth { min-width: 2.2em; padding: 0 0 0 4px; color: var(--muted); font-size:
 tbody tr { cursor: default; }
 tr.hi td:not(.lanes) { background: var(--band); }
 tr.hi td:last-child { border-radius: 0 6px 6px 0; }
-tr.faded td:not(.lanes), .faded { opacity: 0.5; }
+tr.faded td:not(.lanes), .edge.faded, .node.faded { opacity: 0.5; }
 .band { fill: transparent; }
 .band.on { fill: var(--band); }
 .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }
