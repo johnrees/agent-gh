@@ -33,7 +33,7 @@ The harness is found from a variable it sets for its tools, and the family from 
 | --- | --- | --- |
 | Claude Code | `CLAUDECODE=1` with `CLAUDE_CODE_CHILD_SESSION` | `ANTHROPIC_BASE_URL`, `ANTHROPIC_*_MODEL`; effort from `CLAUDE_EFFORT` |
 | Codex | `CODEX_THREAD_ID` or `CODEX_SESSION_ID` | openai, else `AGENT_GH_MODEL` via `shell_environment_policy` |
-| pi | `PI_SESSION_ID` | `PI_MODEL`, `PI_PROVIDER`; effort from `PI_REASONING_LEVEL`; for a virtual model, the model and level of the answer in `PI_SESSION_FILE` that ran the command |
+| pi | `PI_SESSION_ID` | `PI_MODEL`, `PI_PROVIDER`; effort from `PI_REASONING_LEVEL`; a model id no family claims, as a virtual model's, takes the model and level from the answer in `PI_SESSION_FILE` that ran the command, and is refused without one |
 | opencode | `OPENCODE_TERMINAL=1` | `AGENT_GH_MODEL`, set when it starts |
 
 ## Repository hooks

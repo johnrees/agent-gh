@@ -153,7 +153,7 @@ test("pi reports its model, provider, and reasoning level", () => {
   expect(identity({ PI_SESSION_ID: "p", PI_PROVIDER: "openrouter", PI_MODEL: "z-ai/glm-4.6" }).family).toBe("glm");
   expect(identity({ PI_SESSION_ID: "p", PI_PROVIDER: "anthropic", PI_MODEL: "claude-opus-5-5" }).family).toBe("claude");
   expect(refusal(() => identity({ PI_SESSION_ID: "p", PI_PROVIDER: "zai", PI_MODEL: "deepseek-chat" }))).toContain("the signals disagree");
-  expect(refusal(() => identity({ PI_SESSION_ID: "p", PI_PROVIDER: "local", PI_MODEL: "llama-9" }))).toBe(
+  expect(refusal(() => identity({ PI_SESSION_ID: "p", PI_PROVIDER: "local", PI_MODEL: "llama-9" }, noCodexConfig, () => ({ provider: "local", model: "llama-9" })))).toBe(
     "detecting the model: pi runs local/llama-9, which no family in agent-gh's table claims",
   );
   expect(refusal(() => identity({ PI_SESSION_ID: "p" }))).toBe("detecting the model: pi did not report its model (PI_MODEL is unset)");
@@ -202,9 +202,15 @@ test("pi's virtual model acts as the model and level its answer names", () => {
     family: "claude",
     model: "claude-opus-5-5",
   });
-  // With no transcript (an ephemeral session), the selection is all there is.
-  expect(identity({ ...VIRTUAL, PI_PROVIDER: "openai-codex" })).toEqual({ harness: "pi", family: "codex", model: "auto", effort: "off" });
-  expect(refusal(() => identity(VIRTUAL))).toBe("detecting the model: pi runs openrouter/auto, which no family in agent-gh's table claims");
+  // An ephemeral session keeps no answer, and the provider of a selection that names no family is no evidence.
+  const unresolved = "which no family in agent-gh's table claims, and no session file (PI_SESSION_FILE) names the model that answered";
+  expect(refusal(() => identity({ ...VIRTUAL, PI_PROVIDER: "openai-codex" }))).toBe(
+    `detecting the model: pi runs openai-codex/auto, ${unresolved}; run a model id the table claims, or a saved session`,
+  );
+  expect(refusal(() => identity({ ...VIRTUAL, PI_PROVIDER: "zai", PI_MODEL: "z1-preview" }))).toContain(`pi runs zai/z1-preview, ${unresolved}`);
+  expect(identity({ ...VIRTUAL, PI_PROVIDER: "zai", PI_MODEL: "z1-preview" }, noCodexConfig, () => ({ provider: "zai", model: "z1-preview" })).family).toBe(
+    "glm",
+  );
   expect(refusal(() => identity(VIRTUAL, noCodexConfig, () => ({ provider: "local", model: "llama-9" })))).toBe(
     "detecting the model: pi runs openrouter/auto, answering with local/llama-9, which no family in agent-gh's table claims",
   );
@@ -221,7 +227,9 @@ test("a pi model the environment places needs no transcript", () => {
     throw new Error("the transcript must not be read");
   };
   expect(identity({ PI_SESSION_ID: "p", PI_PROVIDER: "openrouter", PI_MODEL: "z-ai/glm-4.6" }, noCodexConfig, unread).family).toBe("glm");
-  expect(identity({ PI_SESSION_ID: "p", PI_PROVIDER: "zai" }, noCodexConfig, unread)).toEqual({ harness: "pi", family: "glm" });
+  expect(refusal(() => identity({ PI_SESSION_ID: "p", PI_PROVIDER: "zai" }, noCodexConfig, unread))).toBe(
+    "detecting the model: pi did not report its model (PI_MODEL is unset)",
+  );
 });
 
 test("AGENT_GH_MODEL never overrides a model the harness reports", () => {

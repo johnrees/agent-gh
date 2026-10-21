@@ -243,10 +243,18 @@ const pi = (env: Env, transcript: PiTranscript): Identity => {
     ...(set(env.PI_MODEL) ? { model: env.PI_MODEL.trim() } : {}),
     ...(set(env.PI_REASONING_LEVEL) ? { effort: env.PI_REASONING_LEVEL.trim() } : {}),
   };
-  // PI_MODEL is the selected model. A virtual one names no family, even when it
-  // is listed under a provider that does (openai-codex/auto can route to any
-  // model), so the answer that issued this command names the model and level.
-  const ran = (selected.model !== undefined && familyOfModel(selected.model) === undefined && transcript(env)) || selected;
+  if (selected.model === undefined) return refuse("pi did not report its model (PI_MODEL is unset)");
+  const name = (model: PiModel) => `${model.provider === undefined ? "" : `${model.provider}/`}${model.model}`;
+  // PI_MODEL is the selected model. A virtual one names no family, and it can be
+  // listed under any provider, even one that serves a single family
+  // (openai-codex/auto can route to Claude), so neither PI_PROVIDER nor the
+  // selection says who ran: only the answer that issued this command does.
+  const ran = familyOfModel(selected.model) === undefined ? transcript(env) : selected;
+  if (ran === undefined) {
+    return refuse(
+      `pi runs ${name(selected)}, which no family in agent-gh's table claims, and no session file (PI_SESSION_FILE) names the model that answered; run a model id the table claims, or a saved session`,
+    );
+  }
   const [modelSource, providerSource] =
     ran === selected ? ["PI_MODEL", "PI_PROVIDER"] : ["PI_SESSION_FILE model", "PI_SESSION_FILE provider"];
   const family = agree([
@@ -254,12 +262,8 @@ const pi = (env: Env, transcript: PiTranscript): Identity => {
     [providerSource, ran.provider === undefined ? undefined : familyOfProvider(ran.provider)],
   ]);
   if (family === undefined) {
-    const name = (model: PiModel) => `${model.provider === undefined ? "" : `${model.provider}/`}${model.model}`;
-    return refuse(
-      selected.model === undefined
-        ? "pi did not report its model (PI_MODEL is unset)"
-        : `pi runs ${name(selected)}${ran === selected ? "" : `, answering with ${name(ran)}`}, which no family in agent-gh's table claims`,
-    );
+    const answered = name(ran) === name(selected) ? "" : `, answering with ${name(ran)}`;
+    return refuse(`pi runs ${name(selected)}${answered}, which no family in agent-gh's table claims`);
   }
   return {
     harness: "pi",
