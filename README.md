@@ -244,6 +244,38 @@ A filtered issue is not offered and not claimed, but it stays in the graph: it s
 
 `agent-gh claim --next [--refs|--no-pr] [LABEL FILTERS]` claims the first issue `next` offers. When that claim loses a race, it reads the frontier again and tries the next one, three times at most (never after an unconfirmed claim), so several workers running it spread across the frontier.
 
+### The whole graph
+
+`agent-gh graph --json [--all] [-R OWNER/REPO]` prints the repository as one graph, so an orchestrator need not join `next --waves --json`, `claims --json`, and `gh api` reads by hand: every open issue, every issue they are blocked by here, and the closed issues of each open milestone, so progress shows (`--all`: every issue and milestone). It reads in a few GraphQL requests (the milestones; the issues 100 a page, with their labels, `blockedBy`, milestone, closing pull requests, and last 30 comments, an issue with more having them read whole over REST; the blockers not read yet, by number; the open pull requests, with their head's statuses and check runs) plus the config, the Queue, and each base branch's required checks over REST. Nothing is written or scheduled. As with `next` and `claims`, it reads with the family App in an agent session and the read App outside one. GraphQL is required, which some proxies (Claude cloud's) reject.
+
+```
+{"v":1,"repo":"johnrees/widget","fetched_at":"…","queue":null,"label":"ready",
+ "milestones":[{"number":1,"title":"M0","description":"…","state":"open","open":10,"closed":18}],
+ "issues":[
+  {"issue":8,"title":"…","url":"…","state":"open","milestone":"M0","labels":["P0","claimed","ready"],"priority":null,"queued":null,
+   "blocked_by":[{"issue":7,"repo":null,"open":false}],
+   "wave":1,"status":"claimed","skipped_by":null,
+   "claim":{"kind":"pr","pr":76,"url":"…","author":"johnrees","family":"claude","session":"…","branch":"claude/8-…","created_at":"…","last_push_at":"…","last_comment_at":"…"},
+   "pr":{"number":76,"url":"…","draft":true,"state":"open","merged_at":null,"review_decision":null,
+         "statuses":{"agent-review":"pending","agent-threads":"success","agent-hold":null},"checks":"pending"},
+   "updated_at":"…"}],
+ "stuck":[],"cycles":[]}
+```
+
+Fields are named as in `next --waves --json` and `claims --json`. `blocked_by` is the only edge: a pull request is a property of its issue, a milestone is a group (its `title` on the issue), and a **When done, update** line is prose. An entry in another repository carries `repo`. `wave` is the issue's wave as `next --waves` lays out the graph with every open issue in it (null for a stuck or closed issue), and `stuck` and `cycles` are its lists. `claim` is the holder by [the rule](#claims) (null when nothing claims the issue), with when it last saw a push or a comment as `claims` gives them. `pr` is the claim's pull request, or else the latest open, merged, then closed pull request that closes the issue: `state` is `open`, `closed`, or `merged`; `review_decision` is `approved`, `changes_requested`, `review_required`, or null; `statuses` holds the head's latest agent-review, agent-threads, and agent-hold states (null where unset); `checks` is the base branch's required checks taken together, the worst of `failed`, `missing`, `pending`, and `passed` (null where it requires none). A closed pull request shows no statuses or checks. `skipped_by` is the `hold.label` or `queue.skip_labels` match of an issue that is otherwise dispatched, whatever its status.
+
+`status` is one of:
+
+- `merged` or `closed`: a closed issue, `merged` when a pull request that closes it merged.
+- `claimed`: a claim holds it with a comment, a draft, or a pull request that still holds only the claim's empty commit.
+- `in_review`: a claim's ready pull request until `ready`.
+- `ready`: a claim's ready pull request whose agent-review is `success`, whose agent-threads and agent-hold are `success` where set, and whose required checks passed.
+- `stuck`: unclaimed, and on or behind a cycle, or behind an open issue in another repository.
+- `blocked`: unclaimed, with an open blocker here.
+- `skipped`: unclaimed and unblocked, dispatched, but carrying the hold's label or a `queue.skip_labels` match.
+- `not_dispatched`: unclaimed and unblocked, but not `ready`, or not in the Queue.
+- `workable`: what `next` offers.
+
 ## Releases
 
 Agents never cut, change, or approve a release unless John has granted that one tag. A tag ruleset does not stop them, since they act as John, its bypass actor, so the guard does, as the merge guard does for branches. In an agent session:
