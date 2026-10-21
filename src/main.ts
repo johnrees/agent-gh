@@ -5,7 +5,7 @@
  * that App on the session's commits. GitHub shows each action as John with
  * the App's badge. The usage below lists every command.
  */
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { allowRelease, parseAllowArgs } from "./allow.ts";
@@ -14,7 +14,10 @@ import { parseClaimArgs, sessionId as claimSession } from "./claim.ts";
 import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, syncLabels } from "./claim-run.ts";
 import type { LabelRules } from "./next.ts";
 import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, wavesLines } from "./next-run.ts";
-import { parseGraphArgs } from "./graph.ts";
+import { type GraphJson, parseGraphArgs } from "./graph.ts";
+import { DEFAULT_EVERY, graphHtml } from "./graph-html.ts";
+import { graphLoop, writePage } from "./graph-loop.ts";
+import { graphMermaid, mermaidWarnings } from "./graph-mermaid.ts";
 import { readGraph } from "./graph-run.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
@@ -92,10 +95,14 @@ const USAGE = `usage:
                                     list live claims with their holder and last push and comment (--json: the stable form)
   agent-gh claims sync [--issue N]... [-R repo]
                                     remove the claim label from issues nothing claims (in GitHub Actions: the closed PR's)
-  agent-gh graph --json [--all] [-R repo]
+  agent-gh graph --json|--mermaid|--html [--all] [-R repo]
                                     the repository as one graph: every open issue with its milestone, blockers, wave,
                                     holder, pull request, and statuses, and each open milestone's closed issues
-                                    (--all: every issue); reads in a few GraphQL requests, writes nothing
+                                    (--all: every issue); reads in a few GraphQL requests, writes nothing;
+                                    --mermaid: a flowchart by milestone, coloured by status; --html: a page drawing it
+                                    --milestone <title>       --mermaid and --html: one milestone (none: no milestone)
+                                    --out <file>              --html: write the page there, through a rename
+                                    --every <seconds>         --html --out: rewrite it each interval (at least 30)
   agent-gh allow release <tag> [--at <sha>] [-R repo]
                                     in your own terminal: grant agents one tag, pushed once (at <sha>, a full commit sha,
                                     when given), and its release, for 24 hours: an issue your own gh opens, or one you paste
@@ -373,13 +380,42 @@ const graphCommand = async (rest: readonly string[], env: NodeJS.ProcessEnv): Pr
   }
   const repo = await resolveRepo("gh", rest, env, () => originUrl(process.cwd()));
   if (repo === undefined) throw new Failure("resolving the repository", "no -R, GH_REPO, or github.com origin remote; run it inside a clone of the repository or pass -R OWNER/REPO");
-  const show = async (io: { api: typeof GITHUB; token: string; repo: Repo }) => {
-    process.stdout.write(`${JSON.stringify(await readGraph(io, apiReader(io), parsed), null, 2)}\n`);
-    return 0;
-  };
-  if (!inAgentSession(env)) return show({ api: GITHUB, token: await readToken({ api: GITHUB, dir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) }), repo });
   const context: Context = { identity: detectIdentity(env), repo, env, api: GITHUB, configDir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) };
-  return withToken(context, (childEnv) => show({ api: GITHUB, token: childEnv.GH_TOKEN ?? "", repo }));
+  // A token for each read, since a loop outlives one.
+  const read = async () => {
+    const graph = (token: string) => {
+      const io = { api: GITHUB, token, repo };
+      return readGraph(io, apiReader(io), parsed);
+    };
+    if (!inAgentSession(env)) return graph(await readToken({ api: GITHUB, dir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) }));
+    return withToken(context, (childEnv) => graph(childEnv.GH_TOKEN ?? ""));
+  };
+  if (parsed.format === "json") {
+    process.stdout.write(`${JSON.stringify(await read(), null, 2)}\n`);
+    return 0;
+  }
+  const options = parsed.milestone === undefined ? {} : { milestone: parsed.milestone };
+  if (parsed.format === "mermaid") {
+    const text = graphMermaid(await read(), options);
+    for (const line of mermaidWarnings(text, parsed.milestone !== undefined)) console.error(line);
+    process.stdout.write(text);
+    return 0;
+  }
+  const page = (json: GraphJson) => graphHtml(json, { ...options, mermaid: graphMermaid(json, options), every: parsed.every ?? DEFAULT_EVERY });
+  if (parsed.out === undefined) {
+    process.stdout.write(page(await read()));
+    return 0;
+  }
+  const loop = {
+    read, sleep: (ms: number) => Bun.sleep(ms), log: (line: string) => console.error(line), tag: String(process.pid),
+    write: (path: string, text: string) => writeFileSync(path, text), rename: (from: string, to: string) => renameSync(from, to),
+  };
+  if (parsed.every === undefined) {
+    writePage(loop, parsed.out, page(await read()));
+    return 0;
+  }
+  await graphLoop(loop, { out: parsed.out, every: parsed.every, page });
+  return 0;
 };
 
 const main = async (argv: readonly string[]): Promise<number> => {
