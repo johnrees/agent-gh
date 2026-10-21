@@ -77,7 +77,7 @@ export const sshHostname = (host: string, options: readonly string[] = []): stri
 };
 
 /** The repository's GitHub remote, `origin` first, if any remote is on github.com. */
-const anyGitHub = (config: GitConfig): Repo | undefined => {
+export const githubRepo = (config: GitConfig): Repo | undefined => {
   const names = [...config.urls.keys()].sort((a, b) => (a === "origin" ? -1 : b === "origin" ? 1 : 0));
   for (const name of names) {
     for (const url of [...(config.pushUrls.get(name) ?? []), ...(config.urls.get(name) ?? [])]) {
@@ -89,7 +89,7 @@ const anyGitHub = (config: GitConfig): Repo | undefined => {
 };
 
 /** Whether any remote of the repository reaches github.com. */
-export const onGitHub = (config: GitConfig): boolean => anyGitHub(config) !== undefined;
+export const onGitHub = (config: GitConfig): boolean => githubRepo(config) !== undefined;
 
 /**
  * Parses `git config -z --get-regexp` output (each entry `key\nvalue\0`) for

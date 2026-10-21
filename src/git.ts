@@ -17,12 +17,17 @@ export const ABSENT = "agent-gh-absent";
  * `git interpret-trailers` arguments that credit the session: the agent
  * trailers replace any earlier set (only what the harness reports survives,
  * never a guess), and the App is credited once, keeping any other co-author.
+ * `session` is the id the session's claims carry (`sessionId`), so `review
+ * full` can tell a commit another session made on a claim branch; a session
+ * with no id in its environment writes none, since a fresh id per commit
+ * would name nobody.
  */
-export const trailerArgs = (identity: Identity, app: CoAuthor): string[] => [
+export const trailerArgs = (identity: Identity, app: CoAuthor, session?: string): string[] => [
   "--if-exists", "replace",
   "--trailer", `Agent-Model: ${identity.model ?? ABSENT}`,
   "--trailer", `Agent-Harness: ${identity.harness}`,
   "--trailer", `Agent-Effort: ${identity.effort ?? ABSENT}`,
+  "--trailer", `Agent-Session: ${session ?? ABSENT}`,
   "--if-exists", "addIfDifferent",
   "--trailer", coAuthorTrailer(app),
 ];
@@ -31,7 +36,7 @@ export const trailerArgs = (identity: Identity, app: CoAuthor): string[] => [
 export const withoutAbsent = (text: string): string =>
   text
     .split("\n")
-    .filter((line) => line !== `Agent-Model: ${ABSENT}` && line !== `Agent-Effort: ${ABSENT}`)
+    .filter((line) => line !== `Agent-Model: ${ABSENT}` && line !== `Agent-Effort: ${ABSENT}` && line !== `Agent-Session: ${ABSENT}`)
     .join("\n");
 
 /**

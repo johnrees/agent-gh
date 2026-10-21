@@ -3,6 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  claimBranchIssue,
   claimCommitMessage,
   claimMarker,
   claimsOn,
@@ -92,6 +93,12 @@ test("a branch slug is the title's words, cut at a word within 40 characters", (
   expect(titleSlug("Claim an issue when work starts: agent-gh claim, release, and claims")).toBe("claim-an-issue-when-work-starts-agent-gh");
   expect(titleSlug("Ünïcödé — ")).toBe("unicode");
   expect(titleSlug("!!!")).toBe("issue");
+});
+
+test("a claim branch names its issue; any other branch, or none, names nothing", () => {
+  expect(claimBranchIssue("claude/7-fix-the-widget")).toBe(7);
+  expect(claimBranchIssue("codex/64-x")).toBe(64);
+  for (const branch of ["feature/7-fix", "claude/fix-7", "claude/7", "main", "claude/07-x", "", undefined]) expect([branch, claimBranchIssue(branch)]).toEqual([branch, undefined]);
 });
 
 test("the commands parse as the usage says", () => {

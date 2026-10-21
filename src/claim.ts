@@ -13,6 +13,7 @@
  * The claim label only mirrors this: anyone can add or remove a label.
  */
 import { randomBytes } from "node:crypto";
+import { familyNames } from "./family.ts";
 import { fitGroup, type LabelRules } from "./next.ts";
 import type { Env } from "./harness.ts";
 import { type Repo, slug } from "./repo.ts";
@@ -192,6 +193,16 @@ export const titleSlug = (title: string): string => {
   const cut = words.slice(0, 41);
   const end = cut.lastIndexOf("-");
   return (end > 0 ? cut.slice(0, end) : words.slice(0, 40)).replace(/-+$/, "");
+};
+
+/**
+ * The issue a claim branch names: `<family>/<N>-<slug>` as `claimBranch`
+ * makes it, for a family in agent-gh's table. Undefined for any other branch
+ * (`feature/12-x`, `main`), and when there is none (a detached HEAD).
+ */
+export const claimBranchIssue = (branch: string | undefined): number | undefined => {
+  const match = /^([^/]+)\/([1-9]\d{0,9})-/.exec(branch ?? "");
+  return match !== null && familyNames().includes(match[1] as string) ? Number(match[2]) : undefined;
 };
 
 /** `<family>/<N>-<slug>`, the branch a claim opens. */

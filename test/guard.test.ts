@@ -1,10 +1,13 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Claim } from "../src/claim.ts";
 import { REGISTRY } from "../src/config.ts";
+import { Failure, NEXT_STEP } from "../src/failure.ts";
 import { coAuthorTrailer } from "../src/git.ts";
-import { guard, hasMessage, UPDATE } from "../src/guard.ts";
+import { type ClaimCheck, guard, hasMessage, UPDATE } from "../src/guard.ts";
+import { readGitConfig } from "../src/target.ts";
 import { bunVersionProblem } from "../scripts/bun-version.ts";
 
 const root = join(import.meta.dir, "..");
@@ -21,6 +24,28 @@ const app = (family: string) => {
 };
 const CLAUDE = app("claude");
 const CLAUDE_TRAILERS = `Agent-Model: claude-opus-5-5\nAgent-Harness: claude\nAgent-Effort: xhigh\n${CLAUDE}`;
+/** The same, from a session with an id in its environment. */
+const SESSION_TRAILERS = (id: string) => `Agent-Model: claude-opus-5-5\nAgent-Harness: claude\nAgent-Effort: xhigh\nAgent-Session: ${id}\n${CLAUDE}`;
+
+/** A claim check for hooks that never reach it. */
+const NEVER: ClaimCheck = {
+  branch: () => {
+    throw new Error("pre-push and unknown hooks never read the branch");
+  },
+  session: { id: "s-one", generated: false },
+  holder: () => {
+    throw new Error("pre-push and unknown hooks never read the claims");
+  },
+  print: () => {
+    throw new Error("pre-push and unknown hooks print nothing");
+  },
+};
+
+/** The claim on #64 as `claims` would report it: draft #65 by a session, or (both null) a person's pull request. */
+const claimBy = (session: string | null, family: string | null = "claude"): Claim => ({
+  issue: 64, kind: "pr", pr: 65, comment: null, url: "https://github.com/johnrees/penmon/pull/65", author: "someone", family, session,
+  id: family === null ? null : "0123456789abcdef", branch: "claude/64-fix", draft: true, createdAt: "2026-10-21T00:00:00Z",
+});
 
 /**
  * A clone with Penmon's hooks switched on, one staged file, and an `agent-gh`
@@ -60,6 +85,99 @@ const world = ({ onGitHub = true } = {}) => {
   const count = () => Number(Bun.spawnSync(["git", "-C", dir, "rev-list", "--count", "--all"]).stdout.toString().trim() || "0");
   return { home, dir, person, agent, run, last, count, stage, config };
 };
+
+/**
+ * The commit-msg hook run in-process on a world's repository, HEAD on
+ * `branch`, with a fake claim check in GitHub's place: `holds` is what holds
+ * #64 (a Failure is thrown, as when GitHub cannot be reached).
+ */
+const hookOn = async (branch: string | undefined, holds: Claim | Failure | undefined, session = { id: "s-one", generated: false }) => {
+  const { home, dir, agent } = world();
+  const file = join(home, "COMMIT_EDITMSG");
+  writeFileSync(file, "work\n");
+  const asked: [string, number][] = [];
+  const printed: string[] = [];
+  const claims: ClaimCheck = {
+    branch: () => branch,
+    session,
+    holder: async (repo, issue) => {
+      asked.push([`${repo.owner}/${repo.name}`, issue]);
+      if (holds instanceof Failure) throw holds;
+      return holds;
+    },
+    print: (line) => printed.push(line),
+  };
+  const verdict = await guard(["commit-msg", file], agent, "/nonexistent", REGISTRY, () => readGitConfig(dir, agent), claims);
+  return { verdict, message: readFileSync(file, "utf8"), asked, printed };
+};
+
+test("a commit on the session's own claim branch is credited with its session; on another session's claim branch it is refused, naming the holder and the fix", async () => {
+  const own = await hookOn("claude/64-fix", claimBy("s-one"));
+  expect(own.verdict).toEqual({ code: 0 });
+  expect(own.asked).toEqual([["johnrees/penmon", 64]]);
+  expect(own.message).toBe(`work\n\n${SESSION_TRAILERS("s-one")}\n`);
+  const other = await hookOn("claude/64-fix", claimBy("s-two"));
+  expect(other.verdict).toEqual({
+    code: 1,
+    message: `agent-gh guard: branch \`claude/64-fix\` is #64's claim branch, and #64 is held by draft #65 by a claude session (s-two) (https://github.com/johnrees/penmon/pull/65), not this claude session (s-one); commit on your own claim branch (\`agent-gh claim <n>\`).\n${NEXT_STEP}`,
+  });
+  expect(other.message).toBe("work\n");
+  // Another family's claim branch is a claim branch too, and a person's pull request holds an issue as well.
+  expect((await hookOn("codex/64-fix", claimBy("s-two", "codex"))).verdict.code).toBe(1);
+  const person = await hookOn("claude/64-fix", claimBy(null, null));
+  expect(person.verdict.message).toContain("#64 is held by draft #65 by someone (https://github.com/johnrees/penmon/pull/65), not this claude session (s-one)");
+  // A session with no id in its environment holds nothing the hook can see, and is told how to say who it is.
+  const anonymous = await hookOn("claude/64-fix", claimBy("s-two"), { id: "f00d", generated: true });
+  expect(anonymous.verdict.message).toContain("not this session, which has no id in its environment (set AGENT_GH_SESSION to the id its claim printed)");
+});
+
+test("a commit on any other branch, on a claim branch nothing holds, or when GitHub cannot say who holds it, passes", async () => {
+  for (const branch of ["main", "feature/64-fix", "claude/fix-64", undefined]) {
+    const result = await hookOn(branch, claimBy("s-two"));
+    expect([branch, result.verdict]).toEqual([branch, { code: 0 }]);
+    expect(result.asked).toEqual([]);
+    expect(result.message).toBe(`work\n\n${SESSION_TRAILERS("s-one")}\n`);
+  }
+  const free = await hookOn("claude/64-fix", undefined);
+  expect(free.verdict).toEqual({ code: 0 });
+  expect(free.asked).toEqual([["johnrees/penmon", 64]]);
+  // Offline, the commit passes with a note: it carries its session, and `review full` refuses a stray one.
+  const offline = await hookOn("claude/64-fix", new Failure("checking the commit", "could not reach api.github.com", true));
+  expect(offline.verdict).toEqual({ code: 0 });
+  expect(offline.printed).toEqual([
+    "agent-gh guard: could not check who holds #64 (checking the commit failed: could not reach api.github.com); committing on claude/64-fix unchecked, and `agent-gh review full` refuses a commit that is not the claim holder's",
+  ]);
+  expect(offline.message).toBe(`work\n\n${SESSION_TRAILERS("s-one")}\n`);
+  // A session with no id writes no Agent-Session trailer.
+  expect((await hookOn("main", undefined, { id: "f00d", generated: true })).message).toBe(`work\n\n${CLAUDE_TRAILERS}\n`);
+  // Offline and with no id, neither check could tell the commit from the holder's, so it is refused until the session says who it is.
+  const unknown = await hookOn("claude/64-fix", new Failure("checking the commit", "could not reach api.github.com", true), { id: "f00d", generated: true });
+  expect(unknown.verdict).toEqual({
+    code: 1,
+    message: `agent-gh guard: could not check who holds #64 (checking the commit failed: could not reach api.github.com), and this session has no id in its environment, so \`agent-gh review full\` could not tell its commit from the claim holder's either; set AGENT_GH_SESSION to the id its claim printed, then commit again.\n${NEXT_STEP}`,
+  });
+  expect(unknown.printed).toEqual([]);
+  expect(unknown.message).toBe("work\n");
+});
+
+test("through git, a session with an id is credited with it, and a claim branch whose holder cannot be read is noted, not refused", () => {
+  const { agent, run, last, stage } = world();
+  const session = { ...agent, CLAUDE_CODE_SESSION_ID: "1a811df7-f1a4" };
+  expect(run(["git", "commit", "-q", "-m", "mine"], session)).toEqual({ code: 0, stderr: "" });
+  expect(last("%B")).toBe(`mine\n\n${SESSION_TRAILERS("1a811df7-f1a4")}`);
+  // An amend from a session without an id drops the earlier session's, never keeping another's.
+  expect(run(["git", "commit", "-q", "--amend", "--no-edit"], agent).code).toBe(0);
+  const amended = last("%B").split("\n");
+  expect(amended.some((line) => line.startsWith("Agent-Session:"))).toBe(false);
+  expect(amended.filter((line) => line.startsWith("Agent-") || line.startsWith("Co-authored-by:")).sort()).toEqual(CLAUDE_TRAILERS.split("\n").sort());
+  // On a claim branch the hook asks GitHub who holds #64; with no login here it cannot, says so, and passes.
+  stage("b\n");
+  expect(run(["git", "switch", "-q", "-c", "claude/64-fix"], agent).code).toBe(0);
+  const commit = run(["git", "commit", "-q", "-m", "on a claim branch"], session);
+  expect(commit.code).toBe(0);
+  expect(commit.stderr).toStartWith("agent-gh guard: could not check who holds #64 (reading the login failed: no login for claude; run `agent-gh login claude` in your own terminal); committing on claude/64-fix unchecked");
+  expect(last("%B")).toBe(`on a claim branch\n\n${SESSION_TRAILERS("1a811df7-f1a4")}`);
+});
 
 test("an agent session's plain commit keeps John as author and credits the session's App", () => {
   const { agent, run, last } = world();
@@ -179,14 +297,14 @@ test("a session agent-gh cannot identify stops the commit with the fix, rather t
   expect(count()).toBe(before);
 });
 
-test("a person's push passes the pre-push guard untouched; an agent's never passes it silently", () => {
+test("a person's push passes the pre-push guard untouched; an agent's never passes it silently", async () => {
   const verdict = (env: Record<string, string>) =>
     guard(["pre-push", "origin", "https://github.com/johnrees/widget.git"], env, "/nonexistent", REGISTRY, () => {
       throw new Error("pre-push never reads the repository");
-    });
-  expect(verdict({})).toEqual({ code: 0 });
+    }, NEVER);
+  expect(await verdict({})).toEqual({ code: 0 });
   // The CLI checks an agent's push against GitHub before guard runs; here it fails closed.
-  expect(verdict(AGENT).code).toBe(2);
+  expect((await verdict(AGENT)).code).toBe(2);
 });
 
 test("an agent's push through the CLI is refused where its repository cannot be told, and a local remote is not held", () => {
@@ -207,12 +325,12 @@ test("an agent's push through the CLI is refused where its repository cannot be 
   expect(push("git@work-github:johnrees/widget.git", {})).toEqual({ code: 0, stderr: "" });
 });
 
-test("a hook this version does not understand fails with exit 2 and the update command, never a pass", () => {
+test("a hook this version does not understand fails with exit 2 and the update command, never a pass", async () => {
   for (const args of [["post-merge"], [], ["commit-msg"], ["commit-msg", "a", "b"]]) {
     for (const env of [{}, AGENT]) {
-      const verdict = guard(args, env, "/nonexistent", REGISTRY, () => {
+      const verdict = await guard(args, env, "/nonexistent", REGISTRY, () => {
         throw new Error("an unknown hook never reads the repository");
-      });
+      }, NEVER);
       expect(verdict.code).toBe(2);
       expect(verdict.message).toContain(UPDATE);
     }

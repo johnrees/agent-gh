@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { allowRelease, parseAllowArgs } from "./allow.ts";
 import { runChild } from "./child.ts";
 import { parseClaimArgs, sessionId as claimSession } from "./claim.ts";
-import { claim, type ClaimIo, claimsLines, eventIssues, listClaims, release, syncLabels } from "./claim-run.ts";
+import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, syncLabels } from "./claim-run.ts";
 import type { LabelRules } from "./next.ts";
 import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, wavesLines } from "./next-run.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
@@ -19,7 +19,7 @@ import { credential, familyToken, readToken } from "./credential.ts";
 import { doctor, PERSON } from "./doctor.ts";
 import { describe, Failure, NEXT_STEP } from "./failure.ts";
 import { GITHUB } from "./github.ts";
-import { guard } from "./guard.ts";
+import { type ClaimCheck, guard } from "./guard.ts";
 import { familyNames } from "./family.ts";
 import { detectIdentity, inAgentSession, personShell } from "./harness.ts";
 import { limitedFamilies, login, loginAll, loginTargets } from "./login.ts";
@@ -50,15 +50,17 @@ const USAGE = `usage:
   agent-gh session-env              from Claude Code's SessionStart hook: put the gh shim first on PATH for every command
   agent-gh read-token               print the read App's token (the gh shim's GH_TOKEN on agent machines)
   agent-gh settings [family...]     print each App's settings, permissions, and repository-access pages (default: every set-up family)
-  agent-gh guard commit-msg <file>  from a git hook: in an agent session, add its Agent-* trailers and credit its family App
+  agent-gh guard commit-msg <file>  from a git hook: in an agent session, refuse a commit on another session's claim branch,
+                                    then add its Agent-* trailers and credit its family App
   agent-gh guard pre-push <remote> <url>
                                     from a git hook: in an agent session, refuse a push to the default branch or one whose rules require checks
   agent-gh review sweep [--base REF] [--effort E]
                                     a quick bug sweep of the branch by another model family; prints, records nothing
-  agent-gh review full [--pr N] [--issue N] [--effort E]
+  agent-gh review full [--pr N] [--issue N] [--effort E] [--adopt]
                                     run the config's checks on the pull request's pushed head, review it against its issue,
                                     and post the findings as a review and the agent-review status (or, with
-                                    status_writer "actions", wait for the agent-review workflow to set it)
+                                    status_writer "actions", wait for the agent-review workflow to set it); a commit
+                                    another session made on a claim's branch is refused unless --adopt takes it on
   agent-gh reply <finding> --applied <sha> | --declined "<why>" [--pr N]
                                     answer a review finding or a notify (its id as \`review full\` prints it, or its URL);
                                     a finding's review thread is answered and resolved
@@ -139,6 +141,7 @@ const reviewIo = (context: Context, repo: Repo, env: Record<string, string>): Re
   token: env.GH_TOKEN ?? "",
   repo,
   family: context.identity.family,
+  ...(claimSession(context.env).generated ? {} : { session: claimSession(context.env).id }),
   git: async (args, input) => {
     const child = Bun.spawn(["git", ...args], { env, stdin: input === undefined ? "ignore" : new Blob([input]), stdout: "pipe", stderr: "ignore" });
     const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
@@ -200,10 +203,20 @@ const reviewOptions = (rest: readonly string[]) => {
   if (mode !== "sweep" && mode !== "full") return undefined;
   const allowed = mode === "sweep" ? ["--base", "--effort"] : ["--pr", "--issue", "--effort"];
   const values: Record<string, string> = {};
-  for (let index = 0; index < flags.length; index += 2) {
-    const [flag, value] = [flags[index] as string, flags[index + 1]];
+  let adopt = false;
+  for (let index = 0; index < flags.length; ) {
+    const flag = flags[index] as string;
+    // `--adopt` stands alone; every other flag takes a value.
+    if (mode === "full" && flag === "--adopt") {
+      if (adopt) return undefined;
+      adopt = true;
+      index += 1;
+      continue;
+    }
+    const value = flags[index + 1];
     if (!allowed.includes(flag) || value === undefined || values[flag] !== undefined) return undefined;
     values[flag] = value;
+    index += 2;
   }
   const number = (value: string | undefined) => (value === undefined ? undefined : /^\d+$/.test(value) ? Number(value) : Number.NaN);
   const [pr, issue] = [number(values["--pr"]), number(values["--issue"])];
@@ -215,6 +228,7 @@ const reviewOptions = (rest: readonly string[]) => {
     ...(pr === undefined ? {} : { pr }),
     ...(issue === undefined ? {} : { issue }),
     ...(effort === undefined ? {} : { effort }),
+    ...(adopt ? { adopt } : {}),
   };
 };
 
@@ -473,7 +487,20 @@ const main = async (argv: readonly string[]): Promise<number> => {
     return 0;
   }
   if (first === "guard") {
-    const verdict = guard(rest, env, defaultConfigDir(), REGISTRY, () => readGitConfig(process.cwd(), env));
+    // git runs a hook from the working tree's top level, where its config and HEAD are read.
+    const claims: ClaimCheck = {
+      branch: () => {
+        const result = Bun.spawnSync(["git", "symbolic-ref", "-q", "--short", "HEAD"], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+        return result.exitCode === 0 ? result.stdout.toString().trim() || undefined : undefined;
+      },
+      session: claimSession(env),
+      holder: (repo, issue) => {
+        const context: Context = { identity: detectIdentity(env), repo, env, api: GITHUB, configDir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) };
+        return withToken(context, (childEnv) => holderOf({ api: GITHUB, token: childEnv.GH_TOKEN ?? "", repo }, "checking the commit", issue));
+      },
+      print: (line) => console.error(line),
+    };
+    const verdict = await guard(rest, env, defaultConfigDir(), REGISTRY, () => readGitConfig(process.cwd(), env), claims);
     if (verdict.message !== undefined) console.error(verdict.message);
     return verdict.code;
   }
