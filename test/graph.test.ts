@@ -234,10 +234,12 @@ const REPOSITORY: World = {
     { number: 11, labels: ["ready"], blockedBy: [{ number: 40, repo: "johnrees/other" }] },
     { number: 12, state: "closed", milestone: 1, closedBy: [20] },
     { number: 13, state: "closed", milestone: 1, closedBy: [21] },
-    { number: 14, state: "closed", closedBy: [22] },
+    { number: 14, state: "closed", closedBy: [22], blockedBy: [{ number: 17 }] },
     { number: 15, state: "closed", milestone: 3 },
     // Behind a skipped issue: blocked, as next --waves has it waiting.
     { number: 16, labels: ["ready"], blockedBy: [{ number: 8 }] },
+    // #14's own closed blocker, read only once #14 is.
+    { number: 17, state: "closed" },
   ],
   pulls: [
     { number: 31, body: `Closes #3.\n${marker(3, "claude", "s3", "1111111111111111")}`, draft: true, createdAt: "2026-10-10T00:00:00Z", pushedAt: "2026-10-11T00:00:00Z", commits: 1, changedFiles: 0, comments: ["2026-10-12T00:00:00Z"] },
@@ -266,7 +268,7 @@ test("graph gives every open issue its status, wave, milestone, blockers, holder
     { number: 1, title: "M0", description: "about M0", state: "open", open: 2, closed: 2 },
     { number: 2, title: "M1", description: "about M1", state: "open", open: 1, closed: 0 },
   ]);
-  // #14 is read as #1's closed blocker; #15, closed in a closed milestone, is not read.
+  // #14 is read as #1's closed blocker, and #17 as #14's; #15, closed in a closed milestone, is not read.
   expect(graph.issues.map((item) => [item.issue, item.status, item.wave])).toEqual([
     [1, "workable", 1],
     [2, "blocked", 2],
@@ -283,7 +285,11 @@ test("graph gives every open issue its status, wave, milestone, blockers, holder
     [13, "closed", null],
     [14, "merged", null],
     [16, "blocked", 2],
+    [17, "closed", null],
   ]);
+  // Every edge here ends at an issue in the graph.
+  const numbers = new Set(graph.issues.map((item) => item.issue));
+  expect(graph.issues.flatMap((item) => item.blocked_by.filter((blocker) => blocker.repo === null && !numbers.has(blocker.issue)))).toEqual([]);
   const at = (number: number) => graph.issues.find((item) => item.issue === number);
   expect(at(1)).toMatchObject({
     title: "T1", url: url(1), state: "open", milestone: "M0", labels: ["priority:high", "ready"], priority: "priority:high", queued: null,
@@ -341,8 +347,8 @@ test("graph reads in a few GraphQL requests where next --waves and claims make o
   const { io, log } = world({ ...REPOSITORY, page: 100 });
   await readGraph(io, apiReader(io), { all: false }, NOW);
   const graphql = log.filter((entry) => entry.path === "/graphql");
-  // Milestones, open issues, M0's closed issues, #14 by number, open pull requests.
-  expect(graphql.length).toBe(5);
+  // Milestones, open issues, M0's closed issues, #14 by number, then its blocker #17, open pull requests.
+  expect(graphql.length).toBe(6);
   // The config and repository, #6's comments read whole, main's rules and branch, and the github-actions App.
   expect(log.length - graphql.length).toBe(6);
   expect(graphql.every((entry) => !/mutation/.test(entry.body))).toBe(true);
@@ -355,7 +361,7 @@ test("graph reads in a few GraphQL requests where next --waves and claims make o
 test("--all reads every issue and every milestone", async () => {
   const { io } = world(REPOSITORY);
   const graph = await readGraph(io, apiReader(io), { all: true }, NOW);
-  expect(graph.issues.map((item) => item.issue)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  expect(graph.issues.map((item) => item.issue)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
   expect(graph.issues.find((item) => item.issue === 15)).toMatchObject({ state: "closed", status: "closed", milestone: "Old" });
   expect(graph.milestones.map((item) => [item.title, item.state])).toEqual([["M0", "open"], ["M1", "open"], ["Old", "closed"]]);
 });

@@ -234,10 +234,14 @@ export const readGraph = async (io: ApiIo, read: Read, options: { readonly all: 
   }
   const issues: GraphIssue[] = [];
   for (const node of found.values()) issues.push(await issueOf(io, node));
-  // The blockers here not read yet (closed ones, outside every open milestone), so each edge here ends at an issue in the graph.
-  const missing = [...new Set(issues.flatMap((issue) => issue.blockedBy.filter((blocker) => blocker.repo === undefined && !found.has(blocker.number)).map((blocker) => blocker.number)))].sort((a, b) => a - b);
-  for (let start = 0; start < missing.length; start += BY_NUMBER) {
-    const batch = missing.slice(start, start + BY_NUMBER);
+  // The blockers here not read yet (closed ones outside every open milestone, then theirs in turn), so each edge here ends at an issue in the graph.
+  const asked = new Set<number>();
+  const unread = () =>
+    [...new Set(issues.flatMap((issue) => issue.blockedBy.filter((blocker) => blocker.repo === undefined && !found.has(blocker.number) && !asked.has(blocker.number)).map((blocker) => blocker.number)))]
+      .sort((a, b) => a - b)
+      .slice(0, BY_NUMBER);
+  for (let batch = unread(); batch.length > 0; batch = unread()) {
+    for (const number of batch) asked.add(number);
     const query = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${batch.map((number) => `i${number}:issue(number:${number}){${issueFields(false)}}`).join(" ")}}}`;
     const repository = await graphql(io, query, { owner: io.repo.owner, name: io.repo.name });
     for (const number of batch) {
