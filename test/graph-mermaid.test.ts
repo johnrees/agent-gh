@@ -136,6 +136,15 @@ test("a blocker in a repository whose name is not a plain owner/repo gets a safe
   expect(text).not.toContain("click x_");
 });
 
+test("blockers in two repositories that spell one node id stay two nodes", () => {
+  const first = FIXTURE.issues[0] as (typeof FIXTURE.issues)[number];
+  const twin = { ...FIXTURE, issues: [{ ...first, blocked_by: [{ issue: 5, repo: "o/a-b", open: true }, { issue: 5, repo: "o/a_b", open: false }, { issue: 5, repo: "o/a-b", open: true }] }] };
+  const text = graphMermaid(twin);
+  expect(text).toContain('x_o_a_b_5["o/a-b#35;5"]\nclass x_o_a_b_5 outside\nx_o_a_b_5_2["o/a_b#35;5"]\nclass x_o_a_b_5_2 outside\n');
+  expect(text).toContain("x_o_a_b_5 --> i1\nx_o_a_b_5_2 --> i1\nx_o_a_b_5 --> i1\n");
+  expect(text).toContain('click x_o_a_b_5 "https://github.com/o/a-b/issues/5"\nclick x_o_a_b_5_2 "https://github.com/o/a_b/issues/5"\n');
+});
+
 test("the flowchart warns past Ondine's URL limit and GitHub's maxTextSize and maxEdges, and not under them", () => {
   expect(mermaidWarnings(GOLDEN)).toEqual([]);
   expect(mermaidWarnings(graphMermaid(FIXTURE, { milestone: "M0" }))).toEqual([]);

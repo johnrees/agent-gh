@@ -380,7 +380,6 @@ const graphCommand = async (rest: readonly string[], env: NodeJS.ProcessEnv): Pr
   }
   const repo = await resolveRepo("gh", rest, env, () => originUrl(process.cwd()));
   if (repo === undefined) throw new Failure("resolving the repository", "no -R, GH_REPO, or github.com origin remote; run it inside a clone of the repository or pass -R OWNER/REPO");
-  const context: Context = { identity: detectIdentity(env), repo, env, api: GITHUB, configDir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) };
   // A token for each read, since a loop outlives one.
   const read = async () => {
     const graph = (token: string) => {
@@ -388,6 +387,7 @@ const graphCommand = async (rest: readonly string[], env: NodeJS.ProcessEnv): Pr
       return readGraph(io, apiReader(io), parsed);
     };
     if (!inAgentSession(env)) return graph(await readToken({ api: GITHUB, dir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) }));
+    const context: Context = { identity: detectIdentity(env), repo, env, api: GITHUB, configDir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) };
     return withToken(context, (childEnv) => graph(childEnv.GH_TOKEN ?? ""));
   };
   if (parsed.format === "json") {

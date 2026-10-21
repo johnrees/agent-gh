@@ -97,17 +97,19 @@ const SCRIPT = `
   });
 
   const issues = new Map(data.issues.map((issue) => [ "i" + issue.issue, issue ]));
+  // A blocker in another repository is found by its link, since two repositories can spell one node id.
   const outside = new Map();
   for (const issue of data.issues) {
     for (const blocker of issue.blocked_by) {
-      if (blocker.repo !== null) outside.set("x_" + blocker.repo.replace(/[^A-Za-z0-9]/g, "_") + "_" + blocker.issue, blocker);
+      if (blocker.repo !== null) outside.set("https://github.com/" + blocker.repo + "/issues/" + blocker.issue, blocker);
     }
   }
   const at = (time) => (time === null || time === undefined || time === "" ? null : Date.parse(time));
-  const lines = (id) => {
-    const issue = issues.get(id);
+  const lines = (node) => {
+    const issue = issues.get(node.getAttribute("data-id"));
     if (issue === undefined) {
-      const blocker = outside.get(id);
+      const link = node.querySelector("a[href]");
+      const blocker = link === null ? undefined : outside.get(link.getAttribute("href"));
       return blocker === undefined ? [] : [blocker.repo + "#" + blocker.issue, blocker.open ? "open, in another repository" : "closed, in another repository"];
     }
     const found = [ "#" + issue.issue + " " + issue.title, issue.status.replace("_", " ") + (issue.milestone === null ? "" : " \\u00b7 " + issue.milestone) ];
@@ -134,7 +136,7 @@ const SCRIPT = `
   };
   const tooltip = document.getElementById("tooltip");
   const show = (node, x, y) => {
-    const text = lines(node.getAttribute("data-id"));
+    const text = lines(node);
     if (text.length === 0) return;
     tooltip.replaceChildren(...text.map((line) => {
       const row = document.createElement("div");

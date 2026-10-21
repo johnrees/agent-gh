@@ -89,6 +89,17 @@ export const graphMermaid = (json: GraphJson, options: MermaidOptions = {}): str
   const groups = new Map<string, Group>(only === undefined ? [] : [[only.id, only]]);
   for (const issue of shown) groups.set(groupOf(issue).id, groupOf(issue));
   const drawn = new Map<string, Drawn>();
+  // `owner/a-b` and `owner/a_b` spell one id, so a later repository's takes a suffix.
+  const repos = new Map<string, string>();
+  const outsideId = (repo: string, number: number): string => {
+    const base = `x_${repo.replace(/[^A-Za-z0-9]/g, "_")}_${number}`;
+    for (let suffix = 1; ; suffix++) {
+      const id = suffix === 1 ? base : `${base}_${suffix}`;
+      const owner = repos.get(id);
+      if (owner === undefined) repos.set(id, repo);
+      if (owner === undefined || owner === repo) return id;
+    }
+  };
   const link = (number: number) => `https://github.com/${json.repo}/issues/${number}`;
   const issueNode = (issue: Issue, outside: boolean): Drawn => ({
     line: `i${issue.issue}[${mermaidLabel(`#${issue.issue} ${shortTitle(issue.title)}`)}]:::${issue.status}`, status: issue.status, url: link(issue.issue), outside,
@@ -97,7 +108,7 @@ export const graphMermaid = (json: GraphJson, options: MermaidOptions = {}): str
   const edges: string[] = [];
   for (const issue of shown) {
     for (const blocker of issue.blocked_by) {
-      const id = blocker.repo === null ? `i${blocker.issue}` : `x_${blocker.repo.replace(/[^A-Za-z0-9]/g, "_")}_${blocker.issue}`;
+      const id = blocker.repo === null ? `i${blocker.issue}` : outsideId(blocker.repo, blocker.issue);
       if (!drawn.has(id)) {
         const found = blocker.repo === null ? byNumber.get(blocker.issue) : undefined;
         if (found !== undefined) drawn.set(id, issueNode(found, true));
