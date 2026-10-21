@@ -14,6 +14,8 @@ import { parseClaimArgs, sessionId as claimSession } from "./claim.ts";
 import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, syncLabels } from "./claim-run.ts";
 import type { LabelRules } from "./next.ts";
 import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, wavesLines } from "./next-run.ts";
+import { parseGraphArgs } from "./graph.ts";
+import { readGraph } from "./graph-run.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
 import { doctor, PERSON } from "./doctor.ts";
@@ -90,6 +92,10 @@ const USAGE = `usage:
                                     list live claims with their holder and last push and comment (--json: the stable form)
   agent-gh claims sync [--issue N]... [-R repo]
                                     remove the claim label from issues nothing claims (in GitHub Actions: the closed PR's)
+  agent-gh graph --json [--all] [-R repo]
+                                    the repository as one graph: every open issue with its milestone, blockers, wave,
+                                    holder, pull request, and statuses, and each open milestone's closed issues
+                                    (--all: every issue); reads in a few GraphQL requests, writes nothing
   agent-gh allow release <tag> [--at <sha>] [-R repo]
                                     in your own terminal: grant agents one tag, pushed once (at <sha>, a full commit sha,
                                     when given), and its release, for 24 hours: an issue your own gh opens, or one you paste
@@ -358,6 +364,24 @@ const claimCommand = async (first: string, rest: readonly string[], env: NodeJS.
   });
 };
 
+/** `agent-gh graph --json`: with the family App in an agent session, else the read App, as `next` and `claims` read. */
+const graphCommand = async (rest: readonly string[], env: NodeJS.ProcessEnv): Promise<number> => {
+  const parsed = parseGraphArgs(rest);
+  if (parsed === undefined) {
+    console.error(USAGE);
+    return 1;
+  }
+  const repo = await resolveRepo("gh", rest, env, () => originUrl(process.cwd()));
+  if (repo === undefined) throw new Failure("resolving the repository", "no -R, GH_REPO, or github.com origin remote; run it inside a clone of the repository or pass -R OWNER/REPO");
+  const show = async (io: { api: typeof GITHUB; token: string; repo: Repo }) => {
+    process.stdout.write(`${JSON.stringify(await readGraph(io, apiReader(io), parsed), null, 2)}\n`);
+    return 0;
+  };
+  if (!inAgentSession(env)) return show({ api: GITHUB, token: await readToken({ api: GITHUB, dir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) }), repo });
+  const context: Context = { identity: detectIdentity(env), repo, env, api: GITHUB, configDir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) };
+  return withToken(context, (childEnv) => show({ api: GITHUB, token: childEnv.GH_TOKEN ?? "", repo }));
+};
+
 const main = async (argv: readonly string[]): Promise<number> => {
   const [first, ...rest] = argv;
   if (first === undefined || first === "--help" || first === "-h" || first === "help") {
@@ -591,6 +615,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     );
   }
   if (first === "claim" || first === "release" || first === "claims" || first === "next") return claimCommand(first, rest, env);
+  if (first === "graph") return graphCommand(rest, env);
   const review = first === "review" ? reviewOptions(rest) : undefined;
   const replying = first === "reply" ? replyOptions(rest) : undefined;
   const notifying = first === "notify" ? await notifyOptions(rest) : undefined;
