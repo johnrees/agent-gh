@@ -48,6 +48,8 @@ type Pull = {
   readonly statuses?: readonly Status[];
   readonly runs?: readonly Run[];
   readonly review?: string;
+  /** Its author's REST login. */
+  readonly author?: string;
 };
 type World = {
   readonly config: unknown;
@@ -85,7 +87,7 @@ const world = (spec: World) => {
     id: comment.id, html_url: `${url(0)}#issuecomment-${comment.id}`, author_association: comment.association ?? "OWNER", user: { login: "johnrees" }, body: comment.body, created_at: comment.at,
   });
   const restPull = (item: Pull) => ({
-    number: item.number, state: "open", body: item.body, html_url: url(item.number, "pull"), user: { login: "johnrees" }, head: { ref: `claude/${item.number}-x`, sha: sha(item.number) },
+    number: item.number, state: "open", body: item.body, html_url: url(item.number, "pull"), user: { login: item.author ?? "johnrees" }, head: { ref: `claude/${item.number}-x`, sha: sha(item.number) },
     draft: item.draft ?? false, created_at: item.createdAt,
   });
   const openPulls = () => spec.pulls.filter((item) => (item.state ?? "open") === "open");
@@ -152,7 +154,8 @@ const world = (spec: World) => {
     ];
     return {
       ...pullRef(item), title: `P${item.number}`, body: item.body, createdAt: item.createdAt, reviewDecision: item.review ?? null, baseRefName: "main",
-      headRefName: `claude/${item.number}-x`, headRefOid: sha(item.number), changedFiles: item.changedFiles ?? 1, author: { login: "johnrees" },
+      headRefName: `claude/${item.number}-x`, headRefOid: sha(item.number), changedFiles: item.changedFiles ?? 1,
+      author: item.author?.endsWith("[bot]") ? { __typename: "Bot", login: item.author.slice(0, -5) } : { __typename: "User", login: item.author ?? "johnrees" },
       comments: { nodes: (item.comments ?? []).slice(-1).map((createdAt) => ({ createdAt })) },
       commits: { totalCount: item.commits ?? 2, nodes: [{ commit: { committedDate: item.pushedAt, statusCheckRollup: contexts.length === 0 ? null : { contexts: { totalCount: contexts.length, nodes: contexts } } } }] },
     };
@@ -243,8 +246,9 @@ const REPOSITORY: World = {
       statuses: [{ context: "agent-review", state: "pending", creator: "github-actions[bot]" }, { context: "agent-threads", state: "success", creator: "github-actions[bot]" }],
     },
     {
-      // A person's pull request: Refs, no marker. A failed run of "test" gave way to a newer run of the same workflow.
-      number: 33, body: "Refs #5", createdAt: "2026-10-10T00:00:00Z", pushedAt: "2026-10-14T00:00:00Z", review: "APPROVED",
+      // A pull request with no marker: Refs only. A failed run of "test" gave way to a newer run of the same workflow.
+      // A bot's: GraphQL names it `renovate`, claims --json `renovate[bot]`.
+      number: 33, author: "renovate[bot]", body: "Refs #5", createdAt: "2026-10-10T00:00:00Z", pushedAt: "2026-10-14T00:00:00Z", review: "APPROVED",
       statuses: [{ context: "agent-review", state: "success", creator: "github-actions[bot]" }, { context: "agent-threads", state: "success", creator: "github-actions[bot]" }, { context: "agent-hold", state: "success", creator: "github-actions[bot]" }],
       runs: [{ name: "test", conclusion: "failure", suite: 1, workflow: 77 }, { name: "test", conclusion: "success", suite: 2, workflow: 77 }],
     },
@@ -290,7 +294,7 @@ test("graph gives every open issue its status, wave, milestone, blockers, holder
     pr: { number: 31, draft: true, state: "open", merged_at: null, review_decision: null, statuses: { "agent-review": null, "agent-threads": null, "agent-hold": null }, checks: "missing" },
   });
   expect(at(4)?.pr).toMatchObject({ statuses: { "agent-review": "pending", "agent-threads": "success", "agent-hold": null }, checks: "missing" });
-  expect(at(5)?.claim).toMatchObject({ kind: "pr", pr: 33, family: null, session: null });
+  expect(at(5)?.claim).toMatchObject({ kind: "pr", pr: 33, author: "renovate[bot]", family: null, session: null });
   expect(at(5)?.pr).toEqual({
     number: 33, url: url(33, "pull"), draft: false, state: "open", merged_at: null, review_decision: "approved",
     statuses: { "agent-review": "success", "agent-threads": "success", "agent-hold": "success" }, checks: "passed",

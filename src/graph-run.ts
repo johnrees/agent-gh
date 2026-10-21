@@ -25,6 +25,8 @@ const nodes = (value: unknown): Record<string, unknown>[] => {
   const list = record(value).nodes;
   return Array.isArray(list) ? list.map(record) : [];
 };
+/** An actor's login as REST spells it: GraphQL names a bot `github-actions`, REST `github-actions[bot]`. */
+const login = (actor: unknown): string => `${text(record(actor).login)}${record(actor).__typename === "Bot" ? "[bot]" : ""}`;
 const lower = (value: unknown): string | null => (typeof value === "string" && value !== "" ? value.toLowerCase() : null);
 
 /**
@@ -74,12 +76,12 @@ const issueFields = (comments: boolean) =>
     "labels(first:100){totalCount nodes{name}}",
     "blockedBy(first:100){totalCount nodes{number title state repository{nameWithOwner}}}",
     `closedByPullRequestsReferences(first:25,includeClosedPrs:true){totalCount nodes{${PULL_REF}}}`,
-    comments ? `comments(last:${LAST_COMMENTS}){totalCount nodes{databaseId url authorAssociation author{login} body createdAt}}` : "",
+    comments ? `comments(last:${LAST_COMMENTS}){totalCount nodes{databaseId url authorAssociation author{__typename login} body createdAt}}` : "",
   ].join(" ");
 
 const ROLLUP =
   "statusCheckRollup{contexts(first:100){totalCount nodes{__typename ...on StatusContext{context state creator{__typename login}} ...on CheckRun{name status conclusion checkSuite{databaseId app{databaseId} workflowRun{workflow{databaseId}}}}}}}";
-const PULL_FIELDS = `${PULL_REF} title body createdAt reviewDecision baseRefName headRefName headRefOid changedFiles author{login} comments(last:1){nodes{createdAt}} commits(last:1){totalCount nodes{commit{committedDate ${ROLLUP}}}}`;
+const PULL_FIELDS = `${PULL_REF} title body createdAt reviewDecision baseRefName headRefName headRefOid changedFiles author{__typename login} comments(last:1){nodes{createdAt}} commits(last:1){totalCount nodes{commit{committedDate ${ROLLUP}}}}`;
 
 /** A list read whole, or a refusal: a label, blocker, or closing pull request left out would misjudge the issue. */
 const whole = (issue: number, what: string, connection: unknown): Record<string, unknown>[] => {
@@ -114,7 +116,7 @@ const issueOf = async (io: ApiIo, node: Record<string, unknown>): Promise<GraphI
         ? (await everyPage(io, STAGE, `/repos/${slug(io.repo)}/issues/${number}/comments`)).map(record)
         : read.map((comment) => ({
             id: integer(comment.databaseId), html_url: text(comment.url), author_association: text(comment.authorAssociation),
-            user: { login: text(record(comment.author).login) }, body: text(comment.body), created_at: text(comment.createdAt),
+            user: { login: login(comment.author) }, body: text(comment.body), created_at: text(comment.createdAt),
           }));
   }
   const milestone = record(node.milestone);
@@ -137,11 +139,8 @@ const pullOf = (node: Record<string, unknown>, repo: string): GraphPull => {
   if (integer(rollup.totalCount) > contexts.length) throw new Failure(STAGE, `#${integer(node.number)}'s head has over ${contexts.length} statuses and check runs, too many to read`);
   const statuses = contexts
     .filter((context) => context.__typename === "StatusContext")
-    .map((context) => {
-      // GraphQL names a bot `github-actions`; REST, and so the App lookup, `github-actions[bot]`.
-      const creator = record(context.creator);
-      return { context: text(context.context), state: lower(context.state), creator: { login: `${text(creator.login)}${creator.__typename === "Bot" ? "[bot]" : ""}` } };
-    });
+    // The App lookup reads REST's bot logins.
+    .map((context) => ({ context: text(context.context), state: lower(context.state), creator: { login: login(context.creator) } }));
   const workflows = new Map<number, number>();
   const runs = contexts
     .filter((context) => context.__typename === "CheckRun")
@@ -155,7 +154,7 @@ const pullOf = (node: Record<string, unknown>, repo: string): GraphPull => {
   return {
     ...ref,
     rest: {
-      number: ref.number, state: "open", body: text(node.body), html_url: ref.url, user: { login: text(record(node.author).login) },
+      number: ref.number, state: "open", body: text(node.body), html_url: ref.url, user: { login: login(node.author) },
       head: { ref: text(node.headRefName), sha: text(node.headRefOid) }, draft: ref.draft, created_at: text(node.createdAt),
     },
     base: text(node.baseRefName),
