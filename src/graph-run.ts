@@ -67,7 +67,7 @@ const everyNode = async (io: ApiIo, field: string, args: string, fields: string)
 /** The comments read with each open issue; an issue with more is read whole over REST. */
 const LAST_COMMENTS = 30;
 
-const PULL_REF = "number url state isDraft mergedAt";
+const PULL_REF = "number url state isDraft mergedAt repository{nameWithOwner}";
 const issueFields = (comments: boolean) =>
   [
     "number title url state updatedAt milestone{number title}",
@@ -78,7 +78,7 @@ const issueFields = (comments: boolean) =>
   ].join(" ");
 
 const ROLLUP =
-  "statusCheckRollup{contexts(first:100){totalCount nodes{__typename ...on StatusContext{context state creator{login}} ...on CheckRun{name status conclusion checkSuite{databaseId app{databaseId} workflowRun{workflow{databaseId}}}}}}}";
+  "statusCheckRollup{contexts(first:100){totalCount nodes{__typename ...on StatusContext{context state creator{__typename login}} ...on CheckRun{name status conclusion checkSuite{databaseId app{databaseId} workflowRun{workflow{databaseId}}}}}}}";
 const PULL_FIELDS = `${PULL_REF} title body createdAt reviewDecision baseRefName headRefName headRefOid changedFiles author{login} comments(last:1){nodes{createdAt}} commits(last:1){totalCount nodes{commit{committedDate ${ROLLUP}}}}`;
 
 /** A list read whole, or a refusal: a label, blocker, or closing pull request left out would misjudge the issue. */
@@ -88,9 +88,12 @@ const whole = (issue: number, what: string, connection: unknown): Record<string,
   return found;
 };
 
-const pullRef = (node: Record<string, unknown>): PullRef => {
+const pullRef = (node: Record<string, unknown>, repo: string): PullRef => {
   const state = lower(node.state);
-  return { number: integer(node.number), url: text(node.url), state: state === "merged" || state === "closed" ? state : "open", draft: node.isDraft === true, mergedAt: text(node.mergedAt) || null };
+  return {
+    number: integer(node.number), url: text(node.url), here: text(record(node.repository).nameWithOwner).toLowerCase() === repo.toLowerCase(),
+    state: state === "merged" || state === "closed" ? state : "open", draft: node.isDraft === true, mergedAt: text(node.mergedAt) || null,
+  };
 };
 
 /** An issue node, its comments as REST lists them; an open one with more than were read has them read whole over REST. */
@@ -120,13 +123,13 @@ const issueOf = async (io: ApiIo, node: Record<string, unknown>): Promise<GraphI
     milestone: node.milestone === null || node.milestone === undefined ? null : { number: integer(milestone.number), title: text(milestone.title) },
     labels: whole(number, "labels", node.labels).map((label) => text(label.name)),
     blockedBy, comments,
-    closedBy: whole(number, "closing pull requests", node.closedByPullRequestsReferences).map(pullRef),
+    closedBy: whole(number, "closing pull requests", node.closedByPullRequestsReferences).map((pull) => pullRef(pull, slug(io.repo))),
     updatedAt: text(node.updatedAt),
   };
 };
 
-/** An open pull request node, its head's statuses and check runs as REST lists them. */
-const pullOf = (node: Record<string, unknown>): GraphPull => {
+/** An open pull request node of `repo`, its head's statuses and check runs as REST lists them. */
+const pullOf = (node: Record<string, unknown>, repo: string): GraphPull => {
   const commits = record(node.commits);
   const head = record(nodes(commits)[0]?.commit);
   const rollup = record(record(head.statusCheckRollup).contexts);
@@ -134,7 +137,11 @@ const pullOf = (node: Record<string, unknown>): GraphPull => {
   if (integer(rollup.totalCount) > contexts.length) throw new Failure(STAGE, `#${integer(node.number)}'s head has over ${contexts.length} statuses and check runs, too many to read`);
   const statuses = contexts
     .filter((context) => context.__typename === "StatusContext")
-    .map((context) => ({ context: text(context.context), state: lower(context.state), creator: { login: text(record(context.creator).login) } }));
+    .map((context) => {
+      // GraphQL names a bot `github-actions`; REST, and so the App lookup, `github-actions[bot]`.
+      const creator = record(context.creator);
+      return { context: text(context.context), state: lower(context.state), creator: { login: `${text(creator.login)}${creator.__typename === "Bot" ? "[bot]" : ""}` } };
+    });
   const workflows = new Map<number, number>();
   const runs = contexts
     .filter((context) => context.__typename === "CheckRun")
@@ -144,7 +151,7 @@ const pullOf = (node: Record<string, unknown>): GraphPull => {
       if (Number.isSafeInteger(suite.databaseId) && Number.isSafeInteger(workflow)) workflows.set(suite.databaseId as number, workflow as number);
       return { name: text(context.name), status: lower(context.status), conclusion: lower(context.conclusion), app: { id: record(suite.app).databaseId }, check_suite: { id: suite.databaseId } };
     });
-  const ref = pullRef(node);
+  const ref = pullRef(node, repo);
   return {
     ...ref,
     rest: {
@@ -242,7 +249,7 @@ export const readGraph = async (io: ApiIo, read: Read, options: { readonly all: 
       }
     }
   }
-  const listed = (await everyNode(io, "pullRequests", `,states:[OPEN]${order}`, PULL_FIELDS)).map(pullOf);
+  const listed = (await everyNode(io, "pullRequests", `,states:[OPEN]${order}`, PULL_FIELDS)).map((node) => pullOf(node, name));
   const { required, pulls } = await requirements(name, read, listed);
   return graphJson({ repo: io.repo, fetchedAt, config, queue, milestones, issues, pulls, required });
 };

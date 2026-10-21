@@ -121,7 +121,7 @@ const world = (spec: World) => {
   }
 
   // GraphQL, as GitHub answers the queries graph-run.ts makes.
-  const pullRef = (item: Pull) => ({ number: item.number, url: url(item.number, "pull"), state: (item.state ?? "open").toUpperCase(), isDraft: item.draft ?? false, mergedAt: item.state === "merged" ? "2026-10-01T00:00:00Z" : null });
+  const pullRef = (item: Pull) => ({ number: item.number, url: url(item.number, "pull"), repository: { nameWithOwner: "johnrees/widget" }, state: (item.state ?? "open").toUpperCase(), isDraft: item.draft ?? false, mergedAt: item.state === "merged" ? "2026-10-01T00:00:00Z" : null });
   const issueNode = (item: Issue, comments: boolean) => ({
     number: item.number, title: title(item.number), url: url(item.number), state: (item.state ?? "open").toUpperCase(), updatedAt: "2026-10-20T00:00:00Z",
     milestone: item.milestone === undefined ? null : { number: item.milestone, title: spec.milestones.find((milestone) => milestone.number === item.milestone)?.title },
@@ -144,7 +144,7 @@ const world = (spec: World) => {
   });
   const pullNode = (item: Pull) => {
     const contexts = [
-      ...(item.statuses ?? []).map((status) => ({ __typename: "StatusContext", context: status.context, state: status.state.toUpperCase(), creator: { login: status.creator ?? "johnrees" } })),
+      ...(item.statuses ?? []).map((status) => ({ __typename: "StatusContext", context: status.context, state: status.state.toUpperCase(), creator: (status.creator ?? "johnrees").endsWith("[bot]") ? { __typename: "Bot", login: (status.creator as string).slice(0, -5) } : { __typename: "User", login: status.creator ?? "johnrees" } })),
       ...(item.runs ?? []).map((run) => ({
         __typename: "CheckRun", name: run.name, status: run.conclusion === null ? "IN_PROGRESS" : "COMPLETED", conclusion: run.conclusion?.toUpperCase() ?? null,
         checkSuite: { databaseId: run.suite, app: { databaseId: run.app ?? 15368 }, workflowRun: run.workflow === undefined ? null : { workflow: { databaseId: run.workflow } } },
@@ -389,7 +389,7 @@ const graphIssue = (number: number, extra: Partial<GraphIssue> = {}): GraphIssue
   number, title: title(number), url: url(number), open: true, milestone: null, labels: ["ready"], blockedBy: [], comments: [], closedBy: [], updatedAt: "", ...extra,
 });
 const graphPull = (number: number, issue: number, extra: Partial<GraphPull> = {}): GraphPull => ({
-  number, url: url(number, "pull"), state: "open", draft: false, mergedAt: null,
+  number, url: url(number, "pull"), here: true, state: "open", draft: false, mergedAt: null,
   rest: { number, state: "open", body: `Closes #${issue}`, html_url: url(number, "pull"), user: { login: "johnrees" }, head: { ref: "b", sha: sha(number) }, draft: extra.draft ?? false, created_at: "2026-10-01T00:00:00Z" },
   base: "main", reviewDecision: null, commits: 2, changedFiles: 1, lastPushAt: null, lastCommentAt: null,
   statuses: [{ context: "agent-review", state: "success" }], runs: [], workflows: new Map(), ...extra,
@@ -424,9 +424,25 @@ test("a claim holds a blocked issue's status as its work, and a pull request onl
   const result = derive([
     graphIssue(1),
     graphIssue(2, { blockedBy: [{ repo: undefined, number: 1, open: true, title: "T1" }] }),
-    graphIssue(3, { closedBy: [{ number: 50, url: url(50, "pull"), state: "open", draft: false, mergedAt: null }] }),
+    graphIssue(3, { closedBy: [{ number: 50, url: url(50, "pull"), here: true, state: "open", draft: false, mergedAt: null }] }),
   ], [graphPull(48, 2, { draft: true }), graphPull(50, 99)]);
   expect(statuses(result)).toEqual([[1, "workable"], [2, "claimed"], [3, "workable"]]);
   expect(result.issues.find((item) => item.issue === 2)?.wave).toBe(2);
-  expect(result.issues.find((item) => item.issue === 3)).toMatchObject({ claim: null, pr: { number: 50, state: "open" } });
+  expect(result.issues.find((item) => item.issue === 3)).toMatchObject({ claim: null, pr: { number: 50, state: "open", statuses: { "agent-review": "success" } } });
+});
+
+test("a pull request in another repository that closes an issue is shown as itself, never as the open one here with its number", () => {
+  const elsewhere = "https://github.com/johnrees/other/pull/50";
+  const result = derive([graphIssue(3, { closedBy: [{ number: 50, url: elsewhere, here: false, state: "open", draft: false, mergedAt: null }] })], [graphPull(50, 99)]);
+  expect(result.issues[0]?.pr).toEqual({
+    number: 50, url: elsewhere, draft: false, state: "open", merged_at: null, review_decision: null,
+    statuses: { "agent-review": null, "agent-threads": null, "agent-hold": null }, checks: null,
+  });
+});
+
+test("the dispatch label matches in any case, as GitHub's labels and next's filter do", () => {
+  expect(statuses(derive([graphIssue(1, { labels: ["Ready"] }), graphIssue(2, { labels: ["READY", "needs-human"] })], [], { config: { ...CONFIG, holdLabel: "needs-human" } }))).toEqual([
+    [1, "workable"],
+    [2, "skipped"],
+  ]);
 });

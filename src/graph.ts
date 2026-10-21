@@ -14,7 +14,7 @@ import { type CheckState, checkState, type RequiredCheck } from "./merge.ts";
 import { type Blocker, labelFilter, type LabelRules, type Node, type SkippedBy, waves } from "./next.ts";
 import type { QueueConfig } from "./next-run.ts";
 import { type Repo, slug } from "./repo.ts";
-import { STATUS_CONTEXT } from "./review.ts";
+import { sameLabel, STATUS_CONTEXT } from "./review.ts";
 import { HOLD_CONTEXT } from "./status.ts";
 import { THREADS_CONTEXT } from "./threads.ts";
 
@@ -35,6 +35,8 @@ export const parseGraphArgs = (args: readonly string[]): { readonly all: boolean
 export type PullRef = {
   readonly number: number;
   readonly url: string;
+  /** In this repository: a pull request elsewhere can close the issue too, and its number says nothing here. */
+  readonly here: boolean;
   readonly state: "open" | "closed" | "merged";
   readonly draft: boolean;
   readonly mergedAt: string | null;
@@ -122,14 +124,21 @@ const pullStatus = (pull: GraphPull, checks: CheckState | null): "claimed" | "in
 
 const latest = (times: readonly (string | null)[]): string | null => times.filter((at): at is string => at !== null && at !== "").sort().at(-1) ?? null;
 
-/** The pull request to show for an issue: its claim's, else the latest open, merged, then closed one that closes it. */
-const pullFor = (issue: GraphIssue, holder: Claim | undefined): number | undefined => {
-  if (holder !== undefined && holder.pr !== null) return holder.pr;
+/**
+ * The pull request to show for an issue: its claim's, else the latest open,
+ * merged, then closed one that closes it; `live` is its open pull request
+ * here, with the statuses, when it is one.
+ */
+const pullFor = (issue: GraphIssue, holder: Claim | undefined, open: ReadonlyMap<number, GraphPull>): { readonly live: GraphPull | undefined; readonly ref: PullRef | undefined } => {
+  if (holder !== undefined && holder.pr !== null) {
+    const live = open.get(holder.pr);
+    return { live, ref: live };
+  }
   for (const state of ["open", "merged", "closed"] as const) {
     const found = issue.closedBy.filter((pull) => pull.state === state).sort((a, b) => b.number - a.number)[0];
-    if (found !== undefined) return found.number;
+    if (found !== undefined) return { live: found.here && state === "open" ? open.get(found.number) : undefined, ref: found };
   }
-  return undefined;
+  return { live: undefined, ref: undefined };
 };
 
 /**
@@ -155,7 +164,8 @@ export const graphJson = (input: GraphRead) => {
     if (!issue.open) continue;
     const holder = taken(input.repo, { number: issue.number, state: "open" }, pulls, issue.comments).holder;
     holders.set(issue.number, holder);
-    const dispatched = issue.labels.includes(input.config.label) && (input.queue === undefined || input.queue.includes(issue.number));
+    // GitHub's labels ignore case, as next's `labels=` filter does.
+    const dispatched = issue.labels.some((label) => sameLabel(label, input.config.label)) && (input.queue === undefined || input.queue.includes(issue.number));
     const skipped = dispatched ? labelFilter(issue.labels, rules) : undefined;
     const rank = input.config.priorityLabels.findIndex((label) => issue.labels.includes(label));
     nodes.set(issue.number, {
@@ -173,9 +183,7 @@ export const graphJson = (input: GraphRead) => {
     const holder = holders.get(issue.number);
     const node = nodes.get(issue.number);
     const wave = waveOf.get(issue.number) ?? null;
-    const number = pullFor(issue, holder);
-    const live = number === undefined ? undefined : open.get(number);
-    const ref = live ?? issue.closedBy.find((pull) => pull.number === number);
+    const { live, ref } = pullFor(issue, holder, open);
     const checks = live === undefined ? null : checksOf(input.required.get(live.base) ?? [], live);
     const status: IssueStatus = !issue.open
       ? issue.closedBy.some((pull) => pull.state === "merged")
