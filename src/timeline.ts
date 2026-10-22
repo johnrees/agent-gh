@@ -174,55 +174,141 @@ export const timelineSvg = (layout: TimelineLayout): TimelineSvg => {
   return { width: spine + RADIUS + 4, height: layout.rows.length * ROW, edges, nodes: layout.rows.map((_, row) => ({ row, cx: spine, cy: y(row) })) };
 };
 
+/** What hovering or pinning a row shows, by row key: the steps to it, what it unlocks, and what waits on it and on more besides. */
+export type Focus = { readonly steps: ReadonlyMap<string, number | "cycle">; readonly unlocks: ReadonlyMap<string, number>; readonly waiting: ReadonlySet<string> };
+
 /**
- * The rows `row` is transitively blocked by (`ancestors`) and that
- * transitively wait on it (`descendants`), each with its shortest distance
- * from `row` by breadth-first search over the laid-out edges, so a hidden row
- * breaks the chain. A row on both sides, through a cycle, is an ancestor.
+ * Each open issue's open blockers, and each key's open dependents, over the
+ * whole graph: a hidden row or a blocker in another repository still blocks.
+ * A blocker here is open as its own issue says, else as its entry says.
  */
-export const related = (layout: TimelineLayout, row: number): { readonly ancestors: ReadonlyMap<number, number>; readonly descendants: ReadonlyMap<number, number> } => {
-  const ancestors = reach(layout, row, "up");
-  const descendants = reach(layout, row, "down");
-  for (const at of ancestors.keys()) descendants.delete(at);
-  return { ancestors, descendants };
+const openGraph = (json: GraphJson) => {
+  const here = new Map(json.issues.map((issue) => [keyOf(issue.issue, null), issue]));
+  const blockers = new Map<string, string[]>();
+  const dependents = new Map<string, string[]>();
+  for (const issue of json.issues) {
+    if (issue.state !== "open") continue;
+    const open = issue.blocked_by.filter((blocker) => (blocker.repo === null ? (here.get(keyOf(blocker.issue, null))?.state ?? (blocker.open ? "open" : "closed")) === "open" : blocker.open));
+    const keys = [...new Set(open.map((blocker) => keyOf(blocker.issue, blocker.repo)))];
+    blockers.set(keyOf(issue.issue, null), keys);
+    for (const key of keys) dependents.set(key, [...(dependents.get(key) ?? []), keyOf(issue.issue, null)]);
+  }
+  return { blockers: (key: string) => blockers.get(key) ?? [], dependents: (key: string) => dependents.get(key) ?? [] };
 };
 
-/** Each row `row` reaches up its blockers or down its dependents, with its shortest distance; a visited set ends a cycle. */
-const reach = (layout: TimelineLayout, row: number, way: "up" | "down"): Map<number, number> => {
-  const depth = new Map<number, number>([[row, 0]]);
-  const queue = [row];
-  for (let at = queue.shift(); at !== undefined; at = queue.shift()) {
-    for (const edge of layout.edges) {
-      const step = way === "up" ? (edge.to === at ? edge.from : undefined) : edge.from === at ? edge.to : undefined;
-      if (step === undefined || depth.has(step)) continue;
-      depth.set(step, (depth.get(at) as number) + 1);
-      queue.push(step);
+/** Every key reached from `start` by `next`, `start` left out. */
+const walk = (start: string, next: (key: string) => readonly string[]): Set<string> => {
+  const seen = new Set<string>();
+  const todo = [start];
+  for (let at = todo.pop(); at !== undefined; at = todo.pop()) {
+    for (const key of next(at)) {
+      if (key === start || seen.has(key)) continue;
+      seen.add(key);
+      todo.push(key);
     }
   }
-  depth.delete(row);
-  return depth;
+  return seen;
 };
 
 /**
- * What hovering (or pinning) `row` shows. An edge is `blocker` (red) on an
- * ancestor path: its source an ancestor, its target `row` or an ancestor; it
- * is `child` (green) on a descendant path: its source `row` or a row `row`
- * reaches downward (an ancestor too, on a cycle);
- * any other edge is `faded`, and so is every row but `row` and its
- * ancestors and descendants. Each of those has a badge: `↑2` two steps up
- * the chain of blockers, `↓1` one step down.
+ * The focus on `row`, over the whole graph's open issues.
+ * - `steps`: its open ancestors (a closed blocker is done, so the walk stops
+ *   there; an open blocker elsewhere is a leaf) in Kahn's waves: step 1 has
+ *   no open blocker and can start now, step k waits only on steps below k,
+ *   so a step is its longest open chain. What Kahn cannot place is `cycle`.
+ * - `unlocks`: its descendants freed by it, in waves: ↓1 waits on nothing
+ *   open but `row`, ↓k only on `row` and levels below k.
+ * - `waiting`: its other open descendants, which wait on something more.
+ * A row on both sides, through a cycle, is a step.
+ */
+export const focus = (json: GraphJson, layout: TimelineLayout, row: number): Focus => {
+  const start = layout.rows[row]?.key ?? "";
+  const graph = openGraph(json);
+  const ancestors = walk(start, graph.blockers);
+  const steps = new Map<string, number | "cycle">();
+  for (let step = 1; ; step++) {
+    const wave = [...ancestors].filter((key) => !steps.has(key) && graph.blockers(key).every((blocker) => steps.has(blocker)));
+    if (wave.length === 0) break;
+    for (const key of wave) steps.set(key, step);
+  }
+  for (const key of ancestors) if (!steps.has(key)) steps.set(key, "cycle");
+  const unlocks = new Map<string, number>();
+  const freed = new Set([start]);
+  for (let level = 1; ; level++) {
+    const wave = [...new Set([...freed].flatMap(graph.dependents))].filter((key) => !freed.has(key) && !ancestors.has(key) && graph.blockers(key).every((blocker) => freed.has(blocker)));
+    if (wave.length === 0) break;
+    for (const key of wave) {
+      unlocks.set(key, level);
+      freed.add(key);
+    }
+  }
+  const waiting = new Set([...walk(start, graph.dependents)].filter((key) => !unlocks.has(key) && !ancestors.has(key)));
+  return { steps, unlocks, waiting };
+};
+
+/** Each hue's shades: 1 the strongest, on what can be acted on (step 1 starts now, ↓1 is freed directly); a later step or level takes the lightest. */
+const RAMP = 3;
+
+/** A badge in the depth column: its text, and its tone (`r1`…`r3` for a step, `g1`…`g3` for an unlock level, `wait` for a row that waits on more). */
+export type Badge = { readonly text: string; readonly tone: string };
+
+/**
+ * What hovering (or pinning) `row` shows: each edge's classes, the rows that
+ * fade, each related row's badge, and the summary line.
+ * - An edge from a step into a step or `row` is `blocker`, toned by its
+ *   source's step.
+ * - An edge from `row` or an unlocked row into an unlocked row is `child`,
+ *   toned by its target's level.
+ * - An edge from `row`, an unlocked row, or a waiting row into a waiting
+ *   row stays plain grey.
+ * - Every other edge, and every row but `row`, its steps, what it unlocks,
+ *   and what waits on it, is `faded`.
  */
 export const timelineHover = (
+  json: GraphJson,
   layout: TimelineLayout,
   row: number,
-): { readonly edges: readonly ("blocker" | "child" | "faded")[]; readonly faded: ReadonlySet<number>; readonly badges: ReadonlyMap<number, string> } => {
-  const { ancestors, descendants } = related(layout, row);
-  const below = reach(layout, row, "down");
-  const edges = layout.edges.map((edge) =>
-    ancestors.has(edge.from) && (edge.to === row || ancestors.has(edge.to)) ? "blocker" : edge.from === row || below.has(edge.from) ? "child" : "faded",
-  );
-  const badges = new Map([...[...ancestors].map(([at, depth]) => [at, `↑${depth}`] as const), ...[...descendants].map(([at, depth]) => [at, `↓${depth}`] as const)]);
-  return { edges, faded: new Set(layout.rows.map((_, at) => at).filter((at) => at !== row && !badges.has(at))), badges };
+): { readonly edges: readonly string[]; readonly faded: ReadonlySet<number>; readonly badges: ReadonlyMap<number, Badge>; readonly summary: string } => {
+  const seen = focus(json, layout, row);
+  const key = (at: number) => layout.rows[at]?.key ?? "";
+  const start = key(row);
+  const tone = (level: number | "cycle") => (level === "cycle" ? RAMP : Math.min(level, RAMP));
+  const edges = layout.edges.map((edge) => {
+    const [from, to] = [key(edge.from), key(edge.to)];
+    const step = seen.steps.get(from);
+    if (step !== undefined && (to === start || seen.steps.has(to))) return `blocker r${tone(step)}`;
+    const level = seen.unlocks.get(to);
+    if (level !== undefined && (from === start || seen.unlocks.has(from))) return `child g${tone(level)}`;
+    if (seen.waiting.has(to) && (from === start || seen.unlocks.has(from) || seen.waiting.has(from))) return "";
+    return "faded";
+  });
+  const badges = new Map<number, Badge>();
+  const faded = new Set<number>();
+  layout.rows.forEach((entry, at) => {
+    const step = seen.steps.get(entry.key);
+    const level = seen.unlocks.get(entry.key);
+    if (step !== undefined) badges.set(at, { text: step === "cycle" ? "∞" : String(step), tone: `r${tone(step)}` });
+    else if (level !== undefined) badges.set(at, { text: `↓${level}`, tone: `g${tone(level)}` });
+    else if (seen.waiting.has(entry.key)) badges.set(at, { text: "↓", tone: "wait" });
+    else if (at !== row) faded.add(at);
+  });
+  return { edges, faded, badges, summary: focusSummary(start, seen) };
+};
+
+/** `#42: 3 steps (2 ∥ 1 ∥ 3 issues) · 1 ∞ in a cycle · unlocks 4`. */
+export const focusSummary = (key: string, seen: Focus): string => {
+  const counts: number[] = [];
+  let cycle = 0;
+  for (const step of seen.steps.values()) {
+    if (step === "cycle") cycle++;
+    else counts[step - 1] = (counts[step - 1] ?? 0) + 1;
+  }
+  const total = counts.reduce((sum, count) => sum + count, 0);
+  const parts = [
+    ...(counts.length === 0 ? [] : [`${counts.length} step${counts.length === 1 ? "" : "s"} (${counts.join(" ∥ ")} issue${total === 1 ? "" : "s"})`]),
+    ...(cycle === 0 ? [] : [`${cycle} ∞ in a cycle`]),
+  ];
+  return `${key}: ${[...(parts.length === 0 ? ["nothing open blocks it"] : parts), `unlocks ${seen.unlocks.size}`].join(" · ")}`;
 };
 
 export const NONE = "—";
@@ -298,8 +384,8 @@ const UNSAFE = new RegExp(`[<>&${String.fromCharCode(0x2028, 0x2029)}]`, "g");
 export const scriptJson = (json: GraphJson): string => JSON.stringify(json).replace(UNSAFE, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 
 const STYLE = `
-:root { color-scheme: light dark; --fg: #1f2328; --text: #424a53; --muted: #6e7781; --bg: #f6f8fa; --surface: #ffffff; --line: #d8dee4; --band: rgba(191, 135, 0, 0.14); --edge: #8b949e; --blocker: #cf222e; --child: #1a7f37; }
-@media (prefers-color-scheme: dark) { :root { --fg: #e6e6e6; --text: #b4b8bd; --muted: #7d8590; --bg: #0b0c0e; --surface: #17181b; --line: #26282c; --band: rgba(210, 170, 60, 0.16); --blocker: #f85149; --child: #3fb950; } }
+:root { color-scheme: light dark; --fg: #1f2328; --text: #424a53; --muted: #6e7781; --bg: #f6f8fa; --surface: #ffffff; --line: #d8dee4; --band: rgba(191, 135, 0, 0.14); --edge: #8b949e; --r1: #c80f1c; --r2: #ef6b70; --r3: #f2a0a3; --g1: #137333; --g2: #45b864; --g3: #94dba6; }
+@media (prefers-color-scheme: dark) { :root { --fg: #e6e6e6; --text: #b4b8bd; --muted: #7d8590; --bg: #0b0c0e; --surface: #17181b; --line: #26282c; --band: rgba(210, 170, 60, 0.16); --r1: #ff5f56; --r2: #c0423d; --r3: #8e3c38; --g1: #4fd463; --g2: #2c8a3e; --g3: #2f6a3b; } }
 body { margin: 0; padding: 16px; font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); background: var(--bg); }
 main { display: inline-block; min-width: min(100%, 960px); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; box-sizing: border-box; }
 h1 { font-size: 15px; font-weight: 600; color: var(--fg); margin: 0 0 4px; }
@@ -326,11 +412,13 @@ tr.faded td:not(.lanes), .edge.faded, .node.faded { opacity: 0.5; }
 svg { display: block; }
 svg.ring { display: inline; vertical-align: -1px; margin-right: 4px; }
 .edge { fill: none; stroke: var(--edge); stroke-width: 1.25; }
-.edge.blocker { stroke: var(--blocker); stroke-width: 2; }
-.edge.child { stroke: var(--child); stroke-width: 2; }
+.edge.blocker, .edge.child { stroke-width: 2; }
 .node { stroke: var(--surface); stroke-width: 1.5; }
 .node.foreign { fill: var(--surface); stroke: var(--muted); stroke-dasharray: 2 1.5; }
 .node.foreign.shut { fill: var(--line); }
+${["r1", "r2", "r3", "g1", "g2", "g3"].map((tone) => `.edge.${tone} { stroke: var(--${tone}); } .node.${tone} { fill: var(--${tone}); } td.${tone} { color: var(--${tone}); }`).join("\n")}
+.node.wait { fill: var(--edge); }
+td.depth.r1, td.depth.g1 { font-weight: 600; }
 ${STATUSES.map(([status, colour]) => `.s-${status} { fill: ${colour}; background: ${colour}; }`).join("\n")}
 `;
 

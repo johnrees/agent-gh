@@ -80,6 +80,8 @@ const COLUMNS: readonly (readonly [string, string])[] = [
 ];
 const head = element("tr", {}, ...COLUMNS.map(([name, kind]) => element("th", { ...(name === "Issue" ? { colspan: "2" } : {}), ...(kind === "" ? {} : { class: kind }) }, name)));
 const body = element("tbody");
+const HINT = "hover a row for the steps to it and what it unlocks; click to pin, Escape to unpin";
+const focusLine = element("p", { class: "meta focus" }, HINT);
 document.body.append(
   element(
     "main",
@@ -87,7 +89,8 @@ document.body.append(
     element("h1", {}, String(json.repo)),
     summary,
     legend,
-    element("p", { class: "meta" }, `stuck: ${list(json.stuck)} · cycles: ${json.cycles.length === 0 ? NONE : json.cycles.map(list).join("; ")} · click a row to pin its chain, Escape to unpin`),
+    element("p", { class: "meta" }, `stuck: ${list(json.stuck)} · cycles: ${json.cycles.length === 0 ? NONE : json.cycles.map(list).join("; ")}`),
+    focusLine,
     element("table", {}, element("thead", {}, head), body),
   ),
 );
@@ -148,27 +151,36 @@ const pinned = (): number | undefined => {
   return at === -1 ? undefined : at;
 };
 
-// Lights a row's chain: its blockers' edges red, its dependents' green, each related row's distance in its badge, and the rest faded.
+const TONES = ["blocker", "child", "faded", "r1", "r2", "r3", "g1", "g2", "g3", "wait"];
+
+// Lights a row's focus: the steps to it in red, what it unlocks in green, each shaded by level with its badge, what waits on more in grey, and the rest faded.
 function light(row: number | undefined) {
   if (row === lit) return;
   lit = row;
-  const hover = row === undefined ? undefined : timelineHover(layout, row);
-  const pin = pinned();
+  const hover = row === undefined ? undefined : timelineHover(json, layout, row);
+  focusLine.textContent = hover?.summary ?? HINT;
   [...body.children].forEach((tr, at) => {
+    const badge = hover?.badges.get(at);
+    const faded = hover?.faded.has(at) ?? false;
     tr.classList.toggle("hi", at === row);
-    tr.classList.toggle("pinned", at === pin);
-    tr.classList.toggle("faded", hover?.faded.has(at) ?? false);
-    const badge = tr.querySelector("td.depth");
-    if (badge !== null) badge.textContent = hover?.badges.get(at) ?? "";
-    nodes[at]?.classList.toggle("faded", hover?.faded.has(at) ?? false);
+    tr.classList.toggle("faded", faded);
+    const depth = tr.querySelector("td.depth");
+    if (depth !== null) {
+      depth.className = badge === undefined ? "depth" : `depth ${badge.tone}`;
+      depth.textContent = badge?.text ?? "";
+    }
+    nodes[at]?.classList.remove(...TONES);
+    if (faded) nodes[at]?.classList.add("faded");
+    if (badge !== undefined) nodes[at]?.classList.add(badge.tone);
   });
   band?.setAttribute("y", String((row ?? 0) * ROW));
   band?.classList.toggle("on", row !== undefined);
   edges.forEach((edge, at) => {
-    const kind = hover?.edges[at];
-    for (const name of ["blocker", "child", "faded"]) edge.classList.toggle(name, kind === name);
-    // Coloured edges go above the faded ones.
-    if (kind === "blocker" || kind === "child") edge.parentNode?.appendChild(edge);
+    const names = (hover?.edges[at] ?? "").split(" ").filter((name) => name !== "");
+    edge.classList.remove(...TONES);
+    edge.classList.add(...names);
+    // Coloured edges go above the grey and faded ones.
+    if (names.includes("blocker") || names.includes("child")) edge.parentNode?.appendChild(edge);
   });
 }
 
