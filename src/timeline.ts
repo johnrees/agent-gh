@@ -83,12 +83,13 @@ export const timelineLayout = (json: GraphJson, options: { readonly hidden?: Rea
       if (from !== undefined) raw.set(`${from} ${to}`, { from, to, open: blocker.open });
     }
   });
-  // A priority label the default list lacks ranks after it: the JSON carries no `queue.priority_labels`.
+  // `next`'s order, from `priority_labels`; JSON from before that field ranks by the default list. A label the list lacks ranks after it.
+  const labels: readonly string[] = Array.isArray(json.priority_labels) ? json.priority_labels : DEFAULT_PRIORITY_LABELS;
   const rank = (row: TimelineRow): readonly [number, number, number, string] => {
     const at = row.issue?.milestone == null ? undefined : milestone.get(row.issue.milestone);
     const priority = row.issue?.priority ?? null;
-    const known = priority === null ? -1 : DEFAULT_PRIORITY_LABELS.indexOf(priority);
-    return [at ?? Number.MAX_SAFE_INTEGER, priority === null ? Number.MAX_SAFE_INTEGER : known === -1 ? DEFAULT_PRIORITY_LABELS.length : known, row.number, row.repo ?? ""];
+    const known = priority === null ? -1 : labels.indexOf(priority);
+    return [at ?? Number.MAX_SAFE_INTEGER, priority === null ? Number.MAX_SAFE_INTEGER : known === -1 ? labels.length : known, row.number, row.repo ?? ""];
   };
   const before = (a: number, b: number) => {
     const [x, y] = [rank(rows[a] as TimelineRow), rank(rows[b] as TimelineRow)];

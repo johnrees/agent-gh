@@ -4,6 +4,7 @@
   "fetched_at": "2026-10-21T12:00:00Z",
   "queue": null,
   "label": "ready",
+  "priority_labels": ["priority:high", "priority:medium", "priority:low"],
   "milestones": [
     { "number": 1, "title": "M1", "description": "", "state": "open", "open": 4, "closed": 2 },
     { "number": 2, "title": "M2 <b>bold</b>", "description": "", "state": "open", "open": 7, "closed": 0 }

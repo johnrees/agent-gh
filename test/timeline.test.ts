@@ -25,6 +25,15 @@ test("free rows go by milestone (none last), then priority (none last), then num
   expect(keysOf(layout)).toEqual(["#4", "#3", "#2", "#5", "#1"]);
 });
 
+test("priority goes by the graph's priority_labels, as next ranks; older JSON without them ranks by the default list", () => {
+  const json = graph();
+  const free = (number: number, priority: string | null) => ({ ...(json.issues[0] as GraphJson["issues"][number]), issue: number, milestone: null, priority, blocked_by: [] });
+  const issues = [free(1, "P0"), free(2, null), free(3, "P1"), free(4, "priority:low"), free(5, "P0")];
+  expect(keysOf(timelineLayout({ ...json, priority_labels: ["P1", "P0"], issues, cycles: [] }))).toEqual(["#3", "#1", "#5", "#4", "#2"]);
+  const { priority_labels: _, ...older } = json;
+  expect(keysOf(timelineLayout({ ...older, issues, cycles: [] } as unknown as GraphJson))).toEqual(["#4", "#1", "#3", "#5", "#2"]);
+});
+
 test("a blocker in another repository gets its own row, with no issue, linked to its issue page", () => {
   const layout = timelineLayout(graph());
   const row = at(layout, "johnrees/other#5");
