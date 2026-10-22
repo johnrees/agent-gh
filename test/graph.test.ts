@@ -34,7 +34,7 @@ type Issue = {
   readonly closedBy?: readonly number[];
 };
 type Status = { readonly context: string; readonly state: string; readonly creator?: string };
-type Run = { readonly name: string; readonly conclusion: string | null; readonly suite: number; readonly workflow?: number; readonly app?: number };
+type Run = { readonly name: string; readonly conclusion: string | null; readonly suite: number; readonly workflow?: number; readonly event?: string; readonly app?: number };
 type Pull = {
   readonly number: number;
   readonly body: string;
@@ -149,7 +149,10 @@ const world = (spec: World) => {
       ...(item.statuses ?? []).map((status) => ({ __typename: "StatusContext", context: status.context, state: status.state.toUpperCase(), creator: (status.creator ?? "johnrees").endsWith("[bot]") ? { __typename: "Bot", login: (status.creator as string).slice(0, -5) } : { __typename: "User", login: status.creator ?? "johnrees" } })),
       ...(item.runs ?? []).map((run) => ({
         __typename: "CheckRun", name: run.name, status: run.conclusion === null ? "IN_PROGRESS" : "COMPLETED", conclusion: run.conclusion?.toUpperCase() ?? null,
-        checkSuite: { databaseId: run.suite, app: { databaseId: run.app ?? 15368 }, workflowRun: run.workflow === undefined ? null : { workflow: { databaseId: run.workflow } } },
+        checkSuite: {
+          databaseId: run.suite, status: run.conclusion === null ? "IN_PROGRESS" : "COMPLETED", app: { databaseId: run.app ?? 15368 },
+          workflowRun: run.workflow === undefined ? null : { event: run.event ?? "pull_request", workflow: { databaseId: run.workflow } },
+        },
       })),
     ];
     return {
@@ -248,11 +251,12 @@ const REPOSITORY: World = {
       statuses: [{ context: "agent-review", state: "pending", creator: "github-actions[bot]" }, { context: "agent-threads", state: "success", creator: "github-actions[bot]" }],
     },
     {
-      // A pull request with no marker: Refs only. A failed run of "test" gave way to a newer run of the same workflow.
+      // A pull request with no marker: Refs only. A failed run of "test" gave way to a newer run of the same workflow;
+      // a dispatched run's failure after it counts for nothing, as GitHub does not evaluate it.
       // A bot's: GraphQL names it `renovate`, claims --json `renovate[bot]`.
       number: 33, author: "renovate[bot]", body: "Refs #5", createdAt: "2026-10-10T00:00:00Z", pushedAt: "2026-10-14T00:00:00Z", review: "APPROVED",
       statuses: [{ context: "agent-review", state: "success", creator: "github-actions[bot]" }, { context: "agent-threads", state: "success", creator: "github-actions[bot]" }, { context: "agent-hold", state: "success", creator: "github-actions[bot]" }],
-      runs: [{ name: "test", conclusion: "failure", suite: 1, workflow: 77 }, { name: "test", conclusion: "success", suite: 2, workflow: 77 }],
+      runs: [{ name: "test", conclusion: "failure", suite: 1, workflow: 77 }, { name: "test", conclusion: "success", suite: 2, workflow: 77 }, { name: "test", conclusion: "failure", suite: 3, workflow: 77, event: "workflow_dispatch" }],
     },
     { number: 20, body: "Closes #12", state: "merged", createdAt: "2026-09-01T00:00:00Z", pushedAt: "2026-09-01T00:00:00Z" },
     { number: 21, body: "Closes #13", state: "closed", createdAt: "2026-09-01T00:00:00Z", pushedAt: "2026-09-01T00:00:00Z" },

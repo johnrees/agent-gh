@@ -9,7 +9,7 @@ import { familyNames } from "./family.ts";
 import { type Api, request } from "./github.ts";
 import { HARNESSES, type Env } from "./harness.ts";
 import { parseRemoteUrl, parseRepo, type Repo, slug } from "./repo.ts";
-import { absent, checkState, type PushedTag, pushedRefs, type RequiredCheck, requiredChecks } from "./merge.ts";
+import { ACTIONS_APP, absent, checkState, type PushedTag, pushedRefs, type RequiredCheck, requiredChecks, type WorkflowRun } from "./merge.ts";
 import { type ApiIo, closingIssues, describeRequired, everyPage, pullThreads, repoOwner } from "./threads-run.ts";
 import {
   AWAITING,
@@ -363,9 +363,6 @@ const MERGE_STAGE = "checking the merge";
 
 const branchPath = (branch: string) => branch.split("/").map(encodeURIComponent).join("/");
 
-/** GitHub Actions' App, whose bot (`github-actions[bot]`) sets the agent-review workflow's statuses. */
-export const ACTIONS_APP = 15368;
-
 /** The pull request's thread, then each issue it closes, with their labels and label events now. */
 const liveThreads = async (io: ReviewIo, pr: Pull): Promise<HoldThread[]> => {
   const events = async (repo: Repo, number: number) => labelEvents(await everyPage(io, MERGE_STAGE, `/repos/${slug(repo)}/issues/${number}/events`, 10));
@@ -454,14 +451,16 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
   if (auto || required.length === 0) return pr.head;
   const statuses = await counted(io, stage, `${repoPath(io)}/commits/${pr.head}/status?`, "statuses");
   const bySomeApp = required.some((check) => check.app !== undefined) ? await byApps() : [];
-  let workflows: Map<number, number> | undefined;
+  let workflows: Map<number, WorkflowRun> | undefined;
   const unmet: string[] = [];
   for (const check of required) {
     const runs = await counted(io, stage, `${repoPath(io)}/commits/${pr.head}/check-runs?check_name=${encodeURIComponent(check.context)}&filter=latest&`, "check_runs");
-    // Several suites' runs: which Actions workflow each suite ran, so a newer run of a workflow supersedes an older one.
-    if (runs.length > 1 && workflows === undefined) workflows = await suiteWorkflows(io, stage, pr.head);
-    const state = checkState(check, check.app === undefined ? statuses : bySomeApp, runs, workflows);
-    if (state !== "passed") unmet.push(`\`${check.context}\` ${state}`);
+    // An Actions run counts only by its workflow run's event and that workflow's newest run, so any one needs the commit's workflow runs.
+    const actions = runs.some((run) => record(record(run).app).id === ACTIONS_APP);
+    if (actions && workflows === undefined) workflows = await suiteWorkflows(io, stage, pr.head);
+    const state = checkState(check, check.app === undefined ? statuses : bySomeApp, runs, workflows ?? new Map());
+    const why = state === "missing" && actions ? ` (${MISSING_RUNS})` : "";
+    if (state !== "passed") unmet.push(`\`${check.context}\` ${state}${why}`);
   }
   if (unmet.length === 0) return pr.head;
   throw new Failure(
@@ -470,11 +469,20 @@ export const gateMerge = async (io: ReviewIo, target: ReadyTarget, admin: boolea
   );
 };
 
-/** Each Actions workflow run's check suite id, mapped to its workflow's id, for the commit. */
-const suiteWorkflows = async (io: ReviewIo, stage: Stage, sha: string): Promise<Map<number, number>> => {
-  const map = new Map<number, number>();
+/** Why a check with GitHub Actions runs is missing: none GitHub would count. */
+const MISSING_RUNS = "no run GitHub counts: a job counts only from a push, pull_request, pull_request_review, pull_request_target, deployment, or deployment_status run, and only from its workflow's newest such run";
+
+/**
+ * Each Actions workflow run on the commit, by its check suite id: its
+ * workflow, event, and whether it completed, for `checkState`. Every page is
+ * read, and a short page or an error refuses the merge.
+ */
+const suiteWorkflows = async (io: ReviewIo, stage: Stage, sha: string): Promise<Map<number, WorkflowRun>> => {
+  const map = new Map<number, WorkflowRun>();
   for (const run of (await counted(io, stage, `${repoPath(io)}/actions/runs?head_sha=${sha}&`, "workflow_runs")).map(record)) {
-    if (Number.isSafeInteger(run.check_suite_id) && Number.isSafeInteger(run.workflow_id)) map.set(run.check_suite_id as number, run.workflow_id as number);
+    if (Number.isSafeInteger(run.check_suite_id) && Number.isSafeInteger(run.workflow_id) && typeof run.event === "string") {
+      map.set(run.check_suite_id as number, { workflow: run.workflow_id as number, event: run.event, completed: run.status === "completed" });
+    }
   }
   return map;
 };

@@ -10,7 +10,7 @@
 import { Failure, type Stage } from "./failure.ts";
 import { type GraphIssue, graphJson, type GraphJson, type GraphPull, type Milestone, type PullRef } from "./graph.ts";
 import { request } from "./github.ts";
-import { type RequiredCheck, requiredChecks } from "./merge.ts";
+import { type RequiredCheck, requiredChecks, type WorkflowRun } from "./merge.ts";
 import { type Blocker, parseQueue } from "./next.ts";
 import { queueConfig, type Read } from "./next-run.ts";
 import { parseRepo, slug } from "./repo.ts";
@@ -82,7 +82,7 @@ const issueFields = (comments: boolean) =>
   ].join(" ");
 
 const ROLLUP =
-  "statusCheckRollup{contexts(first:100){totalCount nodes{__typename ...on StatusContext{context state creator{__typename login}} ...on CheckRun{name status conclusion checkSuite{databaseId app{databaseId} workflowRun{workflow{databaseId}}}}}}}";
+  "statusCheckRollup{contexts(first:100){totalCount nodes{__typename ...on StatusContext{context state creator{__typename login}} ...on CheckRun{name status conclusion checkSuite{databaseId status app{databaseId} workflowRun{event workflow{databaseId}}}}}}}";
 const PULL_FIELDS = `${PULL_REF} title body createdAt reviewDecision baseRefName headRefName headRefOid changedFiles author{__typename login} comments(last:1){nodes{createdAt}} commits(last:1){totalCount nodes{commit{committedDate ${ROLLUP}}}}`;
 
 /** A list read whole, or a refusal: a label, blocker, or closing pull request left out would misjudge the issue. */
@@ -143,13 +143,17 @@ const pullOf = (node: Record<string, unknown>, repo: string): GraphPull => {
     .filter((context) => context.__typename === "StatusContext")
     // The App lookup reads REST's bot logins.
     .map((context) => ({ context: text(context.context), state: lower(context.state), creator: { login: login(context.creator) } }));
-  const workflows = new Map<number, number>();
+  const workflows = new Map<number, WorkflowRun>();
   const runs = contexts
     .filter((context) => context.__typename === "CheckRun")
     .map((context) => {
       const suite = record(context.checkSuite);
-      const workflow = record(record(suite.workflowRun).workflow).databaseId;
-      if (Number.isSafeInteger(suite.databaseId) && Number.isSafeInteger(workflow)) workflows.set(suite.databaseId as number, workflow as number);
+      const workflowRun = record(suite.workflowRun);
+      const workflow = record(workflowRun.workflow).databaseId;
+      // The rollup lists only suites with a run, so a newer workflow run yet to report the job is beyond it (the merge guard reads every one).
+      if (Number.isSafeInteger(suite.databaseId) && Number.isSafeInteger(workflow) && typeof workflowRun.event === "string") {
+        workflows.set(suite.databaseId as number, { workflow: workflow as number, event: workflowRun.event, completed: suite.status === "COMPLETED" });
+      }
       return { name: text(context.name), status: lower(context.status), conclusion: lower(context.conclusion), app: { id: record(suite.app).databaseId }, check_suite: { id: suite.databaseId } };
     });
   const ref = pullRef(node, repo);
