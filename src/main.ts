@@ -58,11 +58,13 @@ const USAGE = `usage:
                                     from a git hook: in an agent session, refuse a push to the default branch or one whose rules require checks
   agent-gh review sweep [--base REF] [--effort E]
                                     a quick bug sweep of the branch by another model family; prints, records nothing
-  agent-gh review full [--pr N] [--issue N] [--effort E] [--adopt]
+  agent-gh review full [--pr N] [--issue N] [--effort E] [--adopt] [--reviewer FAMILY]
                                     run the config's checks on the pull request's pushed head, review it against its issue,
                                     and post the findings as a review and the agent-review status (or, with
                                     status_writer "actions", wait for the agent-review workflow to set it); a commit
-                                    another session made on a claim's branch is refused unless --adopt takes it on
+                                    another session made on a claim's branch is refused unless --adopt takes it on;
+                                    where the config's require names the author, each required family reviews in turn,
+                                    or only --reviewer's
   agent-gh reply <finding> --applied <sha> | --declined "<why>" [--pr N]
                                     answer a review finding or a notify (its id as \`review full\` prints it, or its URL);
                                     a finding's review thread is answered and resolved
@@ -207,7 +209,7 @@ const statusIo = (env: NodeJS.ProcessEnv, repo: Repo, token: string): StatusIo =
 const reviewOptions = (rest: readonly string[]) => {
   const [mode, ...flags] = rest;
   if (mode !== "sweep" && mode !== "full") return undefined;
-  const allowed = mode === "sweep" ? ["--base", "--effort"] : ["--pr", "--issue", "--effort"];
+  const allowed = mode === "sweep" ? ["--base", "--effort"] : ["--pr", "--issue", "--effort", "--reviewer"];
   const values: Record<string, string> = {};
   let adopt = false;
   for (let index = 0; index < flags.length; ) {
@@ -235,6 +237,7 @@ const reviewOptions = (rest: readonly string[]) => {
     ...(issue === undefined ? {} : { issue }),
     ...(effort === undefined ? {} : { effort }),
     ...(adopt ? { adopt } : {}),
+    ...(values["--reviewer"] === undefined ? {} : { reviewer: values["--reviewer"] }),
   };
 };
 

@@ -1,5 +1,5 @@
 import type { AgentApp } from "./config.ts";
-import { type HoldConfig, inert, outcomeSummary, parseMarker, type ReviewMarker, type ReviewPolicy, reviewState, sameLabel, STATUS_CONTEXT, statusDescription } from "./review.ts";
+import { type HoldConfig, inert, outcomeSummary, parseMarker, type ReviewerFamily, type ReviewMarker, type ReviewPolicy, reviewState, sameLabel, STATUS_CONTEXT, statusDescription } from "./review.ts";
 import { byAgent, type ThreadComment } from "./threads.ts";
 
 /**
@@ -116,8 +116,22 @@ export const carryCandidate = (markers: readonly FoundMarker[], patchId: string 
   return latest !== undefined && passes(latest, policy) ? latest : undefined;
 };
 
-/** The latest marker for `head`, which decides its status. */
-export const markerFor = (markers: readonly FoundMarker[], head: string): FoundMarker | undefined => markers.findLast((found) => found.marker.head === head);
+/** The latest marker for `head` (by `family`'s reviewer, when given), which decides its status. */
+export const markerFor = (markers: readonly FoundMarker[], head: string, family?: ReviewerFamily): FoundMarker | undefined =>
+  markers.findLast((found) => found.marker.head === head && (family === undefined || found.marker.reviewer === family));
+
+/** The markers `family`'s reviewer posted, so each required family is judged, and carried forward, on its own reviews alone. */
+export const byReviewer = (markers: readonly FoundMarker[], family: ReviewerFamily): FoundMarker[] => markers.filter((found) => found.marker.reviewer === family);
+
+/**
+ * The family whose work a pull request is, as the workflow reads it: the one
+ * family App every commit credits as co-author (`authorFamily`, from
+ * `fromCommits`), else the author the latest marker that records one names
+ * (the session's family `review full` took, when the commits credit none or
+ * a mix); else undefined.
+ */
+export const pullAuthor = (fromCommits: string | undefined, markers: readonly FoundMarker[]): string | undefined =>
+  fromCommits ?? markers.findLast((found) => found.marker.author !== undefined)?.marker.author;
 
 const status = (state: Status["state"], description: string, targetUrl?: string): Status => ({
   context: STATUS_CONTEXT,
@@ -126,10 +140,50 @@ const status = (state: Status["state"], description: string, targetUrl?: string)
   targetUrl,
 });
 
+/** One family `require` names, and its review of the head: its own marker for it, else a passing one carried forward. */
+export type FamilyReview = { readonly family: ReviewerFamily; readonly current: FoundMarker | undefined; readonly carried: FoundMarker | undefined };
+
+/** How a status that names a missing family begins; the `gh pr ready` refusal reads the family from it. */
+export const AWAITING = /^awaiting (.+?)'s review: run `(agent-gh review full --reviewer \S+)`/;
+
+/**
+ * agent-review where `require` names the author: success only when every
+ * required family's review of the head passes `block_on` and its checks;
+ * else failure naming the first family whose review blocks, else the
+ * families yet to review; pending while none has.
+ */
+export const requiredStatus = (number: number, reviews: readonly FamilyReview[], policy: ReviewPolicy): Status => {
+  const head = (found: FoundMarker) => found.marker.head.slice(0, 8);
+  const missing = reviews.filter((review) => review.current === undefined && review.carried === undefined).map((review) => review.family);
+  if (missing.length === reviews.length) {
+    return status("pending", `needs ${missing.join(" and ")}'s reviews: run \`gh pr checkout ${number} && agent-gh review full --pr ${number}\``);
+  }
+  // Each status links the latest review it counts, so a new review that leaves its words as they were still sets it anew (and `review full` sees it land).
+  const latest = reviews
+    .flatMap((review) => [review.current ?? review.carried].filter((found) => found !== undefined))
+    .reduce<FoundMarker | undefined>((newest, found) => (newest === undefined || found.at >= newest.at ? found : newest), undefined);
+  const blocking = reviews.find((review) => review.current !== undefined && !passes(review.current, policy));
+  const verdict = (found: FoundMarker) => outcomeSummary(found.marker, policy, `checks ${found.marker.checks}`);
+  if (blocking?.current !== undefined) {
+    const rest = missing.length === 0 ? "" : `; ${missing.join(" and ")} yet to review`;
+    return status("failure", `${blocking.family} blocks: ${verdict(blocking.current)}${rest}`, latest?.url);
+  }
+  const passed = reviews.flatMap((review) => {
+    if (review.current !== undefined) return [`${review.family} ${verdict(review.current)}`];
+    if (review.carried !== undefined) return [`${review.family} ${policy.blockOn === "changes_requested" ? "approved" : "passed"} at ${head(review.carried)}, carried forward`];
+    return [];
+  });
+  if (missing.length > 0) {
+    return status("failure", `awaiting ${missing.join(" and ")}'s review: run \`agent-gh review full --reviewer ${missing[0]}\`; ${passed.join(". ")}`, latest?.url);
+  }
+  return status("success", `${reviews.map((review) => review.family).join(" and ")} passed: ${passed.join(". ")}`, latest?.url);
+};
+
 /**
  * agent-review for pull request `number`'s head: success for a pull request
- * that is not an agent's, or that a person waived; else the head's own
- * marker, which `block_on` and its checks judge; else a passing review
+ * that is not an agent's, or that a person waived; where `require` names the
+ * author, every required family's review (`requiredStatus`); else the head's
+ * own marker, which `block_on` and its checks judge; else a passing review
  * carried forward; else pending, naming the command that reviews it.
  */
 export const reviewStatus = (input: {
@@ -139,9 +193,16 @@ export const reviewStatus = (input: {
   readonly current: FoundMarker | undefined;
   readonly carried: FoundMarker | undefined;
   readonly policy: ReviewPolicy;
+  /** Each family `require` names for the author, in the config's order; undefined when it names none. */
+  readonly required?: readonly FamilyReview[] | undefined;
+  /** The config has `require`, but neither the commits nor any marker says whose work this is, so what it asks cannot be known. */
+  readonly authorUnknown?: boolean;
 }): Status => {
   if (!input.agent) return status("success", "not an agent PR");
   if (input.waivedBy !== undefined) return status("success", `waived by ${input.waivedBy}`);
+  // Fails closed: a review from a release that recorded no author never passes for work require may cover.
+  if (input.authorUnknown === true) return status("pending", `needs a review that records its author, for require: run \`gh pr checkout ${input.number} && agent-gh review full --pr ${input.number}\``);
+  if (input.required !== undefined) return requiredStatus(input.number, input.required, input.policy);
   if (input.current !== undefined) {
     const { marker } = input.current;
     return status(reviewState(marker, input.policy), `${outcomeSummary(marker, input.policy, `checks ${marker.checks}`)} (${marker.reviewer} review)`, input.current.url);
