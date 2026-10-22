@@ -1332,7 +1332,7 @@ export const pullDiff = async (io: Pick<ReviewIo, "git">, mergeBase: string, hea
  * who cannot approve his own pull requests): findings on a line the diff
  * shows go on that line, the rest in the body. If GitHub still refuses a
  * line (422), every finding goes in the body instead. Returns when GitHub
- * says it was submitted.
+ * says it was submitted, and its id.
  */
 const postReview = async (io: ReviewIo, number: number, head: string, review: Review, diff: string, body: (outside: readonly Finding[]) => string) => {
   const lines = diffLines(diff);
@@ -1341,8 +1341,11 @@ const postReview = async (io: ReviewIo, number: number, head: string, review: Re
   const inline = findings.filter(onDiff);
   const path = `${repoPath(io)}/pulls/${number}/reviews`;
   const comments = inline.map((finding) => ({ path: finding.file, line: finding.line, side: "RIGHT", body: inlineComment(finding) }));
-  // When GitHub dated the review (else now): what orders it among the pull request's other markers.
-  const dated = (value: unknown) => text(record(value).submitted_at) || new Date().toISOString();
+  // When GitHub dated the review (else now), which orders it among the pull request's other markers, and its id.
+  const dated = (value: unknown) => {
+    const posted = record(value);
+    return { at: text(posted.submitted_at) || new Date().toISOString(), reviewId: Number.isSafeInteger(posted.id) ? (posted.id as number) : undefined };
+  };
   const first = await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(findings.filter((finding) => !onDiff(finding))), comments }, [422]);
   if (first.status !== 422) return dated(first.value);
   if (comments.length === 0) throw new Failure("reviewing", `HTTP 422 from POST ${path}`);
@@ -1448,12 +1451,26 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
    * posted before it, set after each review is posted, so a later reviewer
    * that fails never leaves an earlier success over a block just posted.
    */
+  const requiredNow = async (families: readonly ReviewerFamily[]) => {
+    // Every review GitHub lists, in its order, and this run's it does not list yet, as GitHub dated them: a later one (a concurrent `--reviewer` run's) is the latest.
+    const listed = validMarkers(await markerPosts(io, stage, number), await repoOwner(io, stage), agentApps());
+    const unlisted = done.map((entry) => entry.found).filter((found) => found.reviewId === undefined || !listed.some((other) => other.reviewId === found.reviewId));
+    const posted = [...listed, ...unlisted].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+    return requiredStatus(number, families.map((family): FamilyReview => ({ family, current: markerFor(posted, head, family), carried: undefined })), config);
+  };
   const setRequired = async (families: readonly ReviewerFamily[]): Promise<void> => {
-    // This run's reviews as GitHub dated them, with every other: a later one (a concurrent `--reviewer` run's) is the latest.
-    const posted = [...validMarkers(await markerPosts(io, stage, number), await repoOwner(io, stage), agentApps()), ...done.map((entry) => entry.found)].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
-    const reviews = families.map((family): FamilyReview => ({ family, current: markerFor(posted, head, family), carried: undefined }));
-    const status = requiredStatus(number, reviews, config);
-    await setStatus(io, head, status.state === "success" ? "success" : "failure", status.description);
+    // Set, then read again: a concurrent run's review posted meanwhile, whose own write this one may have overwritten, is set too.
+    let status = await requiredNow(families);
+    for (let round = 1; ; round++) {
+      await setStatus(io, head, status.state === "success" ? "success" : "failure", status.description);
+      const now = await requiredNow(families);
+      if (now.state === status.state && now.description === status.description) return;
+      if (round >= 3) {
+        io.print(`agent-gh: #${number}'s reviews kept changing while ${STATUS_CONTEXT} was set; run \`agent-gh review full\` again to settle it`);
+        return;
+      }
+      status = now;
+    }
   };
   let before: CommitStatus | undefined;
   for (const [index, reviewer] of reviewers.entries()) {
@@ -1472,8 +1489,8 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
     };
     // The workflow's runs for an earlier family's review have long settled by the last one's, so only the last is waited for.
     if (actions && index === reviewers.length - 1) before = await headStatus(io, head);
-    const at = await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
-    done.push({ reviewer, review, found: { marker, at, url: "" } });
+    const { at, reviewId } = await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
+    done.push({ reviewer, review, found: { marker, at, url: "", ...(reviewId === undefined ? {} : { reviewId }) } });
     // A waiver John added meanwhile stands: no status is set over it.
     if (!actions && required !== undefined && index < reviewers.length - 1 && (await waiver(io, stage, await pull(io, stage, number), config)) === undefined) await setRequired(required);
   }

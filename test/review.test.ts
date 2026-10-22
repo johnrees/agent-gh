@@ -328,6 +328,8 @@ type World = {
   workflowRuns?: unknown[];
   /** The pull request's reviews, and its comments on lines. */
   reviews?: unknown[];
+  /** Reviews GitHub lists as well once a status has been set, as when a concurrent run posts one meanwhile. */
+  reviewsAfterStatus?: unknown[];
   lineComments?: unknown[];
   /** The commits git finds in HEAD's history, for an earlier review's head. */
   ancestors?: string[];
@@ -363,7 +365,7 @@ const world = ({
   commitPulls = [{ number: 12, state: "open", head: { sha: HEAD } }], branchPulls = [{ number: 12, state: "open" }], family = "claude",
   coAuthors = [[bot("claude")], [bot("claude")]], checkResults = [], reviewReplies = [], rules = [], branch = { protected: false }, checkRuns = [], workflowRuns = [],
   statusLater = [], comments = [], issueComments = [{ id: 70, body: "Last word.", user: { login: "someone" }, created_at: "2026-10-01T00:00:00Z" }], reactions = {},
-  reviews = [], lineComments = [], ancestors = [], base = "main", issueLabels = ["model:fable-astra"], issueEvents = [], pullBody = "Closes #7.", sessions = [], session = "s-one",
+  reviews = [], reviewsAfterStatus = [], lineComments = [], ancestors = [], base = "main", issueLabels = ["model:fable-astra"], issueEvents = [], pullBody = "Closes #7.", sessions = [], session = "s-one",
 }: World = {}) => {
   let pullReads = 0;
   const statusReads = [...statusLater];
@@ -380,7 +382,7 @@ const world = ({
     [`GET ${REPO}/commits/${HEAD}/pulls`]: () => reply(200, commitPulls),
     [`GET ${REPO}`]: () => reply(200, { default_branch: "main", owner: { login: "johnrees" } }),
     [`GET ${REPO}/issues/12/comments`]: (_, url) => reply(200, page(comments, url)),
-    [`GET ${REPO}/pulls/12/reviews`]: (_, url) => reply(200, page(reviews, url)),
+    [`GET ${REPO}/pulls/12/reviews`]: (_, url) => reply(200, page(fake.log.some((entry) => entry.method === "POST" && entry.path === `${REPO}/statuses/${HEAD}`) ? [...reviews, ...reviewsAfterStatus] : reviews, url)),
     [`GET ${REPO}/pulls/12/comments`]: (_, url) => reply(200, page(lineComments, url)),
     [`GET ${REPO}/commits/${head}/statuses`]: (_, url) => reply(200, page(status, url)),
     "GET /apps/github-actions": () => reply(200, { id: 15368, slug: "github-actions" }),
@@ -1535,6 +1537,11 @@ test("the required families' status counts each family's latest review as GitHub
   const concurrent = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answer: approve, reviews: [later] });
   await reviewFull(concurrent.io, {});
   expect(posted(concurrent.fake, `${REPO}/statuses/${HEAD}`).at(-1)).toEqual({ state: "failure", context: "agent-review", description: "codex blocks: changes requested; checks passed" });
+  // A concurrent `--reviewer claude` run's approval, listed only after this run set its status, is set too, not left behind an older snapshot.
+  const claude = { ...later, id: 901, body: later.body.replace('"reviewer":"codex"', '"reviewer":"claude"').replace("changes_requested", "approve") };
+  const settles = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answer: approve, reviewsAfterStatus: [claude] });
+  await reviewFull(settles.io, { reviewer: "codex" });
+  expect(posted(settles.fake, `${REPO}/statuses/${HEAD}`).map((status) => status.state)).toEqual(["failure", "success"]);
   // John waives the review while Codex runs: no status is set over it, and the waiver is recorded at the end.
   const waived = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answer: approve, labelsLater: ["review-waived"], events: [labeled("johnrees", null)] });
   await reviewFull(waived.io, {});
