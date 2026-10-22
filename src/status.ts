@@ -158,11 +158,15 @@ export const requiredStatus = (number: number, reviews: readonly FamilyReview[],
   if (missing.length === reviews.length) {
     return status("pending", `needs ${missing.join(" and ")}'s reviews: run \`gh pr checkout ${number} && agent-gh review full --pr ${number}\``);
   }
+  // Each status links the latest review it counts, so a new review that leaves its words as they were still sets it anew (and `review full` sees it land).
+  const latest = reviews
+    .flatMap((review) => [review.current ?? review.carried].filter((found) => found !== undefined))
+    .reduce<FoundMarker | undefined>((newest, found) => (newest === undefined || found.at >= newest.at ? found : newest), undefined);
   const blocking = reviews.find((review) => review.current !== undefined && !passes(review.current, policy));
   const verdict = (found: FoundMarker) => outcomeSummary(found.marker, policy, `checks ${found.marker.checks}`);
   if (blocking?.current !== undefined) {
     const rest = missing.length === 0 ? "" : `; ${missing.join(" and ")} yet to review`;
-    return status("failure", `${blocking.family} blocks: ${verdict(blocking.current)}${rest}`, blocking.current.url);
+    return status("failure", `${blocking.family} blocks: ${verdict(blocking.current)}${rest}`, latest?.url);
   }
   const passed = reviews.flatMap((review) => {
     if (review.current !== undefined) return [`${review.family} ${verdict(review.current)}`];
@@ -170,10 +174,9 @@ export const requiredStatus = (number: number, reviews: readonly FamilyReview[],
     return [];
   });
   if (missing.length > 0) {
-    return status("failure", `awaiting ${missing.join(" and ")}'s review: run \`agent-gh review full --reviewer ${missing[0]}\`; ${passed.join(". ")}`);
+    return status("failure", `awaiting ${missing.join(" and ")}'s review: run \`agent-gh review full --reviewer ${missing[0]}\`; ${passed.join(". ")}`, latest?.url);
   }
-  const link = reviews.map((review) => review.current ?? review.carried).find((found) => found !== undefined);
-  return status("success", `${reviews.map((review) => review.family).join(" and ")} passed: ${passed.join(". ")}`, link?.url);
+  return status("success", `${reviews.map((review) => review.family).join(" and ")} passed: ${passed.join(". ")}`, latest?.url);
 };
 
 /**

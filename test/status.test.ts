@@ -176,7 +176,7 @@ test("agent-review where require names the author: every required family's revie
     context: "agent-review", state: "pending", description: "needs codex and claude's reviews: run `gh pr checkout 12 && agent-gh review full --pr 12`", targetUrl: undefined,
   });
   expect(reviewStatus({ ...base, required: required(codex, undefined) })).toEqual({
-    context: "agent-review", state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed", targetUrl: undefined,
+    context: "agent-review", state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed", targetUrl: "https://github.com/r/1",
   });
   expect(reviewStatus({ ...base, required: required(codex, found({ reviewer: "claude", verdict: "changes_requested" }, "3")) })).toEqual({
     context: "agent-review", state: "failure", description: "claude blocks: changes requested; checks passed", targetUrl: "https://github.com/r/3",
@@ -185,8 +185,10 @@ test("agent-review where require names the author: every required family's revie
     state: "failure", description: "codex blocks: changes requested; checks passed; claude yet to review",
   });
   expect(reviewStatus({ ...base, required: required(codex, claude) })).toEqual({
-    context: "agent-review", state: "success", description: "codex and claude passed: codex approved; checks passed. claude approved; checks passed", targetUrl: "https://github.com/r/1",
+    context: "agent-review", state: "success", description: "codex and claude passed: codex approved; checks passed. claude approved; checks passed", targetUrl: "https://github.com/r/2",
   });
+  // It links the latest review it counts, so a re-review that leaves its words unchanged still sets it anew.
+  expect(reviewStatus({ ...base, required: required(found({ reviewer: "codex" }, "6"), claude) }).targetUrl).toBe("https://github.com/r/6");
   expect(reviewStatus({ ...base, required: required(codex, undefined, found({ reviewer: "claude", head: B }, "5")) })).toMatchObject({
     state: "success", description: "codex and claude passed: codex approved; checks passed. claude approved at bbbbbbbb, carried forward",
   });
