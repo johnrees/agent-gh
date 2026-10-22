@@ -11,14 +11,29 @@ const REPO = { owner: "johnrees", name: "widget" };
 const NOW = () => new Date("2026-10-21T12:00:00Z");
 
 test("graph takes --json, --all, and -R; anything else, or no --json, is refused", () => {
-  expect(parseGraphArgs(["--json"])).toEqual({ all: false });
-  expect(parseGraphArgs(["--json", "--all", "-R", "o/r"])).toEqual({ all: true });
-  expect(parseGraphArgs(["--repo=o/r", "--json"])).toEqual({ all: false });
+  expect(parseGraphArgs(["--json"])).toEqual({ format: "json", all: false });
+  expect(parseGraphArgs(["--json", "--all", "-R", "o/r"])).toEqual({ format: "json", all: true });
+  expect(parseGraphArgs(["--repo=o/r", "--json"])).toEqual({ format: "json", all: false });
   expect(parseGraphArgs([])).toBeUndefined();
   expect(parseGraphArgs(["--all"])).toBeUndefined();
   expect(parseGraphArgs(["--json", "--json"])).toBeUndefined();
   expect(parseGraphArgs(["--json", "7"])).toBeUndefined();
   expect(parseGraphArgs(["--json", "-R"])).toBeUndefined();
+});
+
+test("graph takes exactly one of --json, --mermaid, and --html; --milestone for the last two, --out and --every for --html", () => {
+  expect(parseGraphArgs(["--mermaid", "--all", "-R", "o/r"])).toEqual({ format: "mermaid", all: true });
+  expect(parseGraphArgs(["--mermaid", "--milestone", "M0 beta"])).toEqual({ format: "mermaid", all: false, milestone: "M0 beta" });
+  expect(parseGraphArgs(["--html"])).toEqual({ format: "html", all: false });
+  expect(parseGraphArgs(["--html", "--milestone", "none", "--out", "/tmp/g.html", "--every", "30", "--all"])).toEqual({ format: "html", all: true, milestone: "none", out: "/tmp/g.html", every: 30 });
+  expect(parseGraphArgs(["--html", "--out", "g.html"])).toEqual({ format: "html", all: false, out: "g.html" });
+  for (const refused of [
+    ["--json", "--mermaid"], ["--mermaid", "--html"], ["--json", "--html"], ["--mermaid", "--mermaid"],
+    ["--json", "--milestone", "M0"], ["--mermaid", "--milestone"], ["--mermaid", "--milestone", ""], ["--mermaid", "--milestone", "a", "--milestone", "b"],
+    ["--mermaid", "--out", "g.html"], ["--json", "--out", "g.html"], ["--mermaid", "--every", "60"], ["--html", "--out"], ["--html", "--out", ""],
+    ["--html", "--every", "60"], ["--html", "--out", "g.html", "--every", "29"], ["--html", "--out", "g.html", "--every", "1m"], ["--html", "--out", "g.html", "--every", "60.5"],
+    ["--html", "--out", "g.html", "--every"], ["--html", "--out", "a", "--out", "b"], ["--html", "--no-click"], ["--milestone", "M0"], ["--mermaid", "--milestone=M0"],
+  ]) expect(parseGraphArgs(refused)).toBeUndefined();
 });
 
 // The world: one repository's issues and pull requests, served over REST (for `next` and `claims`) and GraphQL (for `graph`).
