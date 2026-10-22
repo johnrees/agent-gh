@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Failure } from "./failure.ts";
+import { familyNames } from "./family.ts";
 
 /**
  * The review gate's policy and pure decisions. A repository opts in with
@@ -26,6 +27,12 @@ export type ReviewConfig = {
   readonly waiverLabel: string;
   /** A reviewer family that reviews every session's work, its own included. */
   readonly pin: ReviewerFamily | undefined;
+  /**
+   * `require`: for an author family it lists, the reviewer families that must
+   * each review its work on the head, in the config's order; `pin` and the
+   * one-reviewer rule then do not apply to it.
+   */
+  readonly require: Readonly<Record<string, readonly ReviewerFamily[]>>;
   /** Commands agent-gh runs, in order, in a throwaway clone of the reviewed commit before the reviewer starts. */
   readonly checks: readonly string[];
   /** How many of the checks' last output lines the reviewer sees. */
@@ -101,6 +108,27 @@ const pinned = (value: unknown, reviewers: readonly Reviewer[]): ReviewerFamily 
   return value as ReviewerFamily;
 };
 
+/**
+ * `require`: each key a model family, each value a non-empty list of distinct
+ * families under `reviewers`, none of them the key's own: a family never has
+ * to review its own work.
+ */
+const requireConfig = (value: unknown, reviewers: readonly Reviewer[]): Readonly<Record<string, readonly ReviewerFamily[]>> => {
+  if (value === undefined) return {};
+  const entries = Object.entries(object(value, "require")).map(([author, list]): [string, ReviewerFamily[]] => {
+    if (!familyNames().includes(author)) throw new Failure(STAGE, `${CONFIG_PATH}: require.${author} is not a model family; use ${familyNames().join(", ")}`);
+    if (!Array.isArray(list) || list.length === 0) throw new Failure(STAGE, `${CONFIG_PATH}: require.${author} must be a non-empty list of reviewer families`);
+    const families = list.map((family, index): ReviewerFamily => {
+      if (family === author) throw new Failure(STAGE, `${CONFIG_PATH}: require.${author}[${index}] is ${author} itself; a family never reviews its own work there`);
+      if (!reviewers.some((reviewer) => reviewer.family === family)) throw new Failure(STAGE, `${CONFIG_PATH}: require.${author}[${index}] must name a family under reviewers`);
+      return family as ReviewerFamily;
+    });
+    if (new Set(families).size !== families.length) throw new Failure(STAGE, `${CONFIG_PATH}: require.${author} names a family twice`);
+    return [author, families];
+  });
+  return Object.fromEntries(entries);
+};
+
 const whole = (value: unknown, key: string, fallback: number, min: number, max: number): number => {
   if (value === undefined) return fallback;
   if (!Number.isSafeInteger(value) || (value as number) < min || (value as number) > max) {
@@ -156,7 +184,7 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
     throw new Failure(STAGE, `${CONFIG_PATH} is not valid JSON`);
   }
   const top = object(raw, "the file");
-  known(top, ["reviewers", "effort", "checklist", "waiver_label", "pin", "checks", "checks_output_lines", "post_checks_output", "checks_timeout_minutes", "block_on", "status_writer", "hold", "claims", "queue"], "the file");
+  known(top, ["reviewers", "effort", "checklist", "waiver_label", "pin", "checks", "checks_output_lines", "post_checks_output", "checks_timeout_minutes", "block_on", "status_writer", "hold", "claims", "queue", "require"], "the file");
   const checksRaw = top.checks ?? [];
   if (!Array.isArray(checksRaw)) throw new Failure(STAGE, `${CONFIG_PATH}: checks must be a list of commands`);
   const reviewersRaw = object(top.reviewers, "reviewers");
@@ -192,6 +220,7 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
     checklist: top.checklist === undefined ? undefined : string(top.checklist, "checklist"),
     waiverLabel,
     pin: pinned(top.pin, reviewers),
+    require: requireConfig(top.require, reviewers),
     checks: checksRaw.map((check, index) => string(check, `checks[${index}]`)),
     checksOutputLines: whole(top.checks_output_lines, "checks_output_lines", 60, 0, 1000),
     postChecksOutput: flag(top.post_checks_output, "post_checks_output"),
@@ -224,6 +253,30 @@ export const reviewerFor = (config: ReviewConfig, author: string): Reviewer => {
     );
   }
   return reviewer;
+};
+
+/**
+ * The reviewers a review of `author`'s work needs: every family `require`
+ * lists for it (which wins over `pin`), else the one `reviewerFor` picks.
+ */
+export const requiredReviewers = (config: ReviewConfig, author: string): Reviewer[] => {
+  const families = Object.hasOwn(config.require, author) ? config.require[author] : undefined;
+  if (families === undefined) return [reviewerFor(config, author)];
+  return families.map((family) => config.reviewers.find((reviewer) => reviewer.family === family) as Reviewer);
+};
+
+/**
+ * The reviewers one `review full` runs: every one `author`'s work needs, or,
+ * with `--reviewer`, just that family, which must be one of them.
+ */
+export const reviewersToRun = (config: ReviewConfig, author: string, only: string | undefined): Reviewer[] => {
+  const needed = requiredReviewers(config, author);
+  if (only === undefined) return needed;
+  const reviewer = needed.find((candidate) => candidate.family === only);
+  if (reviewer === undefined) {
+    throw new Failure("reviewing", `--reviewer ${only}: ${author}'s work is reviewed by ${needed.map((candidate) => candidate.family).join(" and ")} here; name ${needed.length === 1 ? "it" : "one of them"}, or leave --reviewer out`);
+  }
+  return [reviewer];
 };
 
 /**
@@ -1107,6 +1160,8 @@ export type ReviewMarker = {
   readonly checks: ChecksResult["state"];
   readonly reviewer: ReviewerFamily;
   readonly priorities?: readonly Priority[];
+  /** The family whose work was reviewed, which says what `require` asks of it; a marker from an earlier release has none. */
+  readonly author?: string;
 };
 
 const MARKER = /<!-- agent-review (\{[^\n]*?\}) -->/;
@@ -1133,7 +1188,8 @@ export const parseMarker = (body: string): ReviewMarker | undefined => {
     (value.verdict === "approve" || value.verdict === "changes_requested") &&
     CHECKS_STATES.includes(value.checks as ChecksResult["state"]) &&
     REVIEWER_FAMILIES.includes(value.reviewer as ReviewerFamily) &&
-    (value.priorities === undefined || (Array.isArray(value.priorities) && value.priorities.every((priority) => PRIORITIES.includes(priority as Priority))));
+    (value.priorities === undefined || (Array.isArray(value.priorities) && value.priorities.every((priority) => PRIORITIES.includes(priority as Priority)))) &&
+    (value.author === undefined || (typeof value.author === "string" && familyNames().includes(value.author)));
   return ok ? (value as unknown as ReviewMarker) : undefined;
 };
 

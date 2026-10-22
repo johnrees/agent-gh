@@ -13,6 +13,7 @@ import {
   callMarker,
   carryCandidate,
   eventTarget,
+  type FamilyReview,
   firstLine,
   type FoundMarker,
   headRelease,
@@ -22,6 +23,7 @@ import {
   labelEvents,
   NO_ASK,
   type PostedBy,
+  pullAuthor,
   releaseLine,
   reservedFiles,
   reviewStatus,
@@ -159,6 +161,44 @@ test("agent-review at block_on P2: the head's marker fails on a P2 or above, pas
   expect(reviewStatus({ ...base, carried: found({ priorities: ["P3"] }, "1") })).toMatchObject({
     state: "success", description: "passed at aaaaaaaa, carried forward: same patch, base changes miss its files; checks passed",
   });
+});
+
+test("agent-review where require names the author: every required family's review must pass; it fails naming the family that blocks or has yet to review, and is pending while none has", () => {
+  const policy = { blockOn: "changes_requested", checks: [] } as const;
+  const codex = found({ reviewer: "codex" }, "1");
+  const claude = found({ reviewer: "claude" }, "2");
+  const base = { number: 12, agent: true, waivedBy: undefined, current: undefined, carried: undefined, policy } as const;
+  const required = (codexReview: FamilyReview["current"], claudeReview: FamilyReview["current"], carried?: FoundMarker): FamilyReview[] => [
+    { family: "codex", current: codexReview, carried: undefined },
+    { family: "claude", current: claudeReview, carried },
+  ];
+  expect(reviewStatus({ ...base, required: required(undefined, undefined) })).toEqual({
+    context: "agent-review", state: "pending", description: "needs codex and claude's reviews: run `gh pr checkout 12 && agent-gh review full --pr 12`", targetUrl: undefined,
+  });
+  expect(reviewStatus({ ...base, required: required(codex, undefined) })).toEqual({
+    context: "agent-review", state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed", targetUrl: undefined,
+  });
+  expect(reviewStatus({ ...base, required: required(codex, found({ reviewer: "claude", verdict: "changes_requested" }, "3")) })).toEqual({
+    context: "agent-review", state: "failure", description: "claude blocks: changes requested; checks passed", targetUrl: "https://github.com/r/3",
+  });
+  expect(reviewStatus({ ...base, required: required(found({ verdict: "changes_requested" }, "4"), undefined) })).toMatchObject({
+    state: "failure", description: "codex blocks: changes requested; checks passed; claude yet to review",
+  });
+  expect(reviewStatus({ ...base, required: required(codex, claude) })).toEqual({
+    context: "agent-review", state: "success", description: "codex and claude passed: codex approved; checks passed. claude approved; checks passed", targetUrl: "https://github.com/r/1",
+  });
+  expect(reviewStatus({ ...base, required: required(codex, undefined, found({ reviewer: "claude", head: B }, "5")) })).toMatchObject({
+    state: "success", description: "codex and claude passed: codex approved; checks passed. claude approved at bbbbbbbb, carried forward",
+  });
+  // A person's waiver still stands, and an agent's pull request is judged at all only when it is one.
+  expect(reviewStatus({ ...base, waivedBy: "johnrees", required: required(undefined, undefined) })).toMatchObject({ state: "success", description: "waived by johnrees" });
+  expect(reviewStatus({ ...base, agent: false, required: required(undefined, undefined) })).toMatchObject({ state: "success", description: "not an agent PR" });
+});
+
+test("the workflow reads the author from the commits' one co-credited family App, else from the latest marker that records one", () => {
+  expect(pullAuthor("glm", [found({ author: "codex" }, "1")])).toBe("glm");
+  expect(pullAuthor(undefined, [found({ author: "glm" }, "1"), found({}, "2")])).toBe("glm");
+  expect(pullAuthor(undefined, [found({}, "1")])).toBeUndefined();
 });
 
 const comment = (id: number, author: string, appId: number | undefined, createdAt: string, extra: Partial<ThreadComment> = {}): ThreadComment => ({
@@ -304,6 +344,8 @@ type Scenario = {
   sharedWith?: number[];
   /** Another run's call for the same event, posted the moment this run posts its own. */
   callRace?: unknown;
+  /** Keys the config adds, or replaces (its reviewers, its require). */
+  config?: Record<string, unknown>;
 };
 
 /** The secret part of the NTFY_URL secret, which no printed line may show. */
@@ -323,6 +365,7 @@ const statusWorld = (scenario: Scenario) => {
     reviewers: { codex: { model: "m" } }, status_writer: "actions",
     ...(scenario.blockOn === undefined ? {} : { block_on: scenario.blockOn }), ...(scenario.checks === undefined ? {} : { checks: scenario.checks }),
     ...(scenario.hold === undefined || ref !== "main" ? {} : { hold: scenario.hold }),
+    ...scenario.config,
   });
   const fake = fakeGitHub({
     [`GET ${REPO}/pulls/12`]: () => reply(200, { state: "open", head: { sha: head }, base: { ref: "main" }, labels: labels.map((name) => ({ name })), created_at: "2026-10-10T00:00:00Z", user: author }),
@@ -474,6 +517,43 @@ test("the workflow fails an approval whose checks timed out, and carries forward
   expect(await carry({ checks: "timed out" })).toMatchObject({ state: "pending", description: "needs a review: run `gh pr checkout 12 && agent-gh review full --pr 12`" });
   expect(await carry({ checks: "failed" })).toMatchObject({ state: "pending" });
   expect(await carry({ checks: "not run" })).toMatchObject({ state: "pending" });
+});
+
+/** glm's work reviewed by both Codex and Claude, as the issue asks. */
+const REQUIRE = { reviewers: { codex: { model: "m" }, claude: { model: "o" } }, require: { glm: ["codex", "claude"] } };
+const credits = (family: string) => `x\n\nAgent-Harness: pi\nCo-authored-by: johnrees-${family}[bot] <1+johnrees-${family}[bot]@users.noreply.github.com>`;
+
+test("where require names the author, the workflow needs each required family's own review of the head, and names the one that blocks or is missing", async () => {
+  const at = (n: number) => `2026-10-1${n}T00:00:00Z`;
+  const state = async (commits: string[], reviews: unknown[]) => (await deriveStatuses(statusWorld({ head: A, mergeBase: B, config: REQUIRE, commits, reviews }).io, 12))?.statuses[0];
+  const codex = reviewOf(marker({ reviewer: "codex", author: "glm" }), at(1));
+  const claude = reviewOf(marker({ reviewer: "claude", author: "glm" }), at(2));
+  const glm = [credits("glm"), credits("glm")];
+  expect(await state(glm, [])).toMatchObject({ state: "pending", description: "needs codex and claude's reviews: run `gh pr checkout 12 && agent-gh review full --pr 12`" });
+  expect(await state(glm, [codex])).toMatchObject({ state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed" });
+  expect(await state(glm, [codex, claude])).toMatchObject({ state: "success", description: "codex and claude passed: codex approved; checks passed. claude approved; checks passed" });
+  // Each family's latest review of the head counts, so Claude's later block stands over its earlier approval, and Codex's over nothing of Claude's.
+  const claudeBlocks = reviewOf(marker({ reviewer: "claude", verdict: "changes_requested", author: "glm" }), at(3));
+  expect(await state(glm, [claude, codex, claudeBlocks])).toMatchObject({ state: "failure", description: "claude blocks: changes requested; checks passed" });
+  // Commits that credit no single App: the author the latest marker records.
+  expect(await state([credits("glm"), credits("codex")], [codex])).toMatchObject({ state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed" });
+  // Codex's work, which require does not name, is judged on one review, as before.
+  expect(await state([credits("codex")], [reviewOf(marker({ reviewer: "claude", author: "codex" }), at(1))])).toMatchObject({ state: "success", description: "approved; checks passed (claude review)" });
+});
+
+test("where require names the author, each required family's own passing review carries forward across a rebase", async () => {
+  const repo = history();
+  const { patchId } = await pullDiff(repo.io, repo.mb1, repo.head1);
+  const remote = `file://${repo.dir}`;
+  const of = (reviewer: "codex" | "claude", at: string) => reviewOf(marker({ head: repo.head1, merge_base: repo.mb1, patch_id: patchId, reviewer, author: "glm" }), at);
+  repo.git(["update-ref", "refs/pull/12/head", repo.head2]);
+  const state = async (reviews: unknown[]) => (await deriveStatuses(statusWorld({ head: repo.head2, mergeBase: repo.mb2, remote, config: REQUIRE, commits: [credits("glm")], reviews }).io, 12))?.statuses[0];
+  const short = repo.head1.slice(0, 8);
+  expect(await state([of("codex", "2026-10-11T00:00:00Z"), of("claude", "2026-10-12T00:00:00Z")])).toMatchObject({
+    state: "success", description: `codex and claude passed: codex approved at ${short}, carried forward. claude approved at ${short}, carried forward`,
+  });
+  // Codex's passing review never stands in for Claude's.
+  expect(await state([of("codex", "2026-10-11T00:00:00Z")])).toMatchObject({ state: "failure", description: `awaiting claude's review: run \`agent-gh review full --reviewer claude\`; codex approved at ${short}, carried forward` });
 });
 
 test("a person's waiver passes agent-review; an App's does not", async () => {

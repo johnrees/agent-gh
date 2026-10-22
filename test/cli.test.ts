@@ -110,6 +110,8 @@ test("review takes sweep or full and their own flags, and refuses anything else 
     ["review"], ["review", "all"], ["review", "full", "--base", "main"], ["review", "full", "--pr", "x"], ["review", "sweep", "--effort", "huge"], ["review", "full", "--pr"],
     // --adopt stands alone, once, on full only.
     ["review", "sweep", "--adopt"], ["review", "full", "--adopt", "--adopt"], ["review", "full", "--adopt", "yes"],
+    // --reviewer names one family, once, on full only.
+    ["review", "sweep", "--reviewer", "claude"], ["review", "full", "--reviewer"], ["review", "full", "--reviewer", "claude", "--reviewer", "codex"],
   ]) {
     const result = await cli(args, agent);
     expect(result.code).toBe(1);

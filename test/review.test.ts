@@ -22,7 +22,9 @@ import {
   parseReviewConfig,
   prRepoFlag,
   readyTarget,
+  requiredReviewers,
   reviewerFor,
+  reviewersToRun,
   reviewed,
   reviewMarker,
   reviewState,
@@ -302,6 +304,8 @@ type World = {
   optedIn?: boolean;
   config?: unknown;
   answer?: unknown;
+  /** Each reviewer family's own answer, where it differs from `answer`. */
+  answers?: Record<string, unknown>;
   /** Whether the branch has an upstream (whose pull request is #12). */
   upstream?: boolean;
   /** The open pull requests GitHub lists for HEAD's commit. */
@@ -355,7 +359,7 @@ const PATCH_ID = "c".repeat(40);
 
 /** A pull request #12 on johnrees/widget, closing issue #7, in a fake GitHub and a fake reviewer. */
 const world = ({
-  head = HEAD, labels = [], labelsLater, status = [], events = [], optedIn = true, config = EXAMPLE, answer, closes = "johnrees/widget", upstream = true,
+  head = HEAD, labels = [], labelsLater, status = [], events = [], optedIn = true, config = EXAMPLE, answer, answers = {}, closes = "johnrees/widget", upstream = true,
   commitPulls = [{ number: 12, state: "open", head: { sha: HEAD } }], branchPulls = [{ number: 12, state: "open" }], family = "claude",
   coAuthors = [[bot("claude")], [bot("claude")]], checkResults = [], reviewReplies = [], rules = [], branch = { protected: false }, checkRuns = [], workflowRuns = [],
   statusLater = [], comments = [], issueComments = [{ id: 70, body: "Last word.", user: { login: "someone" }, created_at: "2026-10-01T00:00:00Z" }], reactions = {},
@@ -471,9 +475,10 @@ const world = ({
     runReviewer: async (command, stdin, cwd) => {
       commands.push({ command, stdin, cwd });
       steps.push("reviewer");
-      if (command[0] === "claude") return { code: 0, stdout: JSON.stringify({ type: "result", result: "", structured_output: answer }) };
+      const given = Object.hasOwn(answers, command[0] as string) ? answers[command[0] as string] : answer;
+      if (command[0] === "claude") return { code: 0, stdout: JSON.stringify({ type: "result", result: "", structured_output: given }) };
       const out = command[command.indexOf("-o") + 1];
-      if (out !== undefined) await Bun.write(out, typeof answer === "string" ? answer : JSON.stringify(answer));
+      if (out !== undefined) await Bun.write(out, typeof given === "string" ? given : JSON.stringify(given));
       return { code: 0, stdout: "" };
     },
     readFile: (path) => Bun.file(path).text(),
@@ -616,7 +621,7 @@ test("a full review runs the checks itself in a clone of the head, then the auth
   ]);
   expect(parseFinding((review?.comments as { body: string }[])[0]?.body ?? "")).toEqual({ v: 1, id: inlineId, priority: "P2" });
   const body = review?.body as string;
-  expect(parseMarker(body)).toEqual({ v: 1, head: HEAD, merge_base: OLD, patch_id: PATCH_ID, verdict: "changes_requested", checks: "passed", reviewer: "codex", priorities: ["P2", "P1"] });
+  expect(parseMarker(body)).toEqual({ v: 1, head: HEAD, merge_base: OLD, patch_id: PATCH_ID, verdict: "changes_requested", checks: "passed", reviewer: "codex", priorities: ["P2", "P1"], author: "claude" });
   expect(body).toContain("**agent-review** of aaaaaaaa against #7 by gpt-6-astra (codex) at xhigh: changes requested; checks passed");
   expect(body).toContain(`1 finding(s) are on their lines.\n\nOn lines outside the diff:\n- **P1 defect** \`src/b.ts:9\`: Off by one. <!-- agent-finding {"v":1,"id":"${bodyId}","priority":"P1"} -->\n  An empty list`);
   expect(body).not.toContain("src/a.ts:3");
@@ -1431,6 +1436,131 @@ test("a pinned reviewer reviews its own family's work", () => {
   const pinned = parseReviewConfig(JSON.stringify({ reviewers: { codex: { model: "gpt-6-astra" } }, pin: "codex" }));
   expect(reviewerFor(pinned, "codex")).toEqual({ family: "codex", model: "gpt-6-astra" });
   expect(() => parseReviewConfig(JSON.stringify({ reviewers: { codex: { model: "gpt-6-astra" } }, pin: "claude" }))).toThrow("pin must name a family under reviewers");
+});
+
+/** The issue's example with glm's work reviewed by both Codex and Claude. */
+const REQUIRE = { ...EXAMPLE, require: { glm: ["codex", "claude"] } };
+
+test("require names, for an author family, reviewer families under reviewers, never its own; it wins over pin, and --reviewer picks one of them", () => {
+  const both = parseReviewConfig(JSON.stringify({ ...REQUIRE, pin: "codex" }));
+  expect(both.require).toEqual({ glm: ["codex", "claude"] });
+  expect(requiredReviewers(both, "glm").map((reviewer) => reviewer.family)).toEqual(["codex", "claude"]);
+  // An author require does not list keeps one reviewer, the pinned one here.
+  expect(requiredReviewers(both, "codex")).toEqual([{ family: "codex", model: "gpt-6-astra" }]);
+  expect(reviewersToRun(both, "glm", "claude")).toEqual([{ family: "claude", model: "claude-opus-5-5" }]);
+  expect(reviewersToRun(both, "codex", "codex")).toEqual([{ family: "codex", model: "gpt-6-astra" }]);
+  expect(refusal(() => reviewersToRun(both, "codex", "claude"))).toBe("--reviewer claude: codex's work is reviewed by codex here; name it, or leave --reviewer out");
+  expect(refusal(() => reviewersToRun(both, "glm", "gemini"))).toBe("--reviewer gemini: glm's work is reviewed by codex and claude here; name one of them, or leave --reviewer out");
+  expect(parseReviewConfig(JSON.stringify(EXAMPLE)).require).toEqual({});
+  const bad = (require: unknown) => refusal(() => parseReviewConfig(JSON.stringify({ ...EXAMPLE, require })));
+  expect(bad({ claude: ["codex", "claude"] })).toBe(".github/agent-review.json: require.claude[1] is claude itself; a family never reviews its own work there");
+  expect(bad({ glm: ["deepseek"] })).toBe(".github/agent-review.json: require.glm[0] must name a family under reviewers");
+  expect(refusal(() => parseReviewConfig(JSON.stringify({ reviewers: { codex: { model: "m" } }, require: { glm: ["codex", "claude"] } })))).toContain("require.glm[1] must name a family under reviewers");
+  expect(bad({ gemini: ["codex"] })).toContain("require.gemini is not a model family");
+  expect(bad({ glm: [] })).toContain("require.glm must be a non-empty list");
+  expect(bad({ glm: "codex" })).toContain("require.glm must be a non-empty list");
+  expect(bad({ glm: ["codex", "codex"] })).toContain("require.glm names a family twice");
+  expect(bad(["glm"])).toContain("require must be an object");
+});
+
+test("glm's work, where require names codex and claude, gets one review from each on the same head, and the status fails until both pass", async () => {
+  const finding = { priority: "P2", kind: "defect", file: "src/a.ts", line: 3, summary: "Off by one.", scenario: "An empty list." };
+  const answers = { codex: { verdict: "approve", spec: "Done.", findings: [] }, claude: { verdict: "changes_requested", spec: "Not yet.", findings: [finding] } };
+  const w = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answers });
+  await reviewFull(w.io, {});
+  // The checks run once; each family then reads its own fresh clone, in the config's order.
+  expect(w.steps.filter((step) => step.startsWith("check") || step === "reviewer")).toEqual(["check make check", "check make lint", "reviewer", "reviewer"]);
+  expect(w.commands.map((entry) => entry.command[0])).toEqual(["codex", "claude"]);
+  expect(w.printed).toContain("agent-gh: .github/agent-review.json requires codex and claude to review glm's work, each on this head");
+  const reviews = posted(w.fake, `${REPO}/pulls/12/reviews`);
+  expect(reviews.map((review) => parseMarker(review.body as string))).toEqual([
+    { v: 1, head: HEAD, merge_base: OLD, patch_id: PATCH_ID, verdict: "approve", checks: "passed", reviewer: "codex", priorities: [], author: "glm" },
+    { v: 1, head: HEAD, merge_base: OLD, patch_id: PATCH_ID, verdict: "changes_requested", checks: "passed", reviewer: "claude", priorities: ["P2"], author: "glm" },
+  ]);
+  // Every review's findings are printed, each with its reviewer and the ids its posted markers carry.
+  const printed = JSON.parse(w.output()) as { reviewer: string; verdict: string; findings: { id: string }[] }[];
+  expect(printed.map((review) => [review.reviewer, review.verdict, review.findings.length])).toEqual([["codex", "approve", 0], ["claude", "changes_requested", 1]]);
+  expect(parseFinding((reviews[1]?.comments as { body: string }[])[0]?.body ?? "")?.id).toBe(printed[1]?.findings[0]?.id as string);
+  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)).toEqual([
+    { state: "failure", context: "agent-review", description: "claude blocks: changes requested; checks passed" },
+  ]);
+
+  const approve = { verdict: "approve", spec: "Done.", findings: [] };
+  const passed = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answer: approve });
+  await reviewFull(passed.io, {});
+  expect(posted(passed.fake, `${REPO}/statuses/${HEAD}`)).toEqual([
+    { state: "success", context: "agent-review", description: "codex and claude passed: codex approved; checks passed. claude approved; checks passed" },
+  ]);
+});
+
+test("--reviewer reruns one required family; the status still needs every required family's latest review of this head", async () => {
+  const approve = { verdict: "approve", spec: "Done.", findings: [] };
+  const review = (reviewer: "codex" | "claude", head: string, verdict: "approve" | "changes_requested", at: string) => ({
+    id: at.length, user: { login: "johnrees" }, submitted_at: at, html_url: `https://github.com/johnrees/widget/pull/12#review-${reviewer}`,
+    body: reviewMarker({ v: 1, head, merge_base: OLD, patch_id: PATCH_ID, verdict, checks: "passed", reviewer, priorities: [], author: "glm" }),
+  });
+  // Codex approved this head earlier; Claude, rerun alone, approves it now.
+  const rerun = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answer: approve, reviews: [review("codex", HEAD, "approve", "2026-10-11T00:00:00Z")] });
+  await reviewFull(rerun.io, { reviewer: "claude" });
+  expect(rerun.commands.map((entry) => entry.command[0])).toEqual(["claude"]);
+  expect(rerun.printed).toContain("agent-gh: .github/agent-review.json requires codex and claude to review glm's work, each on this head; this runs claude");
+  expect(posted(rerun.fake, `${REPO}/statuses/${HEAD}`)).toEqual([
+    { state: "success", context: "agent-review", description: "codex and claude passed: codex approved; checks passed. claude approved; checks passed" },
+  ]);
+  // Codex's review of an earlier head does not count for this one: the status names it as yet to review.
+  const stale = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answer: approve, reviews: [review("codex", "d".repeat(40), "approve", "2026-10-11T00:00:00Z")] });
+  await reviewFull(stale.io, { reviewer: "claude" });
+  expect(posted(stale.fake, `${REPO}/statuses/${HEAD}`)).toEqual([
+    { state: "failure", context: "agent-review", description: "awaiting codex's review: run `agent-gh review full --reviewer codex`; claude approved; checks passed" },
+  ]);
+  // A family require does not name for this author is refused before anything runs.
+  const wrong = world({ config: REQUIRE, family: "codex", coAuthors: [[bot("codex")]], answer: approve });
+  expect(await gateRefusal(reviewFull(wrong.io, { reviewer: "codex" }))).toBe("--reviewer codex: codex's work is reviewed by claude here; name it, or leave --reviewer out");
+  expect(wrong.commands).toEqual([]);
+});
+
+test("each required family's re-review is judged against its own earlier review", async () => {
+  const approve = { verdict: "approve", spec: "Done.", findings: [] };
+  // The earlier review of PRIOR is Codex's; Claude has none, so Claude's is a full review.
+  const w = world({ ...earlier, config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], ancestors: [PRIOR], answer: approve });
+  await reviewFull(w.io, {});
+  const [codex, claude] = w.commands.map((entry) => entry.stdin) as [string, string];
+  expect(codex).toContain(`This is a re-review. An earlier review was of ${PRIOR}`);
+  expect(claude).not.toContain("re-review");
+  expect(claude).not.toContain("Earlier review of");
+});
+
+test("Codex's work, where require names only glm, gets one review as before", async () => {
+  const approve = { verdict: "approve", spec: "Done.", findings: [] };
+  const w = world({ config: REQUIRE, family: "codex", coAuthors: [[bot("codex")]], answer: approve });
+  await reviewFull(w.io, {});
+  expect(w.commands.map((entry) => entry.command[0])).toEqual(["claude"]);
+  expect(JSON.parse(w.output())).toEqual(approve);
+  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)).toEqual([
+    { state: "success", context: "agent-review", description: "approved; checks passed: 0 finding(s) by claude-opus-5-5 at xhigh" },
+  ]);
+});
+
+test("where the workflow writes the status, each required family's review is posted and the workflow's status is awaited once, after the last", async () => {
+  const approve = { verdict: "approve", spec: "Done.", findings: [] };
+  // The status the workflow set for Codex's review, read just before Claude's is posted, is not the answer.
+  const earlier = { context: "agent-review", state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed", id: 2 };
+  const settled = { context: "agent-review", state: "success", description: "codex and claude passed: codex approved; checks passed. claude approved; checks passed", id: 3 };
+  const w = world({ config: { ...REQUIRE, status_writer: "actions" }, family: "glm", coAuthors: [[bot("glm")]], answer: approve, statusLater: [[earlier], [earlier], [settled]] });
+  await reviewFull(w.io, {});
+  expect(posted(w.fake, `${REPO}/pulls/12/reviews`).map((review) => parseMarker(review.body as string)?.reviewer)).toEqual(["codex", "claude"]);
+  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)).toEqual([]);
+  expect(w.slept).toEqual([5_000]);
+  expect(w.printed.at(-1)).toBe(`agent-gh: the agent-review workflow set agent-review on aaaaaaaa: success (${settled.description})`);
+});
+
+test("gh pr ready names the required family yet to review the head, and the command that runs it alone", async () => {
+  const awaiting = world({ status: [{ context: "agent-review", state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed" }] });
+  expect(await gateRefusal(gateReady(awaiting.io, { number: 12 }))).toBe(
+    "pull request #12's head aaaaaaaa still needs claude's review (awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed); run `agent-gh review full --reviewer claude` on it, or ask John to add the `review-waived` label",
+  );
+  const blocks = world({ status: [{ context: "agent-review", state: "failure", description: "claude blocks: changes requested; checks passed" }] });
+  expect(await gateRefusal(gateReady(blocks.io, { number: 12 }))).toContain("was reviewed and blocked (claude blocks: changes requested; checks passed)");
 });
 
 test("a sweep prints the reviewer's text against the pull request's base and records nothing", async () => {

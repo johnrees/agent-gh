@@ -1,4 +1,4 @@
-import { agentApps } from "./config.ts";
+import { type AgentApp, agentApps } from "./config.ts";
 import { Failure } from "./failure.ts";
 import { request } from "./github.ts";
 import { markerPosts, type Pull, pull, pullDiff, readReviewConfig, type ReviewIo, waiver } from "./review-run.ts";
@@ -7,11 +7,13 @@ import {
   ACTIONS_BOT,
   agentPull,
   askFor,
+  byReviewer,
   callBody,
   called,
   carryCandidate,
   type ChangedFile,
   eventTarget,
+  type FamilyReview,
   type FoundMarker,
   HOLD_CONTEXT,
   holdStatus,
@@ -22,12 +24,13 @@ import {
   postedBy,
   markerFor,
   passes,
+  pullAuthor,
   headRelease,
   reviewStatus,
   type Status,
   validMarkers,
 } from "./status.ts";
-import { type HoldConfig, type ReviewPolicy, sameLabel, STATUS_CONTEXT, statusDescription } from "./review.ts";
+import { authorFamily, type HoldConfig, type ReviewPolicy, sameLabel, STATUS_CONTEXT, statusDescription } from "./review.ts";
 import { THREADS_CONTEXT, threadsStatus } from "./threads.ts";
 import { type ApiIo, closingIssues, everyPage, get, issueComments, pullThreads, repoOwner } from "./threads-run.ts";
 
@@ -54,14 +57,29 @@ const repoPath = (io: ApiIo) => `/repos/${slug(io.repo)}`;
 /** GitHub lists at most this many of a pull request's commits, and says nothing of the rest. */
 const COMMITS_LISTED = 250;
 
-/** The commit messages of a pull request's commits; undefined when GitHub may not have listed them all. */
-const commitMessages = async (io: ApiIo, number: number): Promise<string[] | undefined> => {
+/** A pull request's commits, as GitHub lists them; undefined when it may not have listed them all. */
+const pullCommits = async (io: ApiIo, number: number): Promise<Record<string, unknown>[] | undefined> => {
   const commits = await everyPage(io, STAGE, `${repoPath(io)}/pulls/${number}/commits`, 3).catch((error: unknown) => {
     if (error instanceof Failure && error.detail.includes("lists over")) return undefined;
     throw error;
   });
   if (commits === undefined || commits.length >= COMMITS_LISTED) return undefined;
-  return commits.map((commit) => text(record(record(commit).commit).message));
+  return commits.map(record);
+};
+
+const message = (commit: Record<string, unknown>): string => text(record(commit.commit).message);
+
+/**
+ * The family App every commit but a merge credits as co-author, as `review
+ * full` reads its author (`authorFamily`); undefined for none, a mix, or
+ * commits GitHub did not list in full.
+ */
+const commitsAuthor = (commits: readonly Record<string, unknown>[] | undefined, apps: readonly AgentApp[]): string | undefined => {
+  if (commits === undefined) return undefined;
+  const credits = commits
+    .filter((commit) => !(Array.isArray(commit.parents) && commit.parents.length > 1))
+    .map((commit) => message(commit).split(/\r?\n/).flatMap((line) => /^Co-authored-by:\s*(.+)$/i.exec(line)?.[1] ?? []));
+  return authorFamily(credits, Object.fromEntries(apps.map((app) => [app.family, app.bot])));
 };
 
 /** Fetches commits into the scratch repository, one depth each: only their trees are compared, nothing is run. */
@@ -219,8 +237,9 @@ export const deriveStatuses = async (io: StatusIo, number: number): Promise<Deri
   const apps = agentApps();
   const issue = record(await get(io, STAGE, `${repoPath(io)}/issues/${number}`));
   const viaApp = record(issue.performed_via_github_app).id;
+  const commits = await pullCommits(io, number);
   const agent = agentPull(
-    { author: pr.author, authorType: pr.authorType, viaApp: Number.isSafeInteger(viaApp) ? (viaApp as number) : undefined, commits: await commitMessages(io, number) },
+    { author: pr.author, authorType: pr.authorType, viaApp: Number.isSafeInteger(viaApp) ? (viaApp as number) : undefined, commits: commits?.map(message) },
     apps,
   );
   // A bot that is no family App (Dependabot) is not an agent, but an agent could merge its pull request: reserved paths hold it.
@@ -234,9 +253,23 @@ export const deriveStatuses = async (io: StatusIo, number: number): Promise<Deri
   const owner = await repoOwner(io, STAGE);
   const waivedBy = await waiver(io, STAGE, pr, config);
   const markers = validMarkers(await markerPosts(io, STAGE, number), owner, apps);
-  const current = markerFor(markers, pr.head);
-  const carried = current === undefined && waivedBy === undefined ? await carriedForward(io, number, pr.base, pr.head, markers, config) : undefined;
-  const review = reviewStatus({ number, agent, waivedBy, current, carried, policy: config });
+  const author = pullAuthor(commitsAuthor(commits, apps), markers);
+  const families = author !== undefined && Object.hasOwn(config.require, author) ? config.require[author] : undefined;
+  let review: Status;
+  if (families !== undefined) {
+    // Each required family is judged on its own reviews: its marker for the head, else its own review carried forward.
+    const required: FamilyReview[] = [];
+    for (const family of families) {
+      const current = markerFor(markers, pr.head, family);
+      const carried = current === undefined && waivedBy === undefined ? await carriedForward(io, number, pr.base, pr.head, byReviewer(markers, family), config) : undefined;
+      required.push({ family, current, carried });
+    }
+    review = reviewStatus({ number, agent, waivedBy, current: undefined, carried: undefined, policy: config, required });
+  } else {
+    const current = markerFor(markers, pr.head);
+    const carried = current === undefined && waivedBy === undefined ? await carriedForward(io, number, pr.base, pr.head, markers, config) : undefined;
+    review = reviewStatus({ number, agent, waivedBy, current, carried, policy: config });
+  }
   const threads = threadsStatus(await pullThreads(io, STAGE, pr, owner));
   return { head: pr.head, statuses: [review, { context: THREADS_CONTEXT, ...threads }, ...(held === undefined ? [] : [held])], ...hold };
 };

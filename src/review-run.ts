@@ -11,7 +11,22 @@ import { HARNESSES, type Env } from "./harness.ts";
 import { parseRemoteUrl, parseRepo, type Repo, slug } from "./repo.ts";
 import { absent, checkState, type PushedTag, pushedRefs, type RequiredCheck, requiredChecks } from "./merge.ts";
 import { type ApiIo, closingIssues, describeRequired, everyPage, pullThreads, repoOwner } from "./threads-run.ts";
-import { HOLD_CONTEXT, holdLink, type HoldThread, labelEvents, labelHoldReason, type MarkerPost, headRelease, releaseLine, validMarkers } from "./status.ts";
+import {
+  AWAITING,
+  byReviewer,
+  type FamilyReview,
+  HOLD_CONTEXT,
+  holdLink,
+  type HoldThread,
+  labelEvents,
+  labelHoldReason,
+  type MarkerPost,
+  markerFor,
+  headRelease,
+  releaseLine,
+  requiredStatus,
+  validMarkers,
+} from "./status.ts";
 import {
   agentReviewStatus,
   type ApiCall,
@@ -54,7 +69,9 @@ import {
   type ReviewMarker,
   type Reviewer,
   type ReviewConfig,
+  type ReviewerFamily,
   reviewerFor,
+  reviewersToRun,
   reviewState,
   STATUS_CONTEXT,
   statusDescription,
@@ -192,16 +209,17 @@ export const markerPosts = async (io: ApiIo, stage: Stage, number: number): Prom
 };
 
 /**
- * The pull request's latest earlier review, from the markers the workflow
- * counts: its head, whether that head is an ancestor of `head` (so the diff
+ * The pull request's latest earlier review (by `family`'s reviewer, when
+ * given), from the markers the workflow counts: its head, whether that head is an ancestor of `head` (so the diff
  * since it shows what changed), its findings as posted, and every comment the
  * pull request's author has posted since, outside that review, without a
  * marker. Undefined when it has none.
  */
-const priorReview = async (io: ReviewIo, pr: Pull, head: string): Promise<PriorReview | undefined> => {
+const priorReview = async (io: ReviewIo, pr: Pull, head: string, family?: ReviewerFamily): Promise<PriorReview | undefined> => {
   const stage = "reviewing";
   const posts = await markerPosts(io, stage, pr.number);
-  const found = validMarkers(posts, await repoOwner(io, stage), agentApps()).at(-1);
+  const valid = validMarkers(posts, await repoOwner(io, stage), agentApps());
+  const found = (family === undefined ? valid : byReviewer(valid, family)).at(-1);
   if (found === undefined) return undefined;
   const prior = found.marker.head;
   const reachable = (await io.git(["merge-base", "--is-ancestor", prior, head])) !== undefined;
@@ -310,6 +328,11 @@ const gateUnreviewed = async (io: ReviewIo, stage: Stage, pr: Pull, config: Revi
     return;
   }
   const waive = `or ask John to add the \`${config.waiverLabel}\` label`;
+  // Where `require` names the author, a family yet to review this head is named, with the command that runs it alone.
+  const awaiting = status?.state === "failure" ? AWAITING.exec(status.description) : null;
+  if (awaiting !== null) {
+    throw new Failure(stage, `pull request #${number}'s head ${pr.head.slice(0, 8)} still needs ${awaiting[1]}'s review (${status?.description}); run \`${awaiting[2]}\` on it, ${waive}`);
+  }
   if (status?.state === "failure") {
     throw new Failure(
       stage,
@@ -1213,6 +1236,8 @@ export type FullOptions = {
   readonly effort?: Effort;
   /** Review a claim pull request though commits on it are other sessions' (`--adopt`). */
   readonly adopt?: boolean;
+  /** Run only this reviewer family (`--reviewer`): one `require` names for the author, or the one the config would pick. */
+  readonly reviewer?: string;
 };
 
 /** One commit since the merge base and the session its `Agent-Session` trailer names, if it has one. */
@@ -1399,41 +1424,68 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const effort = options.effort ?? effortFor(config, tick.labels);
   const mergeBase = await mergeBaseOf(io, target.base, head);
   const adopted = await adoptedCommits(io, target, mergeBase, head, options.adopt === true);
-  const reviewer = reviewerFor(config, await authoredBy(io, mergeBase, head));
+  const author = await authoredBy(io, mergeBase, head);
+  const required = Object.hasOwn(config.require, author) ? config.require[author] : undefined;
+  const reviewers = reviewersToRun(config, author, options.reviewer);
+  if (required !== undefined) {
+    const running = reviewers.length === required.length ? "" : `; this runs ${reviewers.map((reviewer) => reviewer.family).join(" and ")}`;
+    io.print(`agent-gh: ${CONFIG_PATH} requires ${required.join(" and ")} to review ${author}'s work, each on this head${running}`);
+  }
   const { diff, patchId } = await pullDiff(io, mergeBase, head);
   const dir = io.tempDir();
   const files = { schema: join(dir, "schema.json"), out: join(dir, "review.json") };
   await Bun.write(files.schema, JSON.stringify(REVIEW_SCHEMA));
   const base: PullBase = { ref: target.base, sha: mergeBase };
   const checks: ChecksResult = config.checks.length === 0 ? { state: "not run" } : await inClone(io, head, (cwd) => runChecks(io, config, cwd, base), base);
-  io.print(`agent-gh: ${checksSummary(checks)}; ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against ${tick.ref}`);
-  const prior = await priorReview(io, target, head);
-  // A fresh clone: the reviewer reads the commit as pushed, never what the checks built or changed.
-  const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks, blockOn: config.blockOn, prior });
-  const result = await inClone(io, head, (cwd) => io.runReviewer(fullCommand(reviewer, effort, files), prompt, cwd), base);
-  if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
-  const answered = await answer(io, reviewer, result.stdout, files.out);
-  // Each finding's id, in its posted marker and the printed JSON: what `agent-gh reply` answers. New for each review.
-  const review = { ...answered, findings: withIds(`${head}\n${randomUUID()}`, answered.findings) };
-  const marker: ReviewMarker = {
-    v: 1, head, merge_base: mergeBase, patch_id: patchId, verdict: review.verdict, checks: checks.state, reviewer: reviewer.family, priorities: review.findings.map((finding) => finding.priority),
-  };
-  const before = actions ? await headStatus(io, head) : undefined;
-  await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
+  const done: { readonly reviewer: Reviewer; readonly review: Review; readonly marker: ReviewMarker }[] = [];
+  let before: CommitStatus | undefined;
+  for (const [index, reviewer] of reviewers.entries()) {
+    io.print(`agent-gh: ${checksSummary(checks)}; ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against ${tick.ref}`);
+    // Where `require` names the author, each family's own earlier review is its baseline.
+    const prior = await priorReview(io, target, head, required === undefined ? undefined : reviewer.family);
+    // A fresh clone: the reviewer reads the commit as pushed, never what the checks built or changed.
+    const prompt = fullPrompt({ repo: slug(io.repo), pull: target, ticket: tick, mergeBase, head, checklist: config.checklist, checks, blockOn: config.blockOn, prior });
+    const result = await inClone(io, head, (cwd) => io.runReviewer(fullCommand(reviewer, effort, files), prompt, cwd), base);
+    if (result.code !== 0) throw new Failure(stage, `the ${reviewer.family} reviewer exited with ${result.code}`);
+    const answered = await answer(io, reviewer, result.stdout, files.out);
+    // Each finding's id, in its posted marker and the printed JSON: what `agent-gh reply` answers. New for each review.
+    const review = { ...answered, findings: withIds(`${head}\n${randomUUID()}`, answered.findings) };
+    const marker: ReviewMarker = {
+      v: 1, head, merge_base: mergeBase, patch_id: patchId, verdict: review.verdict, checks: checks.state, reviewer: reviewer.family, priorities: review.findings.map((finding) => finding.priority), author,
+    };
+    // The workflow's runs for an earlier family's review have long settled by the last one's, so only the last is waited for.
+    if (actions && index === reviewers.length - 1) before = await headStatus(io, head);
+    await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
+    done.push({ reviewer, review, marker });
+  }
   // A waiver John added while the review ran stands: the labels are read afresh, and the verdict never overwrites it.
   let waived: string | undefined;
   if (actions) {
     await awaitWorkflowStatus(io, head, before);
     waived = await waiver(io, stage, await pull(io, stage, number), config);
   } else if ((waived = await recordWaiver(await pull(io, stage, number))) === undefined) {
-    await setStatus(io, head, reviewState(marker, config), `${outcomeSummary(marker, config, checksSummary(checks))}: ${review.findings.length} finding(s) by ${reviewer.model} at ${effort}`);
+    const [only] = done as [(typeof done)[number]];
+    if (required === undefined) {
+      await setStatus(io, head, reviewState(only.marker, config), `${outcomeSummary(only.marker, config, checksSummary(checks))}: ${only.review.findings.length} finding(s) by ${only.reviewer.model} at ${effort}`);
+    } else {
+      // Every required family's latest review of this head counts: this run's, and those posted before it.
+      const posted = validMarkers(await markerPosts(io, stage, number), await repoOwner(io, stage), agentApps());
+      const reviews = required.map((family): FamilyReview => {
+        const mine = done.find((entry) => entry.reviewer.family === family);
+        return { family, current: mine === undefined ? markerFor(posted, head, family) : { marker: mine.marker, at: "", url: "" }, carried: undefined };
+      });
+      const status = requiredStatus(number, reviews, config);
+      await setStatus(io, head, status.state === "success" ? "success" : "failure", status.description);
+    }
   }
   if (waived === undefined && checksBlock(checks.state, config.checks.length > 0) !== undefined) {
     const next = checks.state === "timed out" ? "run `agent-gh review full` again once the machine is less loaded, or raise checks_timeout_minutes" : "fix them, push, and review the new head";
     io.print(`agent-gh: ${checksSummary(checks)}, so ${STATUS_CONTEXT} fails whatever the verdict; ${next}`);
   }
-  if (review.findings.length > 0) io.print('agent-gh: answer each finding with `agent-gh reply <id> --applied <sha>` or `agent-gh reply <id> --declined "<why>"`');
-  io.out(`${JSON.stringify(review, null, 2)}\n`);
+  if (done.some((entry) => entry.review.findings.length > 0)) io.print('agent-gh: answer each finding with `agent-gh reply <id> --applied <sha>` or `agent-gh reply <id> --declined "<why>"`');
+  // One review prints as it always has; where `require` names the author, a list of them, each naming its reviewer.
+  const printed = required === undefined ? (done[0] as (typeof done)[number]).review : done.map((entry) => ({ reviewer: entry.reviewer.family, ...entry.review }));
+  io.out(`${JSON.stringify(printed, null, 2)}\n`);
 };
 
 const SWEEP_BASE = "agent-gh-sweep-base";
