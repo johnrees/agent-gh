@@ -118,6 +118,13 @@ const foreignClaim = async (claims: ClaimCheck, repo: Repo, family: string): Pro
     return undefined;
   }
   if (holder === undefined || mine(holder, family, claims.session.id)) return undefined;
+  // This branch's own pull request with no marker: an edit of its description dropped it, and nothing now says whose it is.
+  if (holder.family === null && holder.kind === "pr" && holder.branch === branch) {
+    return {
+      code: 1,
+      message: `agent-gh guard: branch \`${branch}\` is #${issue}'s claim branch, and its ${holder.draft ? "draft " : ""}#${holder.pr} (${holder.url}) carries no agent-claim marker, so nothing says which session holds #${issue} (an edit of the description dropped it); run \`agent-gh claim --restore ${issue}\` to put it back from the description's edit history, then commit again.\n${NEXT_STEP}`,
+    };
+  }
   const who = claims.session.generated
     ? "this session, which has no id in its environment (set AGENT_GH_SESSION to the id its claim printed)"
     : `this ${family} session (${claims.session.id})`;

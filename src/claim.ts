@@ -59,6 +59,12 @@ export const parseClaim = (body: string): ClaimMarker | undefined => {
   return { v: 1, issue: value.issue as number, family: value.family, session: value.session, id: value.id };
 };
 
+/** A body's claim marker as written, to carry through a rewrite; undefined when it has none that reads. */
+export const claimMarkerText = (body: string): string | undefined => (parseClaim(body) === undefined ? undefined : CLAIM.exec(body)?.[0]);
+
+/** `body` with `marker` appended on its own line: how a description that lost its marker gets it back. */
+export const withClaimMarker = (body: string, marker: string): string => `${body.replace(/\s+$/, "")}\n\n${marker}`;
+
 export const parseRelease = (body: string): ReleaseMarker | undefined => {
   const value = markerObject(RELEASE, body);
   return value?.v === 1 && typeof value.id === "string" && ID.test(value.id) ? { v: 1, id: value.id } : undefined;
@@ -238,7 +244,7 @@ export const claimBody = (marker: ClaimMarker, refs: boolean): string =>
   [
     `${refs ? "Refs" : "Closes"} #${marker.issue}.`,
     "",
-    `A ${marker.family} session claimed #${marker.issue} with \`agent-gh claim\`; this draft holds it until the work lands here or \`agent-gh release ${marker.issue}\` closes it. Keep the marker below when rewriting this description.`,
+    `A ${marker.family} session claimed #${marker.issue} with \`agent-gh claim\`; this draft holds it until the work lands here or \`agent-gh release ${marker.issue}\` closes it. The gh shim keeps the marker below through \`gh pr edit\`; \`agent-gh claim --restore ${marker.issue}\` puts it back if another edit drops it.`,
     "",
     claimMarker(marker),
   ].join("\n");
@@ -329,12 +335,13 @@ export type ClaimArgs =
   | { readonly command: "claim-next"; readonly refs: boolean; readonly noPr: boolean; readonly rules: LabelRules }
   | { readonly command: "next"; readonly json: boolean; readonly waves: boolean; readonly rules: LabelRules }
   | { readonly command: "take"; readonly issue: number }
+  | { readonly command: "restore"; readonly issue: number }
   | { readonly command: "release"; readonly issue: number }
   | { readonly command: "claims"; readonly json: boolean }
   | { readonly command: "sync"; readonly issues: readonly number[] };
 
 /**
- * `claim N|--next [--refs|--no-pr]`, `claim --take N`, `release N`, `claims [--json]`,
+ * `claim N|--next [--refs|--no-pr]`, `claim --take N`, `claim --restore N`, `release N`, `claims [--json]`,
  * `claims sync [--issue N]...`, `next [--json] [--waves]`, each with an
  * optional `-R repo`; undefined when they do not parse. `next` and
  * `claim --next` also take `--skip-label`, `--require-label`, and
@@ -363,9 +370,10 @@ export const parseClaimArgs = (command: string, args: readonly string[]): ClaimA
   if (labelFlags > 0 && !takesLabels) return undefined;
   if (command === "claim") {
     const issues = words.filter((word) => !word.startsWith("-"));
-    if (words.includes("--take")) {
-      const issue = number(words.filter((word) => word !== "--take")[0]);
-      return issue === undefined || words.length !== 2 ? undefined : { command: "take", issue };
+    const handover = words.find((word) => word === "--take" || word === "--restore");
+    if (handover !== undefined) {
+      const issue = number(words.filter((word) => word !== handover)[0]);
+      return issue === undefined || words.length !== 2 ? undefined : { command: handover === "--take" ? "take" : "restore", issue };
     }
     const next = words.includes("--next");
     const flags = words.filter((word) => word.startsWith("-") && word !== "--next");

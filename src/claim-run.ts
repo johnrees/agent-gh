@@ -12,6 +12,7 @@ import {
   claimCommentBody,
   claimCommitMessage,
   type ClaimMarker,
+  claimMarkerText,
   claimsOn,
   DEFAULT_CLAIM_LABEL,
   describeClaim,
@@ -28,6 +29,7 @@ import {
   takeCommentBody,
   type Taken,
   taken,
+  withClaimMarker,
 } from "./claim.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { request } from "./github.ts";
@@ -563,6 +565,72 @@ export const take = async (io: ClaimIo, number: number): Promise<number> => {
     return lost(written);
   }
   io.print(`agent-gh: took #${number}'s claim from a ${from.family} session (${from.session}): draft #${pr} (${holder.url}) on ${branch}, at ${head.slice(0, 8)}; session ${io.session}`);
+  io.out(`${holder.url}\n`);
+  return 0;
+};
+
+/**
+ * `agent-gh claim --restore <N>`: puts the claim marker back on the pull
+ * request that holds issue N without one. The gh shim keeps the marker
+ * through `gh pr edit --body`, but an edit it does not see (GitHub's web
+ * editor, `gh api`) replaces the whole description, marker included; the
+ * pull request then reads as a person's and the commit hook refuses the
+ * holder's own commits. The marker comes from the description's edit
+ * history (GraphQL `userContentEdits`, each a full version): the latest
+ * version that carried one for N, appended to the description as it is now,
+ * whichever session it names. Returns the exit code.
+ */
+export const restore = async (io: ClaimIo, number: number): Promise<number> => {
+  const stage: Stage = "restoring a claim";
+  const issue = await issueOf(io, stage, number);
+  if (issue === undefined) throw new Failure(stage, `${slug(io.repo)} has no issue #${number}`);
+  if (issue.pull_request !== undefined) throw new Failure(stage, `#${number} is a pull request, not an issue`);
+  if (text(issue.state) !== "open") {
+    io.print(`agent-gh: #${number} is closed; there is no claim to restore`);
+    return 1;
+  }
+  const holder = (await claimState(io, stage, issue)).holder;
+  if (holder === undefined) {
+    io.print(`agent-gh: nothing claims #${number}, so there is no marker to restore; claim it with \`agent-gh claim ${number}\``);
+    return 1;
+  }
+  if (holder.family !== null) {
+    io.print(`agent-gh: #${number} is held by ${describeClaim(holder)}, whose marker is in place; there is nothing to restore`);
+    return mine(holder, io.family, io.session) ? 0 : 1;
+  }
+  // A comment without a marker is no claim, so a holder without one is a pull request.
+  const pr = holder.pr as number;
+  const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){userContentEdits(last:100){nodes{editedAt diff}}}}}`;
+  const { value } = await call(io, stage, "POST", "/graphql", { query, variables: { owner: io.repo.owner, name: io.repo.name, number: pr } });
+  const errors = record(value).errors;
+  if (Array.isArray(errors) && errors.length > 0) {
+    const types = [...new Set(errors.map((error) => text(record(error).type)).filter((type) => /^[A-Z_]{1,40}$/.test(type)))];
+    throw new Failure(stage, `GitHub's GraphQL API refused the read of #${pr}'s edit history${types.length === 0 ? "" : ` (${types.join(", ")})`}`);
+  }
+  const nodes = record(record(record(record(record(value).data).repository).pullRequest).userContentEdits).nodes;
+  const versions = (Array.isArray(nodes) ? nodes.map(record) : [])
+    .map((node) => ({ at: text(node.editedAt), marker: claimMarkerText(text(node.diff)) }))
+    .filter((version): version is { at: string; marker: string } => version.marker !== undefined && parseClaim(version.marker)?.issue === number)
+    .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
+  const found = versions[0];
+  if (found === undefined) {
+    io.print(`agent-gh: #${number} is held by ${describeClaim(holder)}, and no version of its description carried a claim marker for #${number} (a person's pull request, not a claim an edit broke); there is nothing to restore`);
+    return 1;
+  }
+  const now = record((await call(io, stage, "GET", `${repoPath(io)}/pulls/${pr}`)).value);
+  if (text(now.state) !== "open") {
+    io.print(`agent-gh: #${pr} was closed while this ran, so it holds #${number} no longer; there is nothing to restore`);
+    return 1;
+  }
+  const marker = parseClaim(found.marker) as ClaimMarker;
+  const ours = marker.family === io.family && marker.session === io.session;
+  const names = ours ? "this session" : `a ${marker.family} session (${marker.session})`;
+  if (claimMarkerText(text(now.body)) === undefined) {
+    await call(io, stage, "PATCH", `${repoPath(io)}/pulls/${pr}`, { body: withClaimMarker(text(now.body), found.marker) });
+    io.print(`agent-gh: restored #${pr}'s claim marker on #${number} from its description's version of ${found.at}; it names ${names}${ours ? "" : `, and \`agent-gh claim --take ${number}\` hands the claim to this one`}`);
+  } else {
+    io.print(`agent-gh: #${pr}'s claim marker was put back while this ran; it names ${names}`);
+  }
   io.out(`${holder.url}\n`);
   return 0;
 };

@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { allowRelease, parseAllowArgs } from "./allow.ts";
 import { runChild } from "./child.ts";
 import { parseClaimArgs, sessionId as claimSession } from "./claim.ts";
-import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, syncLabels, take } from "./claim-run.ts";
+import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, restore, syncLabels, take } from "./claim-run.ts";
 import type { LabelRules } from "./next.ts";
 import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, wavesLines } from "./next-run.ts";
 import { parseGraphArgs } from "./graph.ts";
@@ -82,6 +82,9 @@ const USAGE = `usage:
                                     take over another session's claim on an issue, keeping its branch and pull request:
                                     rewrite the claim to this session and check out its branch, whose earlier commits
                                     \`review full\` then takes as this session's (a comment claim: claim anew, release the old)
+  agent-gh claim --restore <N> [-R repo]
+                                    put the claim marker back on the pull request holding an issue, from the description's
+                                    edit history, after an edit outside the gh shim dropped it (the shim keeps it on \`gh pr edit\`)
   agent-gh claim --next [--refs|--no-pr] [LABEL FILTERS] [-R repo]
                                     claim the first issue \`next\` offers; after a lost race, the next one (at most three)
   agent-gh next [--json] [--waves] [LABEL FILTERS] [-R repo]
@@ -362,6 +365,7 @@ const claimCommand = async (first: string, rest: readonly string[], env: NodeJS.
       return 0;
     }
     if (parsed.command === "release") return release(io, parsed.issue);
+    if (parsed.command === "restore") return restore(io, parsed.issue);
     if (parsed.command === "next") return showNext(io, parsed);
     if (parsed.command === "claim-next") {
       if (session.generated) print(`agent-gh: no session id in the environment; this claim's is ${session.id}: set AGENT_GH_SESSION=${session.id} to release it later`);
@@ -689,6 +693,13 @@ const main = async (argv: readonly string[]): Promise<number> => {
     readFile: async (path) => {
       try {
         return await Bun.file(path).text();
+      } catch {
+        return undefined;
+      }
+    },
+    readStdin: async () => {
+      try {
+        return await Bun.stdin.text();
       } catch {
         return undefined;
       }
