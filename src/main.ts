@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { allowRelease, parseAllowArgs } from "./allow.ts";
 import { runChild } from "./child.ts";
 import { parseClaimArgs, sessionId as claimSession } from "./claim.ts";
-import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, syncLabels } from "./claim-run.ts";
+import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, syncLabels, take } from "./claim-run.ts";
 import type { LabelRules } from "./next.ts";
 import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, wavesLines } from "./next-run.ts";
 import { parseGraphArgs } from "./graph.ts";
@@ -62,7 +62,8 @@ const USAGE = `usage:
                                     run the config's checks on the pull request's pushed head, review it against its issue,
                                     and post the findings as a review and the agent-review status (or, with
                                     status_writer "actions", wait for the agent-review workflow to set it); a commit
-                                    another session made on a claim's branch is refused unless --adopt takes it on;
+                                    another session made on a claim's branch is refused unless --adopt takes it on,
+                                    or a \`claim --take\` handed the branch on after it;
                                     where the config's require names the author, each required family reviews in turn,
                                     or only --reviewer's
   agent-gh reply <finding> --applied <sha> | --declined "<why>" [--pr N]
@@ -77,6 +78,10 @@ const USAGE = `usage:
                                     take an issue before working on it: refuse a closed or taken one, else open a draft
                                     pull request closing it (--refs: referencing it) from a new <family>/<N>-<slug> branch,
                                     or (--no-pr) post a claim comment; a claim that loses a race undoes itself
+  agent-gh claim --take <N> [-R repo]
+                                    take over another session's claim on an issue, keeping its branch and pull request:
+                                    rewrite the claim to this session and check out its branch, whose earlier commits
+                                    \`review full\` then takes as this session's (a comment claim: claim anew, release the old)
   agent-gh claim --next [--refs|--no-pr] [LABEL FILTERS] [-R repo]
                                     claim the first issue \`next\` offers; after a lost race, the next one (at most three)
   agent-gh next [--json] [--waves] [LABEL FILTERS] [-R repo]
@@ -363,6 +368,7 @@ const claimCommand = async (first: string, rest: readonly string[], env: NodeJS.
       return claimNext(io, apiReader(io), parsed);
     }
     if (session.generated) print(`agent-gh: no session id in the environment; this claim's is ${session.id}: set AGENT_GH_SESSION=${session.id} to release it later`);
+    if (parsed.command === "take") return take(io, parsed.issue);
     return claim(io, parsed);
   });
 };

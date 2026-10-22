@@ -31,7 +31,7 @@ import {
   waivedBy,
   withIds,
 } from "../src/review.ts";
-import { claimMarker } from "../src/claim.ts";
+import { claimMarker, takeCommentBody } from "../src/claim.ts";
 import {
   authoredBy,
   commitSessions,
@@ -466,6 +466,9 @@ const world = ({
       if (args[0] === "log" && args.at(-1) === `${OLD}..${HEAD}`) return coAuthors.map((values) => `${values.join("\x1f")}\x1e`).join("\n");
       if (args[0] === "diff" && args.at(-2) === OLD && args.at(-1) === HEAD) return DIFF;
       if (args[0] === "patch-id") return input === `${DIFF}\n` ? `${PATCH_ID} ${"0".repeat(40)}` : undefined;
+      // Head commit `n` (newest 1) has every older one, `n + 1` on, in its history.
+      const numbered = (sha: string | undefined) => (/^([1-9])\1{39}$/.test(sha ?? "") ? Number(sha?.[0]) : undefined);
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor" && numbered(args[3]) !== undefined) return (numbered(args[2]) ?? 0) >= (numbered(args[3]) as number) ? "" : undefined;
       if (args[0] === "merge-base" && args[1] === "--is-ancestor") return args[3] === HEAD && ancestors.includes(args[2] as string) ? "" : undefined;
       if (args[0] === "merge-base") return "f".repeat(40);
       if (args[0] === "cat-file") return args.at(-1) === `${OLD}^{commit}` ? "" : undefined;
@@ -863,6 +866,36 @@ test("a claim pull request's commits must be its holder's: another session's sto
   const unclaimed = world({ sessions: ["s-two", "s-three"], answer: approve });
   await reviewFull(unclaimed.io, {});
   expect(posted(unclaimed.fake, `${REPO}/pulls/12/reviews`)).toHaveLength(1);
+});
+
+test("after `claim --take`, the earlier holder's commits up to the taken head are the new holder's with no --adopt, and the body says so", async () => {
+  const approve = { verdict: "approve", spec: "Done.", findings: [] };
+  const id = "0123456789abcdef";
+  const claimed = `Closes #7.\n\n${claimMarker({ v: 1, issue: 7, family: "codex", session: "s-two", id })}`;
+  // Codex's s-two took the claim from Claude's s-one when the branch's head was commit 2.
+  const take = (head: string, association = "OWNER", claim = id) => ({
+    id: 80, user: { login: "johnrees" }, author_association: association, created_at: "2026-10-01T00:00:00Z",
+    body: takeCommentBody({ v: 1, id: claim, from: { family: "claude", session: "s-one" }, to: { family: "codex", session: "s-two" }, head }),
+  });
+  const handed = world({ pullBody: claimed, sessions: ["s-two", "s-one", "s-one"], comments: [take("2".repeat(40))], answer: approve, family: "codex", session: "s-two" });
+  await reviewFull(handed.io, {});
+  expect(handed.printed).toContain(`agent-gh: 2 commit(s) predate this claim's take from their session, so they are the holder's (s-two): ${"2".repeat(8)} (session s-one), ${"3".repeat(8)} (session s-one)`);
+  const body = String(posted(handed.fake, `${REPO}/pulls/12/reviews`)[0]?.body);
+  expect(body).toContain(`\nAdopted as the claim holder's with its take (\`agent-gh claim --take\`): ${"2".repeat(8)} (session s-one), ${"3".repeat(8)} (session s-one).\n`);
+  expect(body).not.toContain("with `--adopt`");
+  // The earlier holder's commit after the taken head, and any commit under a take by someone without write access or of another claim, is still refused.
+  const later = world({ pullBody: claimed, sessions: ["s-one", "s-two", "s-one"], comments: [take("3".repeat(40))], answer: approve, family: "codex", session: "s-two" });
+  expect(await gateRefusal(reviewFull(later.io, {}))).toBe(
+    `commit ${"1".repeat(8)} is from session s-one, not this claim's holder (s-two); drop or squash it, or take it on as the holder's with \`agent-gh review full --adopt\``,
+  );
+  // A take outside the chain that ends at the holder (a competing take from the same session that never rewrote the marker) hands nothing on.
+  const stray = { ...take("1".repeat(40)), body: takeCommentBody({ v: 1, id, from: { family: "claude", session: "s-one" }, to: { family: "glm", session: "s-three" }, head: "1".repeat(40) }) };
+  const raced = world({ pullBody: claimed, sessions: ["s-one", "s-one"], comments: [take("2".repeat(40)), stray], answer: approve, family: "codex", session: "s-two" });
+  expect(await gateRefusal(reviewFull(raced.io, {}))).toContain(`commit ${"1".repeat(8)} is from session s-one, not this claim's holder (s-two)`);
+  for (const comment of [take("2".repeat(40), "NONE"), take("2".repeat(40), "OWNER", "fedcba9876543210")]) {
+    const stray = world({ pullBody: claimed, sessions: ["s-two", "s-one"], comments: [comment], answer: approve, family: "codex", session: "s-two" });
+    expect(await gateRefusal(reviewFull(stray.io, {}))).toContain(`commit ${"2".repeat(8)} is from session s-one`);
+  }
 });
 
 test("where the workflow writes the status, a full review posts its review and marker, sets no status, and waits for and prints the workflow's", async () => {
@@ -1736,7 +1769,11 @@ test("each head commit's session is read from its Agent-Session trailer, newest 
   repo.git(["checkout", "-q", "-"]);
   repo.git(["merge", "-q", "--no-ff", "-m", "merge side\n\nAgent-Session: s-two", "side"]);
   const merge = repo.git(["rev-parse", "HEAD"]) as string;
-  expect(await commitSessions(repo.io, base, merge)).toEqual([{ sha: merge, session: "s-two" }, { sha: two, session: undefined }, { sha: side, session: undefined }, { sha: one, session: "s-one" }]);
+  // Within one second, git orders the merge's two parents' lines either way.
+  const [newest, ...rest] = await commitSessions(repo.io, base, merge);
+  expect(newest).toEqual({ sha: merge, session: "s-two" });
+  const bySha = (a: { sha: string }, b: { sha: string }) => a.sha.localeCompare(b.sha);
+  expect(rest.sort(bySha)).toEqual([{ sha: two, session: undefined }, { sha: side, session: undefined }, { sha: one, session: "s-one" }].sort(bySha));
 });
 
 test("the patch id names the change, not its base: a rebase over unrelated work keeps it", async () => {

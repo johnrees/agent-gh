@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -7,16 +7,23 @@ import {
   claimCommitMessage,
   claimMarker,
   claimsOn,
+  firstTake,
   linkedIssues,
   mismatch,
+  mine,
   parseClaim,
   parseClaimArgs,
+  parseTake,
   releaseMarker,
+  retakeBody,
   sessionId,
+  takeCommentBody,
+  takesOf,
   taken,
   titleSlug,
 } from "../src/claim.ts";
-import { claim, type ClaimIo, claimsLines, eventIssues, listClaims, release, syncLabels, UNKNOWN } from "../src/claim-run.ts";
+import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, syncLabels, take, UNKNOWN } from "../src/claim-run.ts";
+import { adoptedCommits } from "../src/review-run.ts";
 import { apiReader, claimNext } from "../src/next-run.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
 
@@ -106,6 +113,10 @@ test("the commands parse as the usage says", () => {
   expect(parseClaimArgs("claim", ["--refs", "-R", "o/r", "7"])).toEqual({ command: "claim", issue: 7, refs: true, noPr: false });
   expect(parseClaimArgs("claim", ["7", "--no-pr", "--repo=o/r"])).toEqual({ command: "claim", issue: 7, refs: false, noPr: true });
   for (const bad of [[], ["x"], ["7", "8"], ["7", "--refs", "--no-pr"], ["7", "--draft"], ["-R"], ["0"]]) expect(parseClaimArgs("claim", bad)).toBeUndefined();
+  expect(parseClaimArgs("claim", ["--take", "7", "-R", "o/r"])).toEqual({ command: "take", issue: 7 });
+  expect(parseClaimArgs("claim", ["7", "--take"])).toEqual({ command: "take", issue: 7 });
+  for (const bad of [["--take"], ["--take", "7", "--refs"], ["--take", "7", "--no-pr"], ["--take", "--next"], ["--take", "7", "8"], ["--take", "--take", "7"]]) expect(parseClaimArgs("claim", bad)).toBeUndefined();
+  expect(parseClaimArgs("claim", ["--take", "7", "--skip-label", "x"])).toBeUndefined();
   expect(parseClaimArgs("release", ["7"])).toEqual({ command: "release", issue: 7 });
   expect(parseClaimArgs("claims", ["--json", "-Ro/r"])).toEqual({ command: "claims", json: true });
   expect(parseClaimArgs("claims", [])).toEqual({ command: "claims", json: false });
@@ -128,7 +139,7 @@ const page = <T>(items: readonly T[], url: URL): T[] => (Number(url.searchParams
 const world = ({ issues = [{ ...OPEN, labels: [] }] as Issue[], pulls = [] as Pull[], comments = {} as Record<number, unknown[]>, label = true, labelCreate = 201, config = undefined as unknown } = {}) => {
   const state = { issues, pulls, comments, label, deleted: [] as string[], nextPull: 31, nextComment: 500, lagUntilPulls: 0, staleReads: 0, onPost: () => {} };
   const issue = (number: number) => state.issues.find((item) => item.number === number);
-  const routes: Record<string, (body: string, url: URL) => Response> = {
+  const routes: Record<string, (body: string, url: URL) => Response | Promise<Response>> = {
     [`GET ${PATH}`]: () => reply(200, { default_branch: "main", owner: { login: "johnrees" } }),
     [`GET ${PATH}/contents/.github/agent-review.json`]: () => (config === undefined ? reply(404, {}) : reply(200, { content: Buffer.from(JSON.stringify(config)).toString("base64") })),
     [`GET ${PATH}/pulls`]: (_, url) =>
@@ -172,6 +183,12 @@ const world = ({ issues = [{ ...OPEN, labels: [] }] as Issue[], pulls = [] as Pu
       const had = found?.labels.some((item) => item.name === "claimed") ?? false;
       if (found !== undefined) found.labels = found.labels.filter((item) => item.name !== "claimed");
       return had ? reply(200, []) : reply(404, {});
+    };
+  }
+  for (let id = 500; id < 510; id++) {
+    routes[`DELETE ${PATH}/issues/comments/${id}`] = () => {
+      for (const list of Object.values(state.comments)) list.splice(0, list.length, ...list.filter((item) => (item as { id: number }).id !== id));
+      return new Response(null, { status: 204 });
     };
   }
   for (const family of ["claude", "codex"]) {
@@ -572,4 +589,330 @@ test("claim --next stops when its draft pull request stands unconfirmed, and cla
   expect(a.printed.filter((line) => line.startsWith("agent-gh: claiming"))).toEqual(["agent-gh: claiming #7 Fix the widget"]);
   expect(a.printed.join("\n")).toContain("GitHub does not list this claim's #31 yet");
   expect(w.state.pulls.map((item) => [item.number, item.state])).toEqual([[31, "open"]]);
+});
+
+/** A session's commit with work in it, credited to `session` as the commit-msg hook would, pushed to its branch. */
+const work = (git: ReturnType<typeof origin>, dir: string, file: string, session: string) => {
+  writeFileSync(join(dir, file), `${file}\n`);
+  git.run(["add", file], dir);
+  expect(git.run(["commit", "-q", "-m", `Add ${file}\n\nAgent-Session: ${session}`], dir).code).toBe(0);
+  expect(git.run(["push", "-q", "origin", "HEAD"], dir).code).toBe(0);
+  return git.run(["rev-parse", "HEAD"], dir).stdout;
+};
+
+test("claim --take hands a claim with work on it to this session: same branch and pull request, the marker rewritten, one comment, and review full takes the earlier commits as the holder's", async () => {
+  const w = world();
+  const git = origin();
+  // Session A (claude) claims #7 and pushes a commit.
+  const a = session(w.fake, git, git.clone("a"));
+  expect(await claim(a.io, { issue: 7, refs: false, noPr: false })).toBe(0);
+  const before = parseClaim(w.state.pulls[0]?.body ?? "");
+  const theirs = work(git, a.dir, "a.txt", "s-one");
+  // Session B (codex), in its own clean clone, takes it.
+  const b = session(w.fake, git, git.clone("b"), "codex", "s-two");
+  expect(await take(b.io, 7)).toBe(0);
+  expect(w.state.pulls.map((item) => [item.number, item.state, item.head.ref])).toEqual([[31, "open", "claude/7-fix-the-widget"]]);
+  const after = parseClaim(w.state.pulls[0]?.body ?? "");
+  expect(after).toEqual({ v: 1, issue: 7, family: "codex", session: "s-two", id: before?.id as string });
+  // The rest of the description is as it was.
+  expect(w.state.pulls[0]?.body.replace(/<!-- agent-claim .* -->/, "")).toBe(String(sent(w.fake, "POST", `${PATH}/pulls`)[0]?.body).replace(/<!-- agent-claim .* -->/, ""));
+  const posted = sent(w.fake, "POST", `${PATH}/issues/31/comments`);
+  expect(posted).toHaveLength(1);
+  expect(parseTake(String(posted[0]?.body))).toEqual({ v: 1, id: before?.id as string, from: { family: "claude", session: "s-one" }, to: { family: "codex", session: "s-two" }, head: theirs });
+  expect(String(posted[0]?.body)).toContain("A codex session (s-two) took this claim from a claude session (s-one) with `agent-gh claim --take`");
+  expect(b.printed.at(-1)).toBe("https://github.com/johnrees/widget/pull/31");
+  // B is on the claim branch at A's head, tracking it; the issue is still claimed, now by B, so B's hook passes and A's refuses.
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("claude/7-fix-the-widget");
+  expect(git.run(["rev-parse", "HEAD"], b.dir).stdout).toBe(theirs);
+  expect(git.run(["rev-parse", "--abbrev-ref", "@{upstream}"], b.dir).stdout).toBe("origin/claude/7-fix-the-widget");
+  expect(w.state.issues[0]?.labels).toEqual([{ name: "claimed" }]);
+  const holder = await holderOf(b.io, "checking the commit", 7);
+  expect(holder !== undefined && mine(holder, "codex", "s-two")).toBe(true);
+  expect(holder !== undefined && mine(holder, "claude", "s-one")).toBe(false);
+  // B commits and pushes plainly; review full's check of the commits passes with no --adopt, and says what it took on.
+  const ours = work(git, b.dir, "b.txt", "s-two");
+  expect(git.run(["rev-parse", "claude/7-fix-the-widget"], git.bare).stdout).toBe(ours);
+  const printed: string[] = [];
+  const review = {
+    api: w.fake.api, token: "t", repo: REPO, family: "codex", session: "s-two", print: (line: string) => printed.push(line),
+    git: async (args: readonly string[]) => {
+      const result = git.run(args, b.dir);
+      return result.code === 0 ? result.stdout : undefined;
+    },
+  };
+  const base = git.run(["merge-base", "HEAD", "origin/main"], b.dir).stdout;
+  const pr = { number: 31, body: w.state.pulls[0]?.body ?? "" };
+  expect(await adoptedCommits(review, pr, base, ours, false)).toEqual({ adopted: [], taken: [`${theirs.slice(0, 8)} (session s-one)`] });
+  // A commit A makes after the take (offline, past its hook) is not the holder's: the review refuses it until B adopts or drops it.
+  git.run(["pull", "-q", "--ff-only"], a.dir);
+  const late = work(git, a.dir, "late.txt", "s-one");
+  git.run(["fetch", "-q", "origin"], b.dir);
+  await expect(adoptedCommits(review, pr, base, late, false)).rejects.toThrow(`commit ${late.slice(0, 8)} is from session s-one, not this claim's holder (s-two)`);
+  // A take comment by someone without write access, or for another claim, takes nothing on.
+  w.state.comments[31] = (w.state.comments[31] ?? []).map((item) => ({ ...(item as object), author_association: "NONE" }));
+  await expect(adoptedCommits(review, pr, base, ours, false)).rejects.toThrow(`commit ${theirs.slice(0, 8)} is from session s-one`);
+});
+
+test("claim --take refuses a closed issue, one nothing claims, one held by a person's pull request, and one this session holds", async () => {
+  const git = origin();
+  const cases: [Parameters<typeof world>[0], string][] = [
+    [{ issues: [{ ...OPEN, state: "closed", labels: [] }] }, "#7 is closed; there is no claim to take"],
+    [{}, "nothing claims #7, so there is nothing to take; claim it with `agent-gh claim 7`"],
+    [{ pulls: [pull(5, "Fixes #7", { user: { login: "someone" }, draft: false })] }, "#7 is held by #5 by someone (https://github.com/johnrees/widget/pull/5), which carries no claim marker"],
+    [{ pulls: [pull(31, `Closes #7.\n${marker(7)}`)] }, "this session already holds #7: draft #31 by a claude session (s-one)"],
+  ];
+  for (const [setup, expected] of cases) {
+    const w = world(setup);
+    const a = session(w.fake, git, git.clone(`take-${Math.random()}`));
+    const head = git.run(["rev-parse", "--abbrev-ref", "HEAD"], a.dir).stdout;
+    expect(await take(a.io, 7)).toBe(1);
+    expect(a.printed.join("\n")).toContain(expected);
+    expect(w.fake.log.filter((entry) => entry.method !== "GET")).toEqual([]);
+    expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], a.dir).stdout).toBe(head);
+  }
+});
+
+test("claim --take of a pull request claim refuses uncommitted changes, and a local branch of that name at another commit, before it writes anything", async () => {
+  const w = world();
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  expect(await claim(a.io, { issue: 7, refs: false, noPr: false })).toBe(0);
+  work(git, a.dir, "a.txt", "s-one");
+  const b = session(w.fake, git, git.clone("b"), "codex", "s-two");
+  writeFileSync(join(b.dir, "README"), "x");
+  git.run(["add", "README"], b.dir);
+  await expect(take(b.io, 7)).rejects.toThrow("the working tree has uncommitted changes; commit or stash them first, since the take checks out the claim's branch");
+  git.run(["reset", "-q", "--hard"], b.dir);
+  git.run(["branch", "claude/7-fix-the-widget", "main"], b.dir);
+  await expect(take(b.io, 7)).rejects.toThrow("a local branch claude/7-fix-the-widget already exists at");
+  expect(w.fake.log.filter((entry) => entry.method !== "GET" && entry.path !== `${PATH}/pulls`).filter((entry) => entry.path.includes("/31"))).toEqual([]);
+  expect(parseClaim(w.state.pulls[0]?.body ?? "")?.session).toBe("s-one");
+  // GitHub refusing the marker's rewrite leaves the claim with its holder and the clone where it was.
+  git.run(["branch", "-q", "-D", "claude/7-fix-the-widget"], b.dir);
+  w.routes[`PATCH ${PATH}/pulls/31`] = () => reply(500, {});
+  await expect(take(b.io, 7)).rejects.toThrow("HTTP 500 from PATCH");
+  expect(parseClaim(w.state.pulls[0]?.body ?? "")?.session).toBe("s-one");
+  const [made] = sent(w.fake, "POST", `${PATH}/issues/31/comments`);
+  expect(parseTake(String(made?.body))?.to).toEqual({ family: "codex", session: "s-two" });
+  expect(w.fake.log.filter((entry) => entry.method === "DELETE").map((entry) => entry.path)).toEqual([`${PATH}/issues/comments/500`]);
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("main");
+  expect(git.run(["rev-parse", "-q", "--verify", "refs/heads/claude/7-fix-the-widget"], b.dir).code).not.toBe(0);
+  // A pull request whose marker another take rewrote since the claims were read is left alone.
+  const opened = w.state.pulls[0] as Pull;
+  const read = w.routes[`GET ${PATH}/pulls/31`] as (body: string, url: URL) => Response;
+  w.routes[`GET ${PATH}/pulls/31`] = () => reply(200, { ...opened, body: `Closes #7.\n${marker(7, "glm", "s-three", parseClaim(opened.body)?.id)}` });
+  expect(await take(b.io, 7)).toBe(1);
+  expect(b.printed.at(-1)).toBe("agent-gh: #31's claim changed while this take read it; run `agent-gh claims` and take again if it is still another session's");
+  expect(sent(w.fake, "POST", `${PATH}/issues/31/comments`)).toHaveLength(1);
+  w.routes[`GET ${PATH}/pulls/31`] = read;
+  // Another session's rewrite landing over this one's: the take stands down and puts the clone back, keeping its comment, on which a take from this session would chain.
+  w.routes[`PATCH ${PATH}/pulls/31`] = () => {
+    opened.body = `Closes #7.\n${marker(7, "glm", "s-three", parseClaim(opened.body)?.id)}`;
+    return reply(200, opened);
+  };
+  expect(await take(b.io, 7)).toBe(1);
+  expect(b.printed.at(-1)).toBe("agent-gh: #31's claim went to a glm session (s-three) while this take ran, so this session did not take it; run `agent-gh claims`");
+  expect(w.fake.log.filter((entry) => entry.method === "DELETE")).toHaveLength(1);
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("main");
+});
+
+test("of two sessions taking one claim at once, the one whose take comment is listed first takes it; the other deletes its comment and stays where it was", async () => {
+  const w = world();
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  expect(await claim(a.io, { issue: 7, refs: false, noPr: false })).toBe(0);
+  work(git, a.dir, "a.txt", "s-one");
+  // Both read the claim as the first session's and post their takes before either reads the comments back.
+  let release = () => {};
+  const both = new Promise<void>((resolve) => (release = resolve));
+  w.state.onPost = () => {
+    if ((w.state.comments[31] ?? []).length === 2) release();
+  };
+  const b = session(w.fake, git, git.clone("b"), "codex", "s-two", () => both);
+  const c = session(w.fake, git, git.clone("c"), "glm", "s-three", () => both);
+  const codes = await Promise.all([take(b.io, 7), take(c.io, 7)]);
+  expect(codes.sort()).toEqual([0, 1]);
+  const won = parseClaim(w.state.pulls[0]?.body ?? "");
+  const [winner, loser] = won?.session === "s-two" ? [b, c] : [c, b];
+  expect(loser.printed.at(-1)).toBe("agent-gh: another session's take of it was posted first, so this session took nothing from #31; run `agent-gh claims`, and take again if it is still another session's");
+  expect((w.state.comments[31] ?? []).map((item) => parseTake(String((item as { body: string }).body))?.to.session)).toEqual([won?.session]);
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], loser.dir).stdout).toBe("main");
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], winner.dir).stdout).toBe("claude/7-fix-the-widget");
+});
+
+test("a take whose rewrite went unanswered goes ahead when run again; one whose pull request closed meanwhile takes nothing", async () => {
+  const w = world();
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  expect(await claim(a.io, { issue: 7, refs: false, noPr: false })).toBe(0);
+  const theirs = work(git, a.dir, "a.txt", "s-one");
+  const patch = w.routes[`PATCH ${PATH}/pulls/31`] as (body: string, url: URL) => Response;
+  // GitHub never answers the rewrite (and never applies it).
+  w.routes[`PATCH ${PATH}/pulls/31`] = async () => (await Bun.sleep(2500), reply(504, {}));
+  const b = session(w.fake, git, git.clone("b"), "codex", "s-two");
+  expect(await take(b.io, 7)).toBe(UNKNOWN);
+  expect(b.printed.at(-1)).toContain("rewriting #31's claim marker went unanswered, so whether this session took #7 is unknown");
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("claude/7-fix-the-widget");
+  w.routes[`PATCH ${PATH}/pulls/31`] = patch;
+  expect(await take(b.io, 7)).toBe(0);
+  expect(parseClaim(w.state.pulls[0]?.body ?? "")).toMatchObject({ family: "codex", session: "s-two" });
+  expect(git.run(["rev-parse", "HEAD"], b.dir).stdout).toBe(theirs);
+  // A pull request closed while a take runs is no claim to take.
+  const c = session(w.fake, git, git.clone("c"), "glm", "s-three");
+  const read = w.routes[`GET ${PATH}/pulls/31`] as (body: string, url: URL) => Response;
+  let reads = 0;
+  w.routes[`GET ${PATH}/pulls/31`] = (body, url) => (++reads === 2 ? reply(200, { ...(w.state.pulls[0] as Pull), state: "closed" }) : read(body, url));
+  const posts = sent(w.fake, "POST", `${PATH}/issues/31/comments`).length;
+  expect(await take(c.io, 7)).toBe(1);
+  expect(c.printed.at(-1)).toBe("agent-gh: #31 was closed while this take ran, so this session took nothing from #31; run `agent-gh claims`, and take again if it is still another session's");
+  expect(sent(w.fake, "POST", `${PATH}/issues/31/comments`)).toHaveLength(posts + 1);
+  expect((w.state.comments[31] ?? []).map((item) => parseTake(String((item as { body: string }).body))?.to.session)).toEqual(["s-two", "s-two"]);
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], c.dir).stdout).toBe("main");
+}, 15_000);
+
+test("a take comment GitHub stored without answering is found and deleted, so it does not go ahead of the next session's take", async () => {
+  const w = world();
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  expect(await claim(a.io, { issue: 7, refs: false, noPr: false })).toBe(0);
+  work(git, a.dir, "a.txt", "s-one");
+  const post = w.routes[`POST ${PATH}/issues/31/comments`] as (body: string, url: URL) => Response;
+  w.routes[`POST ${PATH}/issues/31/comments`] = async (body, url) => {
+    const stored = post(body, url);
+    await Bun.sleep(2500);
+    return stored;
+  };
+  const b = session(w.fake, git, git.clone("b"), "codex", "s-two");
+  await expect(take(b.io, 7)).rejects.toThrow("could not reach");
+  expect(w.state.comments[31]).toEqual([]);
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("main");
+  w.routes[`POST ${PATH}/issues/31/comments`] = post;
+  expect(await take(session(w.fake, git, git.clone("c"), "glm", "s-three").io, 7)).toBe(0);
+  expect(parseClaim(w.state.pulls[0]?.body ?? "")).toMatchObject({ family: "glm", session: "s-three" });
+}, 15_000);
+
+test("claim --take whose rewrite cannot be confirmed keeps its comment and the clone on the claim branch, and says so", async () => {
+  const w = world();
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  expect(await claim(a.io, { issue: 7, refs: false, noPr: false })).toBe(0);
+  const read = w.routes[`GET ${PATH}/pulls/31`] as (body: string, url: URL) => Response;
+  let reads = 0;
+  w.routes[`GET ${PATH}/pulls/31`] = (body, url) => (++reads === 3 ? reply(502, {}) : read(body, url));
+  const b = session(w.fake, git, git.clone("b"), "codex", "s-two");
+  expect(await take(b.io, 7)).toBe(UNKNOWN);
+  expect(b.printed.at(-1)).toBe("agent-gh: rewrote #31's claim marker to this session, but could not read it back (HTTP 502 from GET /repos/johnrees/widget/pulls/31); this clone is on claude/7-fix-the-widget: run `agent-gh claims` to confirm");
+  expect(parseClaim(w.state.pulls[0]?.body ?? "")?.session).toBe("s-two");
+  expect(sent(w.fake, "POST", `${PATH}/issues/31/comments`)).toHaveLength(1);
+  expect(w.fake.log.filter((entry) => entry.method === "DELETE")).toEqual([]);
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("claude/7-fix-the-widget");
+});
+
+test("claim --take of a comment claim posts a new claim comment for this session, then the old one's release", async () => {
+  const w = world({ comments: { 7: [comment(400, marker(7, "claude", "s-one", "aaaaaaaaaaaaaaaa"))] } });
+  const git = origin();
+  const b = session(w.fake, git, git.clone("b"), "codex", "s-two");
+  expect(await take(b.io, 7)).toBe(0);
+  const [claimed, released] = sent(w.fake, "POST", `${PATH}/issues/7/comments`).map((item) => String(item.body));
+  expect(parseClaim(claimed ?? "")).toMatchObject({ issue: 7, family: "codex", session: "s-two" });
+  expect(claimed).toContain("took this issue's claim from a claude session (s-one) with `agent-gh claim --take`");
+  expect(released).toContain(releaseMarker({ v: 1, id: "aaaaaaaaaaaaaaaa" }));
+  expect(taken(REPO, OPEN, [], w.state.comments[7] ?? []).claims.map((item) => [item.family, item.session])).toEqual([["codex", "s-two"]]);
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("main");
+  // Of two sessions taking it at once, the earlier new claim holds; the later releases its own.
+  const race = world({ comments: { 7: [comment(400, marker(7, "claude", "s-one", "aaaaaaaaaaaaaaaa"))] } });
+  let first = true;
+  race.state.onPost = () => {
+    if (first) (race.state.comments[7] ??= []).push({ ...comment(450, marker(7, "glm", "s-three", "cccccccccccccccc")), created_at: "2026-10-15T11:44:00Z" });
+    first = false;
+  };
+  const d = session(race.fake, git, git.clone("d"), "codex", "s-two");
+  expect(await take(d.io, 7)).toBe(1);
+  expect(d.printed.join("\n")).toContain("first; released this take's claim comment");
+  expect(taken(REPO, OPEN, [], race.state.comments[7] ?? []).claims.map((item) => item.session)).toEqual(["s-three"]);
+  // When the old claim's release fails, the new claim is released too, so a retry is not refused for it.
+  const flaky = world({ comments: { 7: [comment(400, marker(7, "claude", "s-one", "aaaaaaaaaaaaaaaa"))] } });
+  const post = flaky.routes[`POST ${PATH}/issues/7/comments`] as (body: string, url: URL) => Response;
+  flaky.routes[`POST ${PATH}/issues/7/comments`] = (body, url) => (body.includes("aaaaaaaaaaaaaaaa") ? reply(422, {}) : post(body, url));
+  const e = session(flaky.fake, git, git.clone("e"), "codex", "s-two");
+  await expect(take(e.io, 7)).rejects.toThrow("HTTP 422");
+  expect(taken(REPO, OPEN, [], flaky.state.comments[7] ?? []).claims.map((item) => item.session)).toEqual(["s-one"]);
+  // A release GitHub stored without answering: the new claim stays, and reading the claims back finds it holds.
+  const slow = world({ comments: { 7: [comment(400, marker(7, "claude", "s-one", "aaaaaaaaaaaaaaaa"))] } });
+  const store = slow.routes[`POST ${PATH}/issues/7/comments`] as (body: string, url: URL) => Response;
+  slow.routes[`POST ${PATH}/issues/7/comments`] = async (body, url) => {
+    const stored = store(body, url);
+    if (body.includes("aaaaaaaaaaaaaaaa")) await Bun.sleep(2500);
+    return stored;
+  };
+  const f = session(slow.fake, git, git.clone("f"), "codex", "s-two");
+  expect(await take(f.io, 7)).toBe(0);
+  expect(taken(REPO, OPEN, [], slow.state.comments[7] ?? []).claims.map((item) => item.session)).toEqual(["s-two"]);
+  // A new claim GitHub stored without answering is released, so a retry is not refused for it.
+  const unanswered = world({ comments: { 7: [comment(400, marker(7, "claude", "s-one", "aaaaaaaaaaaaaaaa"))] } });
+  const keepIt = unanswered.routes[`POST ${PATH}/issues/7/comments`] as (body: string, url: URL) => Response;
+  let slowOnce = true;
+  unanswered.routes[`POST ${PATH}/issues/7/comments`] = async (body, url) => {
+    const stored = keepIt(body, url);
+    if (slowOnce) await Bun.sleep(2500);
+    slowOnce = false;
+    return stored;
+  };
+  await expect(take(session(unanswered.fake, git, git.clone("h"), "codex", "s-two").io, 7)).rejects.toThrow("could not reach");
+  expect(taken(REPO, OPEN, [], unanswered.state.comments[7] ?? []).claims.map((item) => item.session)).toEqual(["s-one"]);
+  // A release GitHub lists late: the take waits for it rather than judging the old claim still the holder.
+  const lagging = world({ comments: { 7: [comment(400, marker(7, "claude", "s-one", "aaaaaaaaaaaaaaaa"))] } });
+  const keep = lagging.routes[`POST ${PATH}/issues/7/comments`] as (body: string, url: URL) => Response;
+  const list = lagging.routes[`GET ${PATH}/issues/7/comments`] as (body: string, url: URL) => Response;
+  let hidden: unknown[] = [];
+  lagging.routes[`POST ${PATH}/issues/7/comments`] = (body, url) => {
+    const stored = keep(body, url);
+    if (body.includes("aaaaaaaaaaaaaaaa")) hidden = (lagging.state.comments[7] ?? []).splice(-1);
+    return stored;
+  };
+  let lists = 0;
+  lagging.routes[`GET ${PATH}/issues/7/comments`] = (body, url) => {
+    if (++lists === 3) lagging.state.comments[7]?.push(...hidden.splice(0));
+    return list(body, url);
+  };
+  const g = session(lagging.fake, git, git.clone("g"), "codex", "s-two");
+  expect(await take(g.io, 7)).toBe(0);
+  expect(taken(REPO, OPEN, [], lagging.state.comments[7] ?? []).claims.map((item) => item.session)).toEqual(["s-two"]);
+  // With another claim behind it, a new comment would fall behind that one, so nothing is taken.
+  const crowded = world({ comments: { 7: [comment(400, marker(7, "claude", "s-one", "aaaaaaaaaaaaaaaa")), { ...comment(401, marker(7, "glm", "s-three", "bbbbbbbbbbbbbbbb")), created_at: "2026-10-15T09:30:00Z" }] } });
+  const c = session(crowded.fake, git, git.clone("c"), "codex", "s-two");
+  expect(await take(c.io, 7)).toBe(1);
+  expect(c.printed.join("\n")).toContain("a new claim comment would fall behind them");
+  expect(sent(crowded.fake, "POST", `${PATH}/issues/7/comments`)).toEqual([]);
+}, 15_000);
+
+test("a take hands on commits only through the latest chain of takes ending at the holder, by writers, for this claim", () => {
+  const claimOf = (family: string, session: string) => ({ v: 1 as const, issue: 7, family, session, id: "0123456789abcdef" });
+  const by = (from: string, to: string, head: string, association = "OWNER", id = "0123456789abcdef") => ({
+    author_association: association,
+    body: takeCommentBody({ v: 1, id, from: { family: "claude", session: from }, to: { family: "claude", session: to }, head: head.repeat(40) }),
+  });
+  const heads = (comments: unknown[], holder: string) => takesOf(comments, claimOf("claude", holder)).map((item) => `${item.from.session}>${item.to.session}@${item.head[0]}`);
+  expect(heads([by("a", "b", "1"), by("b", "c", "2")], "c")).toEqual(["a>b@1", "b>c@2"]);
+  // Two takes from a at once: whichever rewrite stands is the chain, the other hands nothing on.
+  expect(heads([by("a", "b", "1"), by("a", "c", "2")], "c")).toEqual(["a>c@2"]);
+  expect(heads([by("a", "b", "1"), by("a", "c", "2")], "b")).toEqual(["a>b@1"]);
+  expect(heads([by("a", "b", "1", "NONE")], "b")).toEqual([]);
+  expect(heads([by("a", "b", "1", "OWNER", "fedcba9876543210")], "b")).toEqual([]);
+  expect(heads([], "b")).toEqual([]);
+  // The take that goes ahead: the first from the holder since a take made it the holder.
+  const ids = (comments: ReturnType<typeof by>[]) => comments.map((item, index) => ({ ...item, id: 10 + index }));
+  expect(firstTake(ids([by("a", "b", "1"), by("a", "c", "2")]), claimOf("claude", "a"))?.id).toBe(10);
+  expect(firstTake(ids([by("a", "b", "1"), by("b", "c", "2"), by("b", "d", "3")]), claimOf("claude", "b"))?.id).toBe(11);
+  expect(firstTake(ids([by("b", "a", "1"), by("a", "b", "2"), by("b", "a", "3"), by("a", "c", "4")]), claimOf("claude", "a"))?.id).toBe(13);
+  expect(firstTake(ids([by("a", "b", "1", "NONE")]), claimOf("claude", "a"))).toBeUndefined();
+});
+
+test("a description's claim marker is rewritten in place; a take marker reads back, and a malformed one reads as none", () => {
+  const body = `Closes #7.\n\nWork.\n\n${marker(7)}\n\nMore.`;
+  expect(retakeBody(body, { v: 1, issue: 7, family: "codex", session: "s-two", id: "0123456789abcdef" })).toBe(`Closes #7.\n\nWork.\n\n${marker(7, "codex", "s-two")}\n\nMore.`);
+  expect(retakeBody("No marker.", { v: 1, issue: 7, family: "codex", session: "s-two", id: "0123456789abcdef" })).toBe("No marker.");
+  const good = { v: 1, id: "0123456789abcdef", from: { family: "claude", session: "s-one" }, to: { family: "codex", session: "s-two" }, head: "a".repeat(40) };
+  expect(parseTake(`<!-- agent-take ${JSON.stringify(good)} -->`)).toEqual(good as never);
+  for (const bad of [{ ...good, head: "abc" }, { ...good, from: { family: "claude" } }, { ...good, id: "x" }, { ...good, v: 2 }]) expect(parseTake(`<!-- agent-take ${JSON.stringify(bad)} -->`)).toBeUndefined();
 });

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Claim } from "../src/claim.ts";
+import { type Claim, claimMarker, claimsOn, retakeBody } from "../src/claim.ts";
 import { REGISTRY } from "../src/config.ts";
 import { Failure, NEXT_STEP } from "../src/failure.ts";
 import { coAuthorTrailer } from "../src/git.ts";
@@ -129,6 +129,22 @@ test("a commit on the session's own claim branch is credited with its session; o
   // A session with no id in its environment holds nothing the hook can see, and is told how to say who it is.
   const anonymous = await hookOn("claude/64-fix", claimBy("s-two"), { id: "f00d", generated: true });
   expect(anonymous.verdict.message).toContain("not this session, which has no id in its environment (set AGENT_GH_SESSION to the id its claim printed)");
+});
+
+test("after `claim --take`, the hook passes the taker's commits on the claim branch and refuses any other session's", async () => {
+  // Draft #65, a codex session's claim on #64, as GitHub lists it before and after this claude session (s-one) takes it.
+  const body = `Closes #64.\n\n${claimMarker({ v: 1, issue: 64, family: "codex", session: "s-two", id: "0123456789abcdef" })}`;
+  const pull = (description: string) => ({
+    number: 65, state: "open", body: description, draft: true, html_url: "https://github.com/johnrees/penmon/pull/65", user: { login: "johnrees" },
+    head: { ref: "codex/64-fix" }, created_at: "2026-10-21T00:00:00Z",
+  });
+  const holder = (description: string) => claimsOn({ owner: "johnrees", name: "penmon" }, 64, [pull(description)], [])[0];
+  const taken = retakeBody(body, { v: 1, issue: 64, family: "claude", session: "s-one", id: "0123456789abcdef" });
+  expect((await hookOn("codex/64-fix", holder(body))).verdict.code).toBe(1);
+  const after = await hookOn("codex/64-fix", holder(taken));
+  expect(after.verdict).toEqual({ code: 0 });
+  expect(after.message).toBe(`work\n\n${SESSION_TRAILERS("s-one")}\n`);
+  expect((await hookOn("codex/64-fix", holder(taken), { id: "s-two", generated: false })).verdict.code).toBe(1);
 });
 
 test("a commit on any other branch, on a claim branch nothing holds, or when GitHub cannot say who holds it, passes", async () => {
