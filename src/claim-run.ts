@@ -16,6 +16,7 @@ import {
   DEFAULT_CLAIM_LABEL,
   describeClaim,
   emptyClaim,
+  firstTake,
   linkedIssues,
   mine,
   type Mismatch,
@@ -23,6 +24,8 @@ import {
   ago,
   parseClaim,
   releaseCommentBody,
+  retakeBody,
+  takeCommentBody,
   type Taken,
   taken,
 } from "./claim.ts";
@@ -166,6 +169,29 @@ const dropBranch = async (io: ClaimIo, stage: Stage, branch: string, previous: {
   await io.git(["branch", "-q", "-D", branch]);
 };
 
+/**
+ * Refuses a clone whose origin does not fetch from and push to `io.repo`, or
+ * whose working tree has uncommitted changes, before a claim moves to a
+ * branch. Fetch and every push URL: a clone that fetches here but pushes to
+ * a fork, or to a mirror on disk, would push nothing here. A push URL must
+ * name this repository, or be the fetch URL itself.
+ */
+const cleanCloneOfRepo = async (io: ClaimIo, stage: Stage, what: string, why: string): Promise<void> => {
+  const fetchUrl = (await io.git(["remote", "get-url", "origin"])).stdout;
+  const pushUrls = (await io.git(["remote", "get-url", "--push", "--all", "origin"])).stdout.split("\n");
+  const here = (url: string) => {
+    const remote = parseRemoteUrl(url);
+    return remote !== undefined && slug(remote).toLowerCase() === slug(io.repo).toLowerCase();
+  };
+  const elsewhere = (url: string) => url === "" || (parseRemoteUrl(url) !== undefined && !here(url));
+  if (elsewhere(fetchUrl) || pushUrls.some((url) => url === "" || (url !== fetchUrl && !here(url)))) {
+    throw new Failure(stage, `${what} from a clone whose origin fetches from and pushes to ${slug(io.repo)}`);
+  }
+  if ((await git(io, stage, ["status", "--porcelain", "--untracked-files=no"])) !== "") {
+    throw new Failure(stage, `the working tree has uncommitted changes; commit or stash them first, since ${why}`);
+  }
+};
+
 /** Rounds of reading a new claim back before giving up on seeing it listed. */
 const READ_BACK_ROUNDS = 3;
 
@@ -175,13 +201,14 @@ const READ_BACK_ROUNDS = 3;
  * and undefined when the claim is never listed, since a claim that cannot
  * see itself cannot tell whether it won.
  */
-const readBack = async (io: ClaimIo, stage: Stage, number: number, ours: (item: Claim) => boolean): Promise<Taken | "closed" | undefined> => {
+const readBack = async (io: ClaimIo, stage: Stage, number: number, ours: (item: Claim) => boolean, gone?: (item: Claim) => boolean): Promise<Taken | "closed" | undefined> => {
   for (let round = 1; round <= READ_BACK_ROUNDS; round++) {
     await io.sleep(io.recheckMs * round);
     const issue = await issueOf(io, stage, number);
     if (issue === undefined || text(issue.state) !== "open") return "closed";
     const state = await claimState(io, stage, issue);
-    if (state.claims.some(ours)) return state;
+    // `gone`: a claim this one released, which a list that lags the release still shows.
+    if (state.claims.some(ours) && (gone === undefined || !state.claims.some(gone))) return state;
   }
   return undefined;
 };
@@ -236,21 +263,7 @@ export const claim = async (io: ClaimIo, options: ClaimOptions): Promise<number>
   const marker: ClaimMarker = { v: 1, issue: number, family: io.family, session: io.session, id: crypto.randomUUID().replaceAll("-", "") };
   if (options.noPr) return claimByComment(io, marker, label);
 
-  // Fetch and every push URL: a clone that fetches here but pushes to a fork, or to a mirror on disk, would open nothing here.
-  // A push URL must name this repository, or be the fetch URL itself.
-  const fetchUrl = (await io.git(["remote", "get-url", "origin"])).stdout;
-  const pushUrls = (await io.git(["remote", "get-url", "--push", "--all", "origin"])).stdout.split("\n");
-  const here = (url: string) => {
-    const remote = parseRemoteUrl(url);
-    return remote !== undefined && slug(remote).toLowerCase() === slug(io.repo).toLowerCase();
-  };
-  const elsewhere = (url: string) => url === "" || (parseRemoteUrl(url) !== undefined && !here(url));
-  if (elsewhere(fetchUrl) || pushUrls.some((url) => url === "" || (url !== fetchUrl && !here(url)))) {
-    throw new Failure(stage, `claim with a draft pull request from a clone whose origin fetches from and pushes to ${slug(io.repo)}`);
-  }
-  if ((await git(io, stage, ["status", "--porcelain", "--untracked-files=no"])) !== "") {
-    throw new Failure(stage, "the working tree has uncommitted changes; commit or stash them first, since the claim switches to a new branch");
-  }
+  await cleanCloneOfRepo(io, stage, "claim with a draft pull request", "the claim switches to a new branch");
   const previous = { branch: (await io.git(["symbolic-ref", "-q", "--short", "HEAD"])).stdout || undefined, sha: await git(io, stage, ["rev-parse", "HEAD"]) };
   const branch = claimBranch(io.family, number, title);
   if ((await io.git(["rev-parse", "-q", "--verify", `refs/heads/${branch}`])).code === 0) {
@@ -345,6 +358,212 @@ const claimByComment = async (io: ClaimIo, marker: ClaimMarker, label: string): 
   await addLabel(io, stage, marker.issue, label, io.print);
   io.print(`agent-gh: claimed #${marker.issue} with a comment (${text(posted.html_url)}); session ${io.session}`);
   io.out(`${text(posted.html_url)}\n`);
+  return 0;
+};
+
+/** A take that another session's rewrite of the marker overtook: `marker` is what the pull request carries now. */
+class Lost extends Error {
+  constructor(readonly marker: ClaimMarker | undefined, readonly why?: string) {
+    super("the claim changed hands");
+  }
+}
+
+/**
+ * `agent-gh claim --take <N>`: hands the claim holding issue N, another
+ * session's, to this one, keeping its branch and pull request. For a pull
+ * request claim, the claim branch is fetched and checked out, one comment on
+ * the pull request names who took it from whom at which head (what `review
+ * full` reads to take the earlier holder's commits as this one's), and the
+ * marker is rewritten to this session, keeping its `issue` and `id`; a
+ * failure partway puts the clone back. A comment claim gets a new claim
+ * comment, then its old one's release, and is read back as `claim` reads its
+ * own, so of two sessions taking it at once one holds it.
+ * Refuses a closed issue, one nothing claims, one held by a pull request
+ * without a claim marker (a person's), and one this session holds already.
+ * Who may take is who may close the claim's pull request: anyone acting as
+ * John. Returns the exit code.
+ */
+export const take = async (io: ClaimIo, number: number): Promise<number> => {
+  const stage: Stage = "claiming";
+  const issue = await issueOf(io, stage, number);
+  if (issue === undefined) throw new Failure(stage, `${slug(io.repo)} has no issue #${number}`);
+  if (issue.pull_request !== undefined) throw new Failure(stage, `#${number} is a pull request, not an issue`);
+  if (text(issue.state) !== "open") {
+    io.print(`agent-gh: #${number} is closed; there is no claim to take`);
+    return 1;
+  }
+  const state = await claimState(io, stage, issue);
+  const holder = state.holder;
+  if (holder === undefined) {
+    io.print(`agent-gh: nothing claims #${number}, so there is nothing to take; claim it with \`agent-gh claim ${number}\``);
+    return 1;
+  }
+  if (mine(holder, io.family, io.session)) {
+    io.print(`agent-gh: this session already holds #${number}: ${describeClaim(holder)}; there is nothing to take`);
+    return 1;
+  }
+  if (holder.family === null || holder.session === null || holder.id === null) {
+    io.print(`agent-gh: #${number} is held by ${describeClaim(holder)}, which carries no claim marker, so there is no claim to take`);
+    return 1;
+  }
+  const from = { family: holder.family, session: holder.session };
+  const marker: ClaimMarker = { v: 1, issue: number, family: io.family, session: io.session, id: holder.id };
+  if (holder.kind === "comment") {
+    // The new claim comment is created after any other claim's, so with another claim behind this one it would fall behind it once the old one is released.
+    if (state.claims.length > 1) {
+      io.print(`agent-gh: #${number} has other claims behind ${describeClaim(holder)} (${state.claims.slice(1).map(describeClaim).join("; ")}); a new claim comment would fall behind them, so take nothing until they are closed or released`);
+      return 1;
+    }
+    const fresh: ClaimMarker = { ...marker, id: crypto.randomUUID().replaceAll("-", "") };
+    // The new claim first, then the old one's release, so the issue is never free between them.
+    const release = (id: string) => call(io, stage, "POST", `${repoPath(io)}/issues/${number}/comments`, { body: releaseCommentBody({ v: 1, id }) });
+    let posted: Record<string, unknown>;
+    try {
+      posted = record((await call(io, stage, "POST", `${repoPath(io)}/issues/${number}/comments`, { body: claimCommentBody(fresh, from) })).value);
+    } catch (error) {
+      // GitHub may have stored it without answering: released, it cannot sit behind the old claim and refuse the next take.
+      await release(fresh.id).catch(() => undefined);
+      throw error;
+    }
+    // Unanswered, or failed on GitHub's side (5xx), the release may have landed, so the new claim stays and the read-back below settles it;
+    // refused (4xx), it did not, and the new claim, left live behind the old one, would refuse the next take.
+    let status: number | undefined;
+    try {
+      ({ status } = await request(io.api, stage, "POST", `${repoPath(io)}/issues/${number}/comments`, io.token, { body: releaseCommentBody({ v: 1, id: holder.id }) }));
+    } catch (error) {
+      if (!(error instanceof Failure)) throw error;
+    }
+    if (status !== undefined && status >= 400 && status < 500) {
+      await release(fresh.id).catch(() => undefined);
+      throw new Failure(stage, `HTTP ${status} from POST ${repoPath(io)}/issues/${number}/comments`);
+    }
+    // Another session taking it at the same time posts its own claim: the earlier one holds, and the later releases itself.
+    const after = await readBack(io, stage, number, (item) => item.comment === posted.id, (item) => item.id === holder.id);
+    if (after === undefined) {
+      io.print(`agent-gh: GitHub does not list this take's claim comment yet, so whether it holds #${number} is unknown; it stands: run \`agent-gh claims\`, then keep it or \`agent-gh release ${number}\``);
+      return UNKNOWN;
+    }
+    if (after === "closed" || after.holder?.comment !== posted.id) {
+      await release(fresh.id);
+      io.print(`agent-gh: #${number} ${lostTo(after)}; released this take's claim comment`);
+      return 1;
+    }
+    io.print(`agent-gh: took #${number}'s claim from a ${from.family} session (${from.session}) with a comment (${text(posted.html_url)}); session ${io.session}`);
+    io.out(`${text(posted.html_url)}\n`);
+    return 0;
+  }
+  const pr = holder.pr as number;
+  const pull = record((await call(io, stage, "GET", `${repoPath(io)}/pulls/${pr}`)).value);
+  const sameClaim = (found: ClaimMarker | undefined, who: { readonly family: string; readonly session: string }) =>
+    found?.id === holder.id && found.family === who.family && found.session === who.session;
+  if (!sameClaim(parseClaim(text(pull.body)), from)) {
+    io.print(`agent-gh: #${pr}'s claim changed while this take read it; run \`agent-gh claims\` and take again if it is still another session's`);
+    return 1;
+  }
+  const branch = text(record(pull.head).ref);
+  if (text(record(record(pull.head).repo).full_name).toLowerCase() !== slug(io.repo).toLowerCase() || branch === "") {
+    throw new Failure(stage, `#${pr}'s branch is not in ${slug(io.repo)}, so this session could not push to it`);
+  }
+  await cleanCloneOfRepo(io, stage, "take a claim", "the take checks out the claim's branch");
+  await git(io, stage, ["fetch", "-q", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+  const head = await git(io, stage, ["rev-parse", `refs/remotes/origin/${branch}^{commit}`]);
+  const local = await io.git(["rev-parse", "-q", "--verify", `refs/heads/${branch}^{commit}`]);
+  if (local.code === 0 && local.stdout !== head) {
+    throw new Failure(stage, `a local branch ${branch} already exists at ${local.stdout.slice(0, 8)}, not at #${pr}'s head ${head.slice(0, 8)}; delete it or bring it to origin's, then take again`);
+  }
+  // The branch first, then the comment, then the marker: a take that fails before the rewrite leaves the claim with its holder and this clone where it was.
+  const previous = { branch: (await io.git(["symbolic-ref", "-q", "--short", "HEAD"])).stdout || undefined, sha: await git(io, stage, ["rev-parse", "HEAD"]) };
+  await git(io, stage, local.code === 0 ? ["switch", "-q", branch] : ["switch", "-q", "--no-track", "-c", branch, `refs/remotes/origin/${branch}`]);
+  const back = async () => {
+    if (local.code === 0) await io.git(previous.branch === undefined ? ["switch", "-q", "--detach", previous.sha] : ["switch", "-q", previous.branch]);
+    else await dropBranch(io, stage, branch, previous, false);
+  };
+  const lost = (found: ClaimMarker | undefined) => {
+    const who = found === undefined ? "nobody's claim" : `a ${found.family} session (${found.session})`;
+    io.print(`agent-gh: #${pr}'s claim went to ${who} while this take ran, so this session did not take it; run \`agent-gh claims\``);
+    return 1;
+  };
+  const takeBody = takeCommentBody({ v: 1, id: holder.id, from, to: { family: io.family, session: io.session }, head });
+  let posted: unknown;
+  let rewritten: boolean | undefined = false;
+  try {
+    await git(io, stage, ["config", `branch.${branch}.remote`, "origin"]);
+    await git(io, stage, ["config", `branch.${branch}.merge`, `refs/heads/${branch}`]);
+    posted = record((await call(io, stage, "POST", `${repoPath(io)}/issues/${pr}/comments`, { body: takeBody })).value).id;
+    // GitHub has no compare-and-swap, so of several sessions taking this claim at once, the one whose take comment is listed first goes ahead.
+    const holding: ClaimMarker = { ...marker, family: from.family, session: from.session };
+    let first: ReturnType<typeof firstTake>;
+    for (let round = 1; round <= READ_BACK_ROUNDS && first === undefined; round++) {
+      await io.sleep(io.recheckMs * round);
+      first = firstTake(await comments(io, stage, pr), holding);
+    }
+    // This session's own earlier take, one whose rewrite went unanswered, goes ahead as this one.
+    if (first?.id !== posted && !(first !== undefined && first.marker.to.family === io.family && first.marker.to.session === io.session)) {
+      throw new Lost(
+        undefined,
+        first === undefined
+          ? "GitHub does not list this take's comment yet"
+          : `a ${first.marker.to.family} session's (${first.marker.to.session}) take of it was posted first (${first.url}; if that take was abandoned before it rewrote the marker, delete that comment)`,
+      );
+    }
+    // Read again just before the rewrite, and after it: of two sessions taking at once, the one whose rewrite stands holds the claim.
+    const now = record((await call(io, stage, "GET", `${repoPath(io)}/pulls/${pr}`)).value);
+    if (text(now.state) !== "open") throw new Lost(undefined, `#${pr} was closed while this take ran`);
+    if (text((await issueOf(io, stage, number))?.state) !== "open") throw new Lost(undefined, `#${number} was closed while this take ran`);
+    if (!sameClaim(parseClaim(text(now.body)), from)) throw new Lost(parseClaim(text(now.body)));
+    // Unanswered, or failed on GitHub's side (5xx), the rewrite may have landed; refused (4xx), it did not.
+    rewritten = undefined;
+    const { status } = await request(io.api, stage, "PATCH", `${repoPath(io)}/pulls/${pr}`, io.token, { body: retakeBody(text(now.body), marker) });
+    rewritten = status >= 200 && status < 300 ? true : status >= 500 ? undefined : false;
+    if (!rewritten) throw new Failure(stage, `HTTP ${status} from PATCH ${repoPath(io)}/pulls/${pr}`);
+  } catch (error) {
+    if (rewritten === undefined) {
+      io.print(`agent-gh: rewriting #${pr}'s claim marker went unanswered or failed on GitHub's side, so whether this session took #${number} is unknown; this clone stays on ${branch}: run \`agent-gh claims\`, and switch back if it is still another session's`);
+      return UNKNOWN;
+    }
+    // A take comment whose marker was never rewritten hands nothing on (`takesOf`), but would go ahead of the next session's take (`firstTake`), so it is deleted;
+    // one whose posting went unanswered is found by its marker.
+    const mineNow = Number.isSafeInteger(posted)
+      ? [posted as number]
+      : await comments(io, stage, pr).then(
+          (items) => items.map(record).filter((item) => text(item.body) === takeBody).map((item) => item.id as number),
+          () => [],
+        );
+    for (const id of mineNow) await call(io, stage, "DELETE", `${repoPath(io)}/issues/comments/${id}`, undefined, [403, 404]).catch(() => undefined);
+    await back();
+    if (!(error instanceof Lost)) throw error;
+    if (error.why !== undefined) {
+      io.print(`agent-gh: this session took nothing from #${pr}: ${error.why}; run \`agent-gh claims\`, and take again if it is still another session's`);
+      return 1;
+    }
+    return lost(error.marker);
+  }
+  // Rewritten: the comment stays whatever follows, since a take from this session builds its chain on it.
+  // A read that still shows the previous holder's marker may lag the rewrite, so it is read again.
+  let written: ClaimMarker | undefined;
+  for (let round = 1; round <= READ_BACK_ROUNDS; round++) {
+    await io.sleep(io.recheckMs * round);
+    try {
+      const after = record((await call(io, stage, "GET", `${repoPath(io)}/pulls/${pr}`)).value);
+      // A pull request closed meanwhile holds nothing, whatever its marker says.
+      written = text(after.state) === "open" ? parseClaim(text(after.body)) : undefined;
+    } catch (error) {
+      if (!(error instanceof Failure)) throw error;
+      io.print(`agent-gh: rewrote #${pr}'s claim marker to this session, but could not read it back (${error.detail}); this clone is on ${branch}: run \`agent-gh claims\` to confirm`);
+      return UNKNOWN;
+    }
+    if (!sameClaim(written, from)) break;
+  }
+  if (sameClaim(written, from)) {
+    io.print(`agent-gh: rewrote #${pr}'s claim marker to this session, but GitHub still shows the previous holder's; this clone is on ${branch}: run \`agent-gh claims\` to confirm`);
+    return UNKNOWN;
+  }
+  if (!sameClaim(written, { family: io.family, session: io.session })) {
+    await back();
+    return lost(written);
+  }
+  io.print(`agent-gh: took #${number}'s claim from a ${from.family} session (${from.session}): draft #${pr} (${holder.url}) on ${branch}, at ${head.slice(0, 8)}; session ${io.session}`);
+  io.out(`${holder.url}\n`);
   return 0;
 };
 

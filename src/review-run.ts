@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { type GrantMarker, GRANT_LABEL, grantCommand, grantProblem, parseGrant, validTag } from "./allow.ts";
-import { parseClaim } from "./claim.ts";
+import { parseClaim, takesOf } from "./claim.ts";
 import { agentApps, REGISTRY } from "./config.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { familyNames } from "./family.ts";
@@ -1264,24 +1264,49 @@ export const commitSessions = async (io: Pick<ReviewIo, "git">, mergeBase: strin
  * trailer names another session (a session that committed onto this branch
  * instead of its own claim's) stops the review until the holder drops or
  * squashes it, or takes it on with `--adopt`, which only the holder's own
- * session may pass, and which the review's body then says. A pull request
- * without a claim marker (a person's) has no holder, and a commit with no
- * session trailer names nobody, so neither is held. Returns the commits
- * adopted, for the body.
+ * session may pass, and which the review's body then says. A commit by a
+ * session this claim was taken from (`claim --take`, whose comment on the
+ * pull request names that session and the head it took, in the chain of
+ * takes that ends at the holder) that the taken head holds is adopted
+ * without the flag, and the body says that too. A pull
+ * request without a claim marker (a person's) has no holder, and a commit
+ * with no session trailer names nobody, so neither is held. Returns the
+ * commits adopted each way, for the body.
  */
-const adoptedCommits = async (io: ReviewIo, pull: Pull, mergeBase: string, head: string, adopt: boolean): Promise<readonly string[]> => {
+export const adoptedCommits = async (
+  io: Pick<ReviewIo, "api" | "token" | "repo" | "family" | "session" | "git" | "print">,
+  pull: Pick<Pull, "number" | "body">,
+  mergeBase: string,
+  head: string,
+  adopt: boolean,
+): Promise<{ readonly adopted: readonly string[]; readonly taken: readonly string[] }> => {
   const holder = parseClaim(pull.body);
-  if (holder === undefined) return [];
-  const foreign = (await commitSessions(io, mergeBase, head)).filter((commit) => commit.session !== undefined && commit.session !== holder.session);
-  if (foreign.length === 0) return [];
-  const named = foreign.map((commit) => `${commit.sha.slice(0, 8)} (session ${commit.session})`);
+  if (holder === undefined) return { adopted: [], taken: [] };
+  const others = (await commitSessions(io, mergeBase, head)).filter((commit) => commit.session !== undefined && commit.session !== holder.session);
+  if (others.length === 0) return { adopted: [], taken: [] };
+  const takes = takesOf(await everyPage(io, "reviewing", `${repoPath(io)}/issues/${pull.number}/comments`), holder);
+  const held: CommitSession[] = [];
+  const foreign: CommitSession[] = [];
+  for (const commit of others) {
+    const before = [];
+    for (const item of takes.filter((candidate) => candidate.from.session === commit.session)) {
+      // The taken head may be gone (a force-push or rebase rewrote it): then nothing is adopted through it.
+      if ((await io.git(["merge-base", "--is-ancestor", commit.sha, item.head])) !== undefined) before.push(item);
+    }
+    (before.length > 0 ? held : foreign).push(commit);
+  }
+  const name = (commit: CommitSession) => `${commit.sha.slice(0, 8)} (session ${commit.session})`;
+  const taken = held.map(name);
+  if (taken.length > 0) io.print(`agent-gh: ${taken.length} commit(s) predate this claim's take from their session, so they are the holder's (${holder.session}): ${taken.join(", ")}`);
+  if (foreign.length === 0) return { adopted: [], taken };
+  const named = foreign.map(name);
   if (adopt) {
     if (holder.family !== io.family || holder.session !== io.session) {
       const who = io.session === undefined ? "this session, which has no id in its environment (set AGENT_GH_SESSION to the id its claim printed)" : `this ${io.family} session (${io.session})`;
       throw new Failure("reviewing", `--adopt is the claim holder's to pass (a ${holder.family} session, ${holder.session}), not ${who}; the holder adopts ${named.join(", ")}, or drops them`);
     }
     io.print(`agent-gh: --adopt takes on ${foreign.length} commit(s) not by this claim's holder (${holder.session}): ${named.join(", ")}`);
-    return named;
+    return { adopted: named, taken };
   }
   const [first] = foreign as [CommitSession, ...CommitSession[]];
   const [which, them] =
@@ -1431,7 +1456,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const tick = await ticket(io, issue);
   const effort = options.effort ?? effortFor(config, tick.labels);
   const mergeBase = await mergeBaseOf(io, target.base, head);
-  const adopted = await adoptedCommits(io, target, mergeBase, head, options.adopt === true);
+  const { adopted, taken } = await adoptedCommits(io, target, mergeBase, head, options.adopt === true);
   const author = await authoredBy(io, mergeBase, head);
   const required = Object.hasOwn(config.require, author) ? config.require[author] : undefined;
   const reviewers = reviewersToRun(config, author, options.reviewer);
@@ -1490,7 +1515,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
     };
     // The workflow's runs for an earlier family's review have long settled by the last one's, so only the last is waited for.
     if (actions && index === reviewers.length - 1) before = await headStatus(io, head);
-    const { at, reviewId, url } = await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
+    const { at, reviewId, url } = await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted, taken }, outside));
     done.push({ reviewer, review, found: { marker, at, url, ...(reviewId === undefined ? {} : { reviewId }) } });
     // A waiver John added meanwhile stands: no status is set over it.
     if (!actions && required !== undefined && index < reviewers.length - 1 && (await waiver(io, stage, await pull(io, stage, number), config)) === undefined) await setRequired(required);

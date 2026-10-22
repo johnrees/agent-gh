@@ -1262,6 +1262,8 @@ export const reviewBody = (
     readonly since: string | undefined;
     /** Commits by other sessions than the claim's holder, which `--adopt` took on, each "abc12345 (session …)". */
     readonly adopted: readonly string[];
+    /** Commits by sessions this claim was taken from (`claim --take`) that predate the take, each "abc12345 (session …)". */
+    readonly taken?: readonly string[];
   },
   outside: readonly Finding[],
 ): string => {
@@ -1270,6 +1272,7 @@ export const reviewBody = (
     reviewMarker(meta.marker),
     `**${STATUS_CONTEXT}** of ${meta.marker.head.slice(0, 8)}${meta.since === undefined ? "" : ` (changes since ${meta.since.slice(0, 8)})`} against ${meta.issue} by ${meta.reviewer.model} (${meta.reviewer.family}) at ${meta.effort}: ${review.verdict === "approve" ? "approve" : "changes requested"}; ${checksSummary(meta.checks)}`,
     ...(meta.adopted.length === 0 ? [] : ["", `Adopted as the claim holder's with \`--adopt\`: ${meta.adopted.join(", ")}.`]),
+    ...(meta.taken === undefined || meta.taken.length === 0 ? [] : ["", `Adopted as the claim holder's with its take (\`agent-gh claim --take\`): ${meta.taken.join(", ")}.`]),
     "",
     inert(review.spec),
     ...(review.findings.length === 0

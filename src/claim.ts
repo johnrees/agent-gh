@@ -24,14 +24,20 @@ export const DEFAULT_CLAIM_LABEL = "claimed";
 export type ClaimMarker = { readonly v: 1; readonly issue: number; readonly family: string; readonly session: string; readonly id: string };
 /** Releases the comment claim `id`. */
 export type ReleaseMarker = { readonly v: 1; readonly id: string };
+/** A session and its family, as a claim marker names them. */
+export type Holder = { readonly family: string; readonly session: string };
+/** On a claim pull request: `to` took the claim `id` from `from` (`claim --take`) when the branch's head was `head`. */
+export type TakeMarker = { readonly v: 1; readonly id: string; readonly from: Holder; readonly to: Holder; readonly head: string };
 
 const CLAIM = /<!-- agent-claim (\{[^\n]*?\}) -->/;
 const RELEASE = /<!-- agent-release (\{[^\n]*?\}) -->/;
+const TAKE = /<!-- agent-take (\{[^\n]*?\}) -->/;
 const ID = /^[0-9a-f]{8,64}$/;
 const WORD = /^[A-Za-z0-9_.:-]{1,100}$/;
 
 export const claimMarker = (marker: ClaimMarker): string => `<!-- agent-claim ${JSON.stringify(marker)} -->`;
 export const releaseMarker = (marker: ReleaseMarker): string => `<!-- agent-release ${JSON.stringify(marker)} -->`;
+export const takeMarker = (marker: TakeMarker): string => `<!-- agent-take ${JSON.stringify(marker)} -->`;
 
 const markerObject = (pattern: RegExp, body: string): Record<string, unknown> | undefined => {
   const match = pattern.exec(body);
@@ -56,6 +62,18 @@ export const parseClaim = (body: string): ClaimMarker | undefined => {
 export const parseRelease = (body: string): ReleaseMarker | undefined => {
   const value = markerObject(RELEASE, body);
   return value?.v === 1 && typeof value.id === "string" && ID.test(value.id) ? { v: 1, id: value.id } : undefined;
+};
+
+const holderIn = (value: unknown): Holder | undefined => {
+  const item = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+  return typeof item.family === "string" && WORD.test(item.family) && typeof item.session === "string" && WORD.test(item.session) ? { family: item.family, session: item.session } : undefined;
+};
+
+export const parseTake = (body: string): TakeMarker | undefined => {
+  const value = markerObject(TAKE, body);
+  const [from, to] = [holderIn(value?.from), holderIn(value?.to)];
+  if (value?.v !== 1 || typeof value.id !== "string" || !ID.test(value.id) || from === undefined || to === undefined) return undefined;
+  return typeof value.head === "string" && /^[0-9a-f]{40}$/.test(value.head) ? { v: 1, id: value.id, from, to, head: value.head } : undefined;
 };
 
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -225,9 +243,59 @@ export const claimBody = (marker: ClaimMarker, refs: boolean): string =>
     claimMarker(marker),
   ].join("\n");
 
-/** A claim comment's body, for an issue with no code. */
-export const claimCommentBody = (marker: ClaimMarker): string =>
-  `${claimMarker(marker)}\nA ${marker.family} session (${marker.session}) claimed this issue with \`agent-gh claim --no-pr\`; \`agent-gh release ${marker.issue}\` releases it.`;
+/** A claim comment's body, for an issue with no code; `from`, the session it took the claim from with `claim --take`. */
+export const claimCommentBody = (marker: ClaimMarker, from?: Holder): string =>
+  from === undefined
+    ? `${claimMarker(marker)}\nA ${marker.family} session (${marker.session}) claimed this issue with \`agent-gh claim --no-pr\`; \`agent-gh release ${marker.issue}\` releases it.`
+    : `${claimMarker(marker)}\nA ${marker.family} session (${marker.session}) took this issue's claim from a ${from.family} session (${from.session}) with \`agent-gh claim --take\`; \`agent-gh release ${marker.issue}\` releases it.`;
+
+/** A claim pull request's description with its marker rewritten to `marker`, as `claim --take` hands it on. */
+export const retakeBody = (body: string, marker: ClaimMarker): string => body.replace(CLAIM, () => claimMarker(marker));
+
+/** The comment `claim --take` posts on the claim pull request: who took it from whom, and the head the taker continues from. */
+export const takeCommentBody = (marker: TakeMarker): string =>
+  `${takeMarker(marker)}\nA ${marker.to.family} session (${marker.to.session}) took this claim from a ${marker.from.family} session (${marker.from.session}) with \`agent-gh claim --take\`, at ${marker.head.slice(0, 8)}; \`agent-gh review full\` takes the earlier session's commits up to there as the holder's.`;
+
+const same = (a: Holder, b: Holder) => a.family === b.family && a.session === b.session;
+
+/**
+ * The takes that handed claim `holder` on to its holder, from a pull
+ * request's comments (REST, oldest first), by people with write access as
+ * for claim comments: the latest take of its `id` to the holder, the latest
+ * before that to the session that one took it from, and so on back. A take
+ * off that chain (one that lost a race, or failed before rewriting the
+ * marker) hands nothing on.
+ */
+export const takesOf = (comments: readonly unknown[], holder: ClaimMarker): TakeMarker[] => {
+  const chain: TakeMarker[] = [];
+  let to: Holder = holder;
+  for (const comment of comments.map(record).filter((item) => TRUSTED.includes(text(item.author_association))).reverse()) {
+    const marker = parseTake(text(comment.body));
+    if (marker === undefined || marker.id !== holder.id || !same(marker.to, to)) continue;
+    chain.unshift(marker);
+    to = marker.from;
+  }
+  return chain;
+};
+
+/**
+ * Of the takes of `holder`'s claim from its holder, posted since a take made
+ * it the holder (or since the claim opened), the comment id of the first,
+ * by people with write access, its URL, and its marker: the one take that goes ahead
+ * when several sessions take the same claim at once. Undefined when none is
+ * listed.
+ */
+export const firstTake = (comments: readonly unknown[], holder: ClaimMarker): { readonly id: number; readonly url: string; readonly marker: TakeMarker } | undefined => {
+  const takes = comments
+    .map(record)
+    .filter((item) => TRUSTED.includes(text(item.author_association)))
+    .flatMap((item) => {
+      const marker = parseTake(text(item.body));
+      return marker === undefined || marker.id !== holder.id ? [] : [{ id: integer(item.id), url: text(item.html_url), marker }];
+    });
+  const since = takes.findLastIndex((item) => same(item.marker.to, holder));
+  return takes.slice(since + 1).find((item) => same(item.marker.from, holder));
+};
 
 export const releaseCommentBody = (marker: ReleaseMarker): string => `${releaseMarker(marker)}\nReleased the claim above.`;
 
@@ -260,12 +328,13 @@ export type ClaimArgs =
   | { readonly command: "claim"; readonly issue: number; readonly refs: boolean; readonly noPr: boolean }
   | { readonly command: "claim-next"; readonly refs: boolean; readonly noPr: boolean; readonly rules: LabelRules }
   | { readonly command: "next"; readonly json: boolean; readonly waves: boolean; readonly rules: LabelRules }
+  | { readonly command: "take"; readonly issue: number }
   | { readonly command: "release"; readonly issue: number }
   | { readonly command: "claims"; readonly json: boolean }
   | { readonly command: "sync"; readonly issues: readonly number[] };
 
 /**
- * `claim N|--next [--refs|--no-pr]`, `release N`, `claims [--json]`,
+ * `claim N|--next [--refs|--no-pr]`, `claim --take N`, `release N`, `claims [--json]`,
  * `claims sync [--issue N]...`, `next [--json] [--waves]`, each with an
  * optional `-R repo`; undefined when they do not parse. `next` and
  * `claim --next` also take `--skip-label`, `--require-label`, and
@@ -294,6 +363,10 @@ export const parseClaimArgs = (command: string, args: readonly string[]): ClaimA
   if (labelFlags > 0 && !takesLabels) return undefined;
   if (command === "claim") {
     const issues = words.filter((word) => !word.startsWith("-"));
+    if (words.includes("--take")) {
+      const issue = number(words.filter((word) => word !== "--take")[0]);
+      return issue === undefined || words.length !== 2 ? undefined : { command: "take", issue };
+    }
     const next = words.includes("--next");
     const flags = words.filter((word) => word.startsWith("-") && word !== "--next");
     if (next) {
