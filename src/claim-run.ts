@@ -509,6 +509,7 @@ export const take = async (io: ClaimIo, number: number): Promise<number> => {
     // Read again just before the rewrite, and after it: of two sessions taking at once, the one whose rewrite stands holds the claim.
     const now = record((await call(io, stage, "GET", `${repoPath(io)}/pulls/${pr}`)).value);
     if (text(now.state) !== "open") throw new Lost(undefined, `#${pr} was closed while this take ran`);
+    if (text((await issueOf(io, stage, number))?.state) !== "open") throw new Lost(undefined, `#${number} was closed while this take ran`);
     if (!sameClaim(parseClaim(text(now.body)), from)) throw new Lost(parseClaim(text(now.body)));
     // Unanswered, or failed on GitHub's side (5xx), the rewrite may have landed; refused (4xx), it did not.
     rewritten = undefined;

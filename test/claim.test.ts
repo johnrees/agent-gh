@@ -705,6 +705,15 @@ test("claim --take of a pull request claim refuses uncommitted changes, and a lo
   expect(b.printed.at(-1)).toBe("agent-gh: #31's claim changed while this take read it; run `agent-gh claims` and take again if it is still another session's");
   expect(sent(w.fake, "POST", `${PATH}/issues/31/comments`)).toHaveLength(1);
   w.routes[`GET ${PATH}/pulls/31`] = read;
+  // An issue closed while the take ran has no claim to take.
+  const issue7 = w.routes[`GET ${PATH}/issues/7`] as (body: string, url: URL) => Response;
+  let issueReads = 0;
+  w.routes[`GET ${PATH}/issues/7`] = (body, url) => (++issueReads === 2 ? reply(200, { ...OPEN, state: "closed", labels: [] }) : issue7(body, url));
+  expect(await take(b.io, 7)).toBe(1);
+  expect(b.printed.at(-1)).toBe("agent-gh: this session took nothing from #31: #7 was closed while this take ran; run `agent-gh claims`, and take again if it is still another session's");
+  expect(parseClaim(w.state.pulls[0]?.body ?? "")?.session).toBe("s-one");
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("main");
+  w.routes[`GET ${PATH}/issues/7`] = issue7;
   // Another session's rewrite landing over this one's: the take stands down and puts the clone back, keeping its comment, on which a take from this session would chain.
   w.routes[`PATCH ${PATH}/pulls/31`] = () => {
     opened.body = `Closes #7.\n${marker(7, "glm", "s-three", parseClaim(opened.body)?.id)}`;
@@ -712,7 +721,7 @@ test("claim --take of a pull request claim refuses uncommitted changes, and a lo
   };
   expect(await take(b.io, 7)).toBe(1);
   expect(b.printed.at(-1)).toBe("agent-gh: #31's claim went to a glm session (s-three) while this take ran, so this session did not take it; run `agent-gh claims`");
-  expect(w.fake.log.filter((entry) => entry.method === "DELETE")).toHaveLength(1);
+  expect(w.fake.log.filter((entry) => entry.method === "DELETE")).toHaveLength(2);
   expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("main");
 });
 
