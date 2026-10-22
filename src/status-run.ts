@@ -70,15 +70,25 @@ const pullCommits = async (io: ApiIo, number: number): Promise<Record<string, un
 const message = (commit: Record<string, unknown>): string => text(record(commit.commit).message);
 
 /**
+ * A commit message's `Co-authored-by` trailers, as git reads trailers: only
+ * from its last paragraph, and only when every line there is a trailer (or
+ * continues one), so an example in the body credits no one.
+ */
+export const coAuthorTrailers = (body: string): string[] => {
+  const paragraphs = body.replace(/\r\n/g, "\n").trim().split(/\n[ \t]*\n/);
+  const last = paragraphs.length < 2 ? [] : (paragraphs.at(-1) as string).split("\n");
+  if (last.length === 0 || !last.every((line) => /^[A-Za-z0-9-]+:\s/.test(line) || /^[ \t]+\S/.test(line))) return [];
+  return last.flatMap((line) => /^Co-authored-by:\s*(.+)$/i.exec(line)?.[1]?.trim() ?? []);
+};
+
+/**
  * The family App every commit but a merge credits as co-author, as `review
  * full` reads its author (`authorFamily`); undefined for none, a mix, or
  * commits GitHub did not list in full.
  */
 const commitsAuthor = (commits: readonly Record<string, unknown>[] | undefined, apps: readonly AgentApp[]): string | undefined => {
   if (commits === undefined) return undefined;
-  const credits = commits
-    .filter((commit) => !(Array.isArray(commit.parents) && commit.parents.length > 1))
-    .map((commit) => message(commit).split(/\r?\n/).flatMap((line) => /^Co-authored-by:\s*(.+)$/i.exec(line)?.[1] ?? []));
+  const credits = commits.filter((commit) => !(Array.isArray(commit.parents) && commit.parents.length > 1)).map((commit) => coAuthorTrailers(message(commit)));
   return authorFamily(credits, Object.fromEntries(apps.map((app) => [app.family, app.bot])));
 };
 

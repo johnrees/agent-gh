@@ -29,7 +29,7 @@ import {
   reviewStatus,
   validMarkers,
 } from "../src/status.ts";
-import { deriveStatuses, statusCommand, type StatusIo, writeStatuses } from "../src/status-run.ts";
+import { coAuthorTrailers, deriveStatuses, statusCommand, type StatusIo, writeStatuses } from "../src/status-run.ts";
 import { awaitingOwner, notifyMarker, parseNotify, parseReply, replyMarker, requiredComments, type ThreadComment, threadsStatus } from "../src/threads.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
 
@@ -193,6 +193,14 @@ test("agent-review where require names the author: every required family's revie
   // A person's waiver still stands, and an agent's pull request is judged at all only when it is one.
   expect(reviewStatus({ ...base, waivedBy: "johnrees", required: required(undefined, undefined) })).toMatchObject({ state: "success", description: "waived by johnrees" });
   expect(reviewStatus({ ...base, agent: false, required: required(undefined, undefined) })).toMatchObject({ state: "success", description: "not an agent PR" });
+});
+
+test("a commit's co-authors are its trailers, as git reads them: the last paragraph, all trailers; an example in the body credits no one", () => {
+  expect(coAuthorTrailers(credits("glm"))).toEqual(["johnrees-glm[bot] <1+johnrees-glm[bot]@users.noreply.github.com>"]);
+  expect(coAuthorTrailers("Fix\r\n\r\nCo-Authored-By: Claude <noreply@anthropic.com>\r\n")).toEqual(["Claude <noreply@anthropic.com>"]);
+  expect(coAuthorTrailers("Fix\n\nCo-authored-by: johnrees-codex[bot] <x>\n\nMore prose after the example.")).toEqual([]);
+  expect(coAuthorTrailers("Fix\n\nCo-authored-by: johnrees-codex[bot] <x>\nnot a trailer")).toEqual([]);
+  expect(coAuthorTrailers("Co-authored-by: johnrees-codex[bot] <x>")).toEqual([]);
 });
 
 test("the workflow reads the author from the commits' one co-credited family App, else from the latest marker that records one", () => {
@@ -535,6 +543,10 @@ test("where require names the author, the workflow needs each required family's 
   // Each family's latest review of the head counts, so Claude's later block stands over its earlier approval, and Codex's over nothing of Claude's.
   const claudeBlocks = reviewOf(marker({ reviewer: "claude", verdict: "changes_requested", author: "glm" }), at(3));
   expect(await state(glm, [claude, codex, claudeBlocks])).toMatchObject({ state: "failure", description: "claude blocks: changes requested; checks passed" });
+  // An App named in a commit's body, not its trailers, credits no one: the marker's author, glm, decides.
+  expect(await state(["Fix\n\nCo-authored-by: johnrees-codex[bot] <x>\n\nAn example, not a trailer.\n\nAgent-Harness: pi"], [codex])).toMatchObject({
+    state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed",
+  });
   // Commits that credit no single App: the author the latest marker records.
   expect(await state([credits("glm"), credits("codex")], [codex])).toMatchObject({ state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed" });
   // Codex's work, which require does not name, is judged on one review, as before.

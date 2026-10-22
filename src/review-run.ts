@@ -1438,6 +1438,21 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   const base: PullBase = { ref: target.base, sha: mergeBase };
   const checks: ChecksResult = config.checks.length === 0 ? { state: "not run" } : await inClone(io, head, (cwd) => runChecks(io, config, cwd, base), base);
   const done: { readonly reviewer: Reviewer; readonly review: Review; readonly marker: ReviewMarker }[] = [];
+  /**
+   * Where `require` names the author and agent-gh sets the status: every
+   * required family's latest review of this head, this run's and those
+   * posted before it, set after each review is posted, so a later reviewer
+   * that fails never leaves an earlier success over a block just posted.
+   */
+  const setRequired = async (families: readonly ReviewerFamily[]): Promise<void> => {
+    const posted = validMarkers(await markerPosts(io, stage, number), await repoOwner(io, stage), agentApps());
+    const reviews = families.map((family): FamilyReview => {
+      const mine = done.find((entry) => entry.reviewer.family === family);
+      return { family, current: mine === undefined ? markerFor(posted, head, family) : { marker: mine.marker, at: "", url: "" }, carried: undefined };
+    });
+    const status = requiredStatus(number, reviews, config);
+    await setStatus(io, head, status.state === "success" ? "success" : "failure", status.description);
+  };
   let before: CommitStatus | undefined;
   for (const [index, reviewer] of reviewers.entries()) {
     io.print(`agent-gh: ${checksSummary(checks)}; ${reviewer.model} (${reviewer.family}) at ${effort} is reviewing #${number} against ${tick.ref}`);
@@ -1457,6 +1472,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
     if (actions && index === reviewers.length - 1) before = await headStatus(io, head);
     await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
     done.push({ reviewer, review, marker });
+    if (!actions && required !== undefined && index < reviewers.length - 1) await setRequired(required);
   }
   // A waiver John added while the review ran stands: the labels are read afresh, and the verdict never overwrites it.
   let waived: string | undefined;
@@ -1468,14 +1484,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
     if (required === undefined) {
       await setStatus(io, head, reviewState(only.marker, config), `${outcomeSummary(only.marker, config, checksSummary(checks))}: ${only.review.findings.length} finding(s) by ${only.reviewer.model} at ${effort}`);
     } else {
-      // Every required family's latest review of this head counts: this run's, and those posted before it.
-      const posted = validMarkers(await markerPosts(io, stage, number), await repoOwner(io, stage), agentApps());
-      const reviews = required.map((family): FamilyReview => {
-        const mine = done.find((entry) => entry.reviewer.family === family);
-        return { family, current: mine === undefined ? markerFor(posted, head, family) : { marker: mine.marker, at: "", url: "" }, carried: undefined };
-      });
-      const status = requiredStatus(number, reviews, config);
-      await setStatus(io, head, status.state === "success" ? "success" : "failure", status.description);
+      await setRequired(required);
     }
   }
   if (waived === undefined && checksBlock(checks.state, config.checks.length > 0) !== undefined) {

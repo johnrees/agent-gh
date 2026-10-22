@@ -1481,16 +1481,22 @@ test("glm's work, where require names codex and claude, gets one review from eac
   const printed = JSON.parse(w.output()) as { reviewer: string; verdict: string; findings: { id: string }[] }[];
   expect(printed.map((review) => [review.reviewer, review.verdict, review.findings.length])).toEqual([["codex", "approve", 0], ["claude", "changes_requested", 1]]);
   expect(parseFinding((reviews[1]?.comments as { body: string }[])[0]?.body ?? "")?.id).toBe(printed[1]?.findings[0]?.id as string);
-  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)).toEqual([
-    { state: "failure", context: "agent-review", description: "claude blocks: changes requested; checks passed" },
-  ]);
+  // Set after each review: Codex's approval alone still awaits Claude's.
+  const awaiting = { state: "failure", context: "agent-review", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed" };
+  expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)).toEqual([awaiting, { state: "failure", context: "agent-review", description: "claude blocks: changes requested; checks passed" }]);
 
   const approve = { verdict: "approve", spec: "Done.", findings: [] };
   const passed = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answer: approve });
   await reviewFull(passed.io, {});
   expect(posted(passed.fake, `${REPO}/statuses/${HEAD}`)).toEqual([
-    { state: "success", context: "agent-review", description: "codex and claude passed: codex approved; checks passed. claude approved; checks passed" },
+    awaiting, { state: "success", context: "agent-review", description: "codex and claude passed: codex approved; checks passed. claude approved; checks passed" },
   ]);
+
+  // A later reviewer that fails leaves the status the earlier review set, never one from before it: a block just posted stands.
+  const blocked = { verdict: "changes_requested", spec: "No.", findings: [] };
+  const broken = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answers: { codex: blocked, claude: "not json" }, status: [{ context: "agent-review", state: "success" }] });
+  expect(await gateRefusal(reviewFull(broken.io, {}))).toBe("the claude reviewer's answer is not JSON");
+  expect(posted(broken.fake, `${REPO}/statuses/${HEAD}`)).toEqual([{ state: "failure", context: "agent-review", description: "codex blocks: changes requested; checks passed; claude yet to review" }]);
 });
 
 test("--reviewer reruns one required family; the status still needs every required family's latest review of this head", async () => {
