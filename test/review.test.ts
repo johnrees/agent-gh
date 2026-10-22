@@ -327,7 +327,8 @@ type World = {
   rules?: unknown[];
   branch?: unknown;
   checkRuns?: unknown[];
-  workflowRuns?: unknown[];
+  /** The head's Actions workflow runs (one completed pull_request run of suite 1 unless given), or how GitHub answers for them. */
+  workflowRuns?: unknown[] | ((url: URL) => Response);
   /** The pull request's reviews, and its comments on lines. */
   reviews?: unknown[];
   /** Reviews GitHub lists as well once a status has been set, as when a concurrent run posts one meanwhile. */
@@ -348,6 +349,9 @@ type World = {
   session?: string | null;
 };
 
+/** Suite 1's workflow run: workflow 1, started by a pull request, completed. The fixtures' Actions check runs are its jobs. */
+const WORKFLOW_RUN = { check_suite_id: 1, workflow_id: 1, event: "pull_request", status: "completed" };
+
 /** The page of `items` a request asks for, as GitHub pages them (all of them when it names no page). */
 const page = <T>(items: readonly T[], url: URL): T[] => {
   const size = Number(url.searchParams.get("per_page") ?? items.length);
@@ -365,7 +369,7 @@ const PATCH_ID = "c".repeat(40);
 const world = ({
   head = HEAD, labels = [], labelsLater, status = [], events = [], optedIn = true, config = EXAMPLE, answer, answers = {}, closes = "johnrees/widget", upstream = true,
   commitPulls = [{ number: 12, state: "open", head: { sha: HEAD } }], branchPulls = [{ number: 12, state: "open" }], family = "claude",
-  coAuthors = [[bot("claude")], [bot("claude")]], checkResults = [], reviewReplies = [], postedReviews = [], rules = [], branch = { protected: false }, checkRuns = [], workflowRuns = [],
+  coAuthors = [[bot("claude")], [bot("claude")]], checkResults = [], reviewReplies = [], postedReviews = [], rules = [], branch = { protected: false }, checkRuns = [], workflowRuns = [WORKFLOW_RUN],
   statusLater = [], comments = [], issueComments = [{ id: 70, body: "Last word.", user: { login: "someone" }, created_at: "2026-10-01T00:00:00Z" }], reactions = {},
   reviews = [], reviewsAfterStatus = [], lineComments = [], ancestors = [], base = "main", issueLabels = ["model:fable-astra"], issueEvents = [], pullBody = "Closes #7.", sessions = [], session = "s-one",
 }: World = {}) => {
@@ -401,7 +405,7 @@ const world = ({
       const runs = checkRuns.filter((run) => (run as { name: string }).name === url.searchParams.get("check_name"));
       return reply(200, { total_count: runs.length, check_runs: page(runs, url) });
     },
-    [`GET ${REPO}/actions/runs`]: (_, url) => reply(200, { total_count: workflowRuns.length, workflow_runs: page(workflowRuns, url) }),
+    [`GET ${REPO}/actions/runs`]: (_, url) => (typeof workflowRuns === "function" ? workflowRuns(url) : reply(200, { total_count: workflowRuns.length, workflow_runs: page(workflowRuns, url) })),
     [`GET ${REPO}/rules/branches/main`]: () => reply(200, rules),
     [`GET ${REPO}/branches/main`]: () => reply(200, branch),
     [`GET ${REPO}/rules/branches/release`]: () => reply(200, rules),
@@ -1215,7 +1219,7 @@ test("gh pr merge names its pull request as gh does, skipping flag values, and -
 });
 
 const REQUIRED = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "build", integration_id: 15368 }, { context: "agent-review" }] } }];
-const PASSED = { status: [{ context: "agent-review", state: "success" }], checkRuns: [{ name: "build", status: "completed", conclusion: "success", app: { id: 15368 } }] };
+const PASSED = { status: [{ context: "agent-review", state: "success" }], checkRuns: [{ name: "build", status: "completed", conclusion: "success", app: { id: 15368 }, check_suite: { id: 1 } }] };
 
 const mergeDeps = (io: ReviewIo, calls: string[], files: Record<string, string> = {}): GhDispatch => ({
   withToken: async (_, use) => use({ GH_TOKEN: "t" }),
@@ -1235,7 +1239,7 @@ const mergeDeps = (io: ReviewIo, calls: string[], files: Record<string, string> 
 test("an agent's gh pr merge runs only once every check the base branch requires has passed on the head", async () => {
   const here = parseRepo("johnrees/widget");
   const calls: string[] = [];
-  const unmet = world({ rules: REQUIRED, status: [{ context: "agent-review", state: "failure" }], checkRuns: [{ name: "build", status: "in_progress", conclusion: null, app: { id: 15368 } }] });
+  const unmet = world({ rules: REQUIRED, status: [{ context: "agent-review", state: "failure" }], checkRuns: [{ name: "build", status: "in_progress", conclusion: null, app: { id: 15368 }, check_suite: { id: 1 } }] });
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--squash"], here, mergeDeps(unmet.io, calls)))).toBe(
     "pull request #12's head aaaaaaaa has not passed every check main requires (`build` pending, `agent-review` failed); wait for them to pass, fix what fails, or merge with `--auto`, which GitHub completes once they pass",
   );
@@ -1259,7 +1263,7 @@ test("an agent may turn on auto-merge while checks are pending or failing, bound
   // GitHub holds auto-merge until the required checks pass, even for a bypass actor (checked live).
   const here = parseRepo("johnrees/widget");
   const calls: string[] = [];
-  const failing = world({ rules: REQUIRED, status: [{ context: "agent-review", state: "failure" }], checkRuns: [{ name: "build", status: "completed", conclusion: "failure", app: { id: 15368 } }] });
+  const failing = world({ rules: REQUIRED, status: [{ context: "agent-review", state: "failure" }], checkRuns: [{ name: "build", status: "completed", conclusion: "failure", app: { id: 15368 }, check_suite: { id: 1 } }] });
   expect(await dispatchGh(["pr", "merge", "12", "--auto", "--squash"], here, mergeDeps(failing.io, calls))).toBe(0);
   expect(calls).toEqual([`gh pr merge 12 --auto --squash --match-head-commit ${HEAD}`]);
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12", "--auto", "--admin"], here, mergeDeps(failing.io, calls)))).toContain("an agent never merges with `--admin`");
@@ -1293,8 +1297,8 @@ test("a required check tied to GitHub Actions is met by a status its bot set (th
 test("the merge guard reads every page of statuses and check runs", async () => {
   const calls: string[] = [];
   const here = parseRepo("johnrees/widget");
-  const passing = Array.from({ length: 150 }, () => ({ name: "build", status: "completed", conclusion: "success", app: { id: 15368 } }));
-  const late = world({ rules: REQUIRED, status: [...Array.from({ length: 120 }, (_, n) => ({ context: `other-${n}`, state: "success" })), { context: "agent-review", state: "success" }], checkRuns: [...passing, { name: "build", status: "completed", conclusion: "failure", app: { id: 15368 } }] });
+  const passing = Array.from({ length: 150 }, () => ({ name: "build", status: "completed", conclusion: "success", app: { id: 15368 }, check_suite: { id: 1 } }));
+  const late = world({ rules: REQUIRED, status: [...Array.from({ length: 120 }, (_, n) => ({ context: `other-${n}`, state: "success" })), { context: "agent-review", state: "success" }], checkRuns: [...passing, { name: "build", status: "completed", conclusion: "failure", app: { id: 15368 }, check_suite: { id: 1 } }] });
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(late.io, calls)))).toContain("(`build` failed)");
   expect(calls).toEqual([]);
 });
@@ -1305,11 +1309,51 @@ test("the merge guard judges a check by its workflow's newest run (penmon #387)"
   const build = (conclusion: string, id: number, suite: number) => ({ name: "build", status: "completed", conclusion, app: { id: 15368 }, id, check_suite: { id: suite } });
   const status = [{ context: "agent-review", state: "success" }];
   const draftThenReady = [build("failure", 1, 10), build("success", 2, 20)];
-  const sameWorkflow = [{ check_suite_id: 10, workflow_id: 1 }, { check_suite_id: 20, workflow_id: 1 }];
+  const workflowRun = (suite: number, workflow: number, event = "pull_request", done = "completed") => ({ check_suite_id: suite, workflow_id: workflow, event, status: done });
+  const sameWorkflow = [workflowRun(10, 1), workflowRun(20, 1)];
   expect(await dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: REQUIRED, status, checkRuns: draftThenReady, workflowRuns: sameWorkflow }).io, calls))).toBe(0);
   // The same runs from two workflows: the failure still counts.
-  const twoWorkflows = [{ check_suite_id: 10, workflow_id: 1 }, { check_suite_id: 20, workflow_id: 2 }];
+  const twoWorkflows = [workflowRun(10, 1), workflowRun(20, 2)];
   expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: REQUIRED, status, checkRuns: draftThenReady, workflowRuns: twoWorkflows }).io, calls)))).toContain("(`build` failed)");
+  // A dispatched run's pass does not supersede the pull request run's failure.
+  const dispatched = [workflowRun(10, 1), workflowRun(20, 1, "workflow_dispatch")];
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: REQUIRED, status, checkRuns: draftThenReady, workflowRuns: dispatched }).io, calls)))).toContain("(`build` failed)");
+  // A dispatched run's pass alone is no run GitHub counts.
+  const alone = await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: REQUIRED, status, checkRuns: [build("success", 2, 20)], workflowRuns: dispatched }).io, calls)));
+  expect(alone).toContain("(`build` missing (no run GitHub counts: a job counts only from a push, pull_request,");
+  // Even one run needs its workflow run: a scheduled run's pass is missing too.
+  const scheduled = [workflowRun(20, 1, "schedule")];
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: REQUIRED, status, checkRuns: [build("success", 2, 20)], workflowRuns: scheduled }).io, calls)))).toContain("(`build` missing");
+  // A newer pull request run of the workflow, still in progress and without the job yet, holds the check pending.
+  const newer = [workflowRun(20, 1), workflowRun(30, 1, "pull_request", "in_progress")];
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: REQUIRED, status, checkRuns: draftThenReady, workflowRuns: newer }).io, calls)))).toContain("(`build` pending)");
+  expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD}`]);
+});
+
+test("the merge guard reads every page of the head's workflow runs, and fails closed on an error or a short page", async () => {
+  const calls: string[] = [];
+  const here = parseRepo("johnrees/widget");
+  const status = [{ context: "agent-review", state: "success" }];
+  const build = (conclusion: string, suite: number) => ({ name: "build", status: "completed", conclusion, app: { id: 15368 }, check_suite: { id: suite } });
+  // 150 other workflow runs first: the build's two runs are on the second page, the dispatched one after the pull request's.
+  const others = Array.from({ length: 150 }, (_, n) => ({ check_suite_id: 1000 + n, workflow_id: 9, event: "push", status: "completed" }));
+  const runs = [...others, { check_suite_id: 10, workflow_id: 1, event: "pull_request", status: "completed" }, { check_suite_id: 20, workflow_id: 1, event: "workflow_dispatch", status: "completed" }];
+  const paged = world({ rules: REQUIRED, status, checkRuns: [build("failure", 10), build("success", 20)], workflowRuns: runs });
+  expect(await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(paged.io, calls)))).toContain("(`build` failed)");
+  const pass = world({ rules: REQUIRED, status, checkRuns: [build("success", 10)], workflowRuns: runs });
+  expect(await dispatchGh(["pr", "merge", "12"], here, mergeDeps(pass.io, calls))).toBe(0);
+  expect(pass.fake.log.filter((entry) => entry.path === `${REPO}/actions/runs`).length).toBe(2);
+  // A page short of the total, an error, or an answer without the list refuses the merge.
+  const short = (url: URL) => reply(200, { total_count: runs.length + 5, workflow_runs: page(runs, url) });
+  for (const [answer, why] of [
+    [short, "/actions/runs lists fewer results than its total"],
+    [() => reply(500, {}), "/actions/runs"],
+    [() => reply(200, { total_count: 1 }), "/actions/runs: invalid response"],
+  ] as const) {
+    const refusal = await gateRefusal(dispatchGh(["pr", "merge", "12"], here, mergeDeps(world({ rules: REQUIRED, status, checkRuns: [build("success", 10)], workflowRuns: answer }).io, calls)));
+    expect(refusal).toContain(why);
+    expect(refusal).not.toContain("has not passed");
+  }
   expect(calls).toEqual([`gh pr merge 12 --match-head-commit ${HEAD}`]);
 });
 

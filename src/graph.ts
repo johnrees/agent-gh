@@ -10,7 +10,7 @@
  * a milestone is a group, and a **When done, update** line is prose.
  */
 import { type Claim, emptyClaim, taken } from "./claim.ts";
-import { type CheckState, checkState, type RequiredCheck } from "./merge.ts";
+import { type CheckState, checkState, type RequiredCheck, type WorkflowRuns } from "./merge.ts";
 import { type Blocker, labelFilter, type LabelRules, type Node, type SkippedBy, waves } from "./next.ts";
 import type { QueueConfig } from "./next-run.ts";
 import { type Repo, slug } from "./repo.ts";
@@ -59,8 +59,8 @@ export type GraphPull = PullRef & {
   readonly statuses: readonly Record<string, unknown>[];
   /** The head's check runs, as REST lists them (name, status, conclusion, app, check_suite). */
   readonly runs: readonly Record<string, unknown>[];
-  /** Each check suite's Actions workflow, for `checkState`. */
-  readonly workflows: ReadonlyMap<number, number>;
+  /** Each check suite's Actions workflow run, for `checkState`. */
+  readonly workflows: WorkflowRuns;
 };
 
 export type GraphIssue = {

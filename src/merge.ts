@@ -42,50 +42,94 @@ export type CheckState = "passed" | "failed" | "pending" | "missing";
 
 const PASSING = ["success", "neutral", "skipped"];
 
+/** GitHub Actions' App: its check runs are workflow jobs, and its bot sets a workflow's statuses. */
+export const ACTIONS_APP = 15368;
+
 /**
- * The check runs a required check is judged by. An Actions workflow's runs
- * count only from its newest workflow run: the check suite with the highest
- * id (`workflows` maps a suite's id to its workflow's id), since suites are
- * created with their workflow run while a run's own id dates only its job.
- * So a draft's failed run gives way to the ready pull request's run of that
- * workflow, while two workflows with the same job name are judged
- * separately. Other runs (another App's, or a suite of no known workflow)
- * are never superseded.
+ * The events whose workflow runs' jobs GitHub evaluates for required checks
+ * ("Checks from some workflow jobs are not evaluated", GitHub's
+ * troubleshooting required status checks). A job's check from any other
+ * (`workflow_dispatch`, `schedule`, `repository_dispatch`, …) never
+ * satisfies one, and agents can start those runs.
  */
-const current = (runs: Record<string, unknown>[], workflows: ReadonlyMap<number, number>): Record<string, unknown>[] => {
-  const suiteOf = (run: Record<string, unknown>) => record(run.check_suite).id as number;
-  const workflowOf = (run: Record<string, unknown>) => (Number.isSafeInteger(record(run.check_suite).id) ? workflows.get(suiteOf(run)) : undefined);
+export const REQUIRED_CHECK_EVENTS: readonly string[] = ["push", "pull_request", "pull_request_review", "pull_request_target", "deployment", "deployment_status"];
+
+/** An Actions workflow run on the commit: its workflow's id, the event that started it, and whether it has completed. */
+export type WorkflowRun = { readonly workflow: number; readonly event: string; readonly completed: boolean };
+
+/** Each workflow run's check suite id, mapped to that run. */
+export type WorkflowRuns = ReadonlyMap<number, WorkflowRun>;
+
+/** A required check's runs as GitHub counts them, and whether a workflow's newest run is still to report it or finished without it. */
+type Counted = { readonly runs: Record<string, unknown>[]; readonly awaited: boolean; readonly dropped: boolean };
+
+/**
+ * The check runs a required check is judged by. Another App's runs all
+ * count. An Actions run (a workflow job) counts only when its workflow run
+ * was started by one of `REQUIRED_CHECK_EVENTS`, and only from its
+ * workflow's newest such run: the check suite with the highest id, since
+ * suites are created with their workflow run (a re-run keeps its suite)
+ * while a run's own id dates only its job. So a draft's failed run gives way
+ * to the ready pull request's run of that workflow, two workflows with the
+ * same job name are judged separately, and a dispatched run neither passes,
+ * fails, nor supersedes. When that newest run has not reported the job, the
+ * older run's job counts for nothing: the check is `awaited` while the run
+ * is in progress, and `dropped` once it finished without it (GitHub would
+ * likely still judge the older job; the guard refuses instead). An Actions
+ * run whose workflow run is not in `workflows` (not listed yet) is
+ * `awaited`, so the guard fails closed.
+ */
+const counted = (runs: Record<string, unknown>[], workflows: WorkflowRuns): Counted => {
   const newest = new Map<number, number>();
+  for (const [suite, run] of workflows) if (REQUIRED_CHECK_EVENTS.includes(run.event)) newest.set(run.workflow, Math.max(newest.get(run.workflow) ?? 0, suite));
+  const kept: Record<string, unknown>[] = [];
+  const superseded = new Set<number>();
+  let awaited = false;
   for (const run of runs) {
-    const workflow = workflowOf(run);
-    if (workflow !== undefined) newest.set(workflow, Math.max(newest.get(workflow) ?? 0, suiteOf(run)));
+    if (record(run.app).id !== ACTIONS_APP) {
+      kept.push(run);
+      continue;
+    }
+    const suite = record(run.check_suite).id;
+    const workflowRun = Number.isSafeInteger(suite) ? workflows.get(suite as number) : undefined;
+    if (workflowRun === undefined) awaited = true;
+    else if (!REQUIRED_CHECK_EVENTS.includes(workflowRun.event)) continue;
+    else if (suite === newest.get(workflowRun.workflow)) kept.push(run);
+    else superseded.add(workflowRun.workflow);
   }
-  return runs.filter((run) => {
-    const workflow = workflowOf(run);
-    return workflow === undefined || suiteOf(run) === newest.get(workflow);
-  });
+  let dropped = false;
+  for (const workflow of superseded) {
+    const suite = newest.get(workflow) as number;
+    if (kept.some((run) => record(run.check_suite).id === suite)) continue;
+    if (workflows.get(suite)?.completed === true) dropped = true;
+    else awaited = true;
+  }
+  return { runs: kept, awaited, dropped };
 };
 
 /**
  * Whether a commit passed a required check, from its statuses, latest first,
- * and the check runs named `check.context` (the latest of each suite). Every
- * current run (see `current`) must pass. A check tied to an App counts only that App's
- * check runs and statuses: for one, `statuses` must give each status's
- * `app_id` (the App whose bot set it), and a status without it never counts.
+ * and the check runs named `check.context` (the latest of each suite), with
+ * the commit's Actions workflow runs (`workflows`) to judge an Actions run
+ * by (see `counted`). Every counted run must pass. A check tied to an App
+ * counts only that App's check runs and statuses: for one, `statuses` must
+ * give each status's `app_id` (the App whose bot set it), and a status
+ * without it never counts. A check whose workflow's newest run finished
+ * without it is `missing`, whatever else passed.
  */
-export const checkState = (check: RequiredCheck, statuses: unknown, runs: unknown, workflows: ReadonlyMap<number, number> = new Map()): CheckState => {
-  const matching = current(
+export const checkState = (check: RequiredCheck, statuses: unknown, runs: unknown, workflows: WorkflowRuns): CheckState => {
+  const { runs: matching, awaited, dropped } = counted(
     list(runs)
       .map(record)
       .filter((run) => run.name === check.context && (check.app === undefined || record(run.app).id === check.app)),
     workflows,
   );
   const status = list(statuses).map(record).find((entry) => entry.context === check.context && (check.app === undefined || entry.app_id === check.app));
-  if (matching.length === 0 && status === undefined) return "missing";
   if (matching.some((run) => run.status === "completed" && !PASSING.includes(run.conclusion as string))) return "failed";
   if (status !== undefined && (status.state === "failure" || status.state === "error")) return "failed";
-  if (matching.some((run) => run.status !== "completed")) return "pending";
+  if (awaited || matching.some((run) => run.status !== "completed")) return "pending";
   if (status !== undefined && status.state !== "success") return "pending";
+  if (dropped || (matching.length === 0 && status === undefined)) return "missing";
   return "passed";
 };
 
