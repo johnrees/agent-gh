@@ -554,6 +554,10 @@ test("where require names the author, the workflow needs each required family's 
   });
   // Commits that credit no single App: the author the latest marker records.
   expect(await state([credits("glm"), credits("codex")], [codex])).toMatchObject({ state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed" });
+  // Nothing says whose work it is (commits that credit no single App, a marker from a release that records no author): it fails closed, never passing on one review.
+  expect(await state([credits("glm"), credits("codex")], [reviewOf(marker({ reviewer: "codex" }), at(1))])).toMatchObject({
+    state: "pending", description: "needs a review that records its author, for require: run `gh pr checkout 12 && agent-gh review full --pr 12`",
+  });
   // Codex's work, which require does not name, is judged on one review, as before.
   expect(await state([credits("codex")], [reviewOf(marker({ reviewer: "claude", author: "codex" }), at(1))])).toMatchObject({ state: "success", description: "approved; checks passed (claude review)" });
 });

@@ -265,11 +265,14 @@ export const deriveStatuses = async (io: StatusIo, number: number): Promise<Deri
   const owner = await repoOwner(io, STAGE);
   const waivedBy = await waiver(io, STAGE, pr, config);
   const markers = validMarkers(await markerPosts(io, STAGE, number), owner, apps);
-  // The author matters only where require names some.
-  const author = Object.keys(config.require).length === 0 ? undefined : pullAuthor(await commitsAuthor(io, commits, apps), markers);
+  // The author matters only where require names some; when nothing says who it is, the status fails closed.
+  const requires = Object.keys(config.require).length > 0;
+  const author = requires ? pullAuthor(await commitsAuthor(io, commits, apps), markers) : undefined;
   const families = author !== undefined && Object.hasOwn(config.require, author) ? config.require[author] : undefined;
   let review: Status;
-  if (families !== undefined) {
+  if (requires && author === undefined) {
+    review = reviewStatus({ number, agent, waivedBy, current: undefined, carried: undefined, policy: config, authorUnknown: true });
+  } else if (families !== undefined) {
     // Each required family is judged on its own reviews: its marker for the head, else its own review carried forward.
     const required: FamilyReview[] = [];
     for (const family of families) {

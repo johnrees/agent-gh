@@ -195,9 +195,13 @@ export const reviewStatus = (input: {
   readonly policy: ReviewPolicy;
   /** Each family `require` names for the author, in the config's order; undefined when it names none. */
   readonly required?: readonly FamilyReview[] | undefined;
+  /** The config has `require`, but neither the commits nor any marker says whose work this is, so what it asks cannot be known. */
+  readonly authorUnknown?: boolean;
 }): Status => {
   if (!input.agent) return status("success", "not an agent PR");
   if (input.waivedBy !== undefined) return status("success", `waived by ${input.waivedBy}`);
+  // Fails closed: a review from a release that recorded no author never passes for work require may cover.
+  if (input.authorUnknown === true) return status("pending", `needs a review that records its author, for require: run \`gh pr checkout ${input.number} && agent-gh review full --pr ${input.number}\``);
   if (input.required !== undefined) return requiredStatus(input.number, input.required, input.policy);
   if (input.current !== undefined) {
     const { marker } = input.current;
