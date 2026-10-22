@@ -1067,6 +1067,7 @@ test("gh pr edit --body or --body-file keeps a claim pull request's marker when 
   expect(await dispatchGh(["pr", "edit", "12", "-F-"], here, deps(claimed.io))).toBe(0);
   expect(await dispatchGh(["pr", "edit", "12", "--body-file", "/dev/fd/3"], here, deps(claimed.io, { "/dev/fd/3": `Done.\n${marker}` }))).toBe(0);
   expect(await dispatchGh(["pr", "edit", "12", "--body=Done."], here, deps(world({ pullBody: "Closes #7." }).io))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "12", "--body-file", "/work/plain.md"], here, deps(world({ pullBody: "Closes #7." }).io, { "/work/plain.md": "Plain." }))).toBe(0);
   expect(await dispatchGh(["pr", "edit", "12", "--title", "Done"], here, deps(claimed.io))).toBe(0);
   expect(await dispatchGh(["pr", "edit", "12", "--body", "x", "--body-file", "y"], here, deps(claimed.io))).toBe(0);
   expect(await dispatchGh(["pr", "edit", "12", "--body"], here, deps(claimed.io))).toBe(0);
@@ -1077,6 +1078,7 @@ test("gh pr edit --body or --body-file keeps a claim pull request's marker when 
     "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Done.\n${marker}`])}`,
     "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Done.\n${marker}`])}`,
     "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body=Done."])}`,
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", "Plain."])}`,
     `gh ${JSON.stringify(["pr", "edit", "12", "--title", "Done"])}`,
     `gh ${JSON.stringify(["pr", "edit", "12", "--body", "x", "--body-file", "y"])}`,
     `gh ${JSON.stringify(["pr", "edit", "12", "--body"])}`,

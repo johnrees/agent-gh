@@ -834,12 +834,14 @@ const dispatchEdit = async (args: readonly string[], edit: EditCommand, repo: Re
     const io = deps.io(target, env);
     const number = await pullNumber(io, EDIT_STAGE, edit.target);
     if (number === undefined) return deps.runWith(args, env);
-    const marker = claimMarkerText(text(record((await call(io, EDIT_STAGE, "GET", `${repoPath(io)}/pulls/${number}`)).value).body));
-    if (marker === undefined) return deps.runWith(args, env);
     const body = "text" in edit.body ? edit.body.text : edit.body.file === "-" ? await deps.readStdin() : await deps.readFile(edit.body.file);
     if (body === undefined) return deps.runWith(args, env);
     // A file read here may have been a pipe or stdin, gone for gh, so what was read goes on as `--body` even when it needs no marker.
-    if (claimMarkerText(body) !== undefined) return deps.runWith("text" in edit.body ? args : withFlags(edit.rest, ["--body", body]), env);
+    const given = "text" in edit.body ? args : withFlags(edit.rest, ["--body", body]);
+    if (claimMarkerText(body) !== undefined) return deps.runWith(given, env);
+    // The marker is read after the input, which may have waited, so a take that rewrote it meanwhile is what gets kept.
+    const marker = claimMarkerText(text(record((await call(io, EDIT_STAGE, "GET", `${repoPath(io)}/pulls/${number}`)).value).body));
+    if (marker === undefined) return deps.runWith(given, env);
     io.print(`agent-gh: kept #${number}'s claim marker at the end of its new description; the commit hook reads it to tell the holder's commits`);
     return deps.runWith(withFlags(edit.rest, ["--body", withClaimMarker(body, marker)]), env);
   });
