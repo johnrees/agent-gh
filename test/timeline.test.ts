@@ -125,6 +125,13 @@ test("focus: a cycle gives ∞, and a row on both sides of it is a step", () => 
   const json = chain([1, [2]], [2, [1]], [3, [2]]);
   expect(focused(json, "#3")).toMatchObject({ steps: { "#1": "cycle", "#2": "cycle" }, summary: "#3: ●2 ∞ in a cycle · unlocks 0" });
   expect(focused(json, "#1")).toEqual({ steps: { "#2": "cycle" }, unlocks: {}, waiting: ["#3"], summary: "#1: ●1 ∞ in a cycle · unlocks 0" });
+  // An issue that blocks itself keeps the cycle warning and its loop, but no badge of its own.
+  const self = chain([1, [1]], [2, [1]]);
+  expect(focused(self, "#1")).toEqual({ steps: { "#1": "cycle" }, unlocks: { "#2": 1 }, waiting: [], summary: "#1: ●1 ∞ in a cycle · unlocks ●1" });
+  const layout = timelineLayout(self);
+  const hover = timelineHover(self, layout, at(layout, "#1"));
+  expect(hover.edges[layout.edges.findIndex((edge) => edge.from === edge.to)]).toBe("blocker c0");
+  expect(hover.badges.has(at(layout, "#1"))).toBe(false);
 });
 
 test("focus: a child with a second open blocker waits, even on a hidden one, and is not unlocked", () => {

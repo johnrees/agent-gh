@@ -219,7 +219,8 @@ const walk = (start: string, next: (key: string) => readonly string[]): Set<stri
  * - `unlocks`: its descendants freed by it, in waves: ↓1 waits on nothing
  *   open but `row`, ↓k only on `row` and levels below k.
  * - `waiting`: its other open descendants, which wait on something more.
- * A row on both sides, through a cycle, is a step.
+ * A row on both sides, through a cycle, is a step; `row` itself is a step,
+ * `cycle`, only when it blocks itself.
  */
 export const focus = (json: GraphJson, layout: TimelineLayout, row: number): Focus => {
   const start = layout.rows[row]?.key ?? "";
@@ -232,6 +233,8 @@ export const focus = (json: GraphJson, layout: TimelineLayout, row: number): Foc
     for (const key of wave) steps.set(key, step);
   }
   for (const key of ancestors) if (!steps.has(key)) steps.set(key, "cycle");
+  // An issue that blocks itself is its own cycle.
+  if (graph.blockers(start).includes(start)) steps.set(start, "cycle");
   const unlocks = new Map<string, number>();
   const freed = new Set([start]);
   for (let level = 1; ; level++) {
@@ -314,6 +317,7 @@ export const timelineHover = (
   layout.rows.forEach((entry, at) => {
     const step = seen.steps.get(entry.key);
     const level = seen.unlocks.get(entry.key);
+    if (at === row) return;
     if (step !== undefined) badges.set(at, { text: step === "cycle" ? "∞" : String(step), tone: tone(entry.key) });
     else if (level !== undefined) badges.set(at, { text: `↓${level}`, tone: tone(entry.key) });
     else if (seen.waiting.has(entry.key)) badges.set(at, { text: "↓", tone: "wait" });
