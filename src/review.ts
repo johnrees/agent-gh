@@ -393,6 +393,8 @@ const ghArgs = (args: readonly string[], valued: ValueFlags) => {
   const values: [string, string][] = [];
   /** Where each value's flag and value sit in `args`, and what of a short cluster stays when they go (`-sb x` leaves `-s`). */
   const spans: { readonly start: number; readonly end: number; readonly keep?: string }[] = [];
+  /** Flags that take a value but ended the arguments without one, which gh refuses. */
+  const missing: string[] = [];
   for (let index = 0; index < args.length; index++) {
     const arg = args[index] as string;
     const start = index;
@@ -404,7 +406,9 @@ const ghArgs = (args: readonly string[], valued: ValueFlags) => {
       flags.push(arg);
       const [name, attached] = arg.includes("=") ? [arg.slice(2, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg.slice(2), undefined];
       if (valued.long.includes(name)) {
-        values.push([name, attached ?? (args[++index] ?? "")]);
+        const value = attached ?? args[++index];
+        if (value === undefined) missing.push(name);
+        values.push([name, value ?? ""]);
         spans.push({ start, end: index });
       }
     } else if (arg.startsWith("-") && arg.length > 1) {
@@ -415,7 +419,9 @@ const ghArgs = (args: readonly string[], valued: ValueFlags) => {
         if (!valued.short.includes(short)) continue;
         // As pflag reads it: `-bx` and `-b=x` carry the value in the word (`-b=` an empty one); only a bare `-b` takes the next argument.
         const attached = arg.slice(at + 1);
-        values.push([short, attached !== "" ? attached.replace(/^=/, "") : (args[++index] ?? "")]);
+        const value = attached !== "" ? attached.replace(/^=/, "") : args[++index];
+        if (value === undefined) missing.push(short);
+        values.push([short, value ?? ""]);
         spans.push({ start, end: index, ...(at > 1 ? { keep: arg.slice(0, at) } : {}) });
         break;
       }
@@ -433,7 +439,7 @@ const ghArgs = (args: readonly string[], valued: ValueFlags) => {
     });
     return kept.filter((arg): arg is string => arg !== undefined);
   };
-  return { words, flags, values, last, without };
+  return { words, flags, values, last, without, missing };
 };
 
 /**
@@ -516,11 +522,12 @@ export type EditCommand = {
  * for any other command.
  */
 export const editCommand = (args: readonly string[]): EditCommand | undefined => {
-  const { words, last, without } = ghArgs(args, EDIT_FLAGS);
+  const { words, last, without, missing } = ghArgs(args, EDIT_FLAGS);
   if (words[0] !== "pr" || words[1] !== "edit") return undefined;
   const text = last("b", "body");
   const file = last("F", "body-file");
-  if ((text === undefined) === (file === undefined)) return undefined;
+  // Both flags, or one with no value: gh refuses the command itself.
+  if ((text === undefined) === (file === undefined) || missing.some((name) => ["b", "body", "F", "body-file"].includes(name))) return undefined;
   return { target: selector(words[2]), body: text !== undefined ? { text } : { file: file as string }, repo: last("R", "repo"), rest: without(["b", "body", "F", "body-file"]) };
 };
 
