@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { graphHtml, PAGE_CSP, PELE_INTEGRITY, PELE_URL, scriptJson } from "../src/graph-html.ts";
+import { graphHtml, PAGE_CSP, PELE_INTEGRITY, PELE_URL, scriptJson, tooltipLines } from "../src/graph-html.ts";
 import { graphMermaid } from "../src/graph-mermaid.ts";
 import { FIXTURE } from "./graph-fixture.ts";
 
@@ -59,6 +59,32 @@ test("the page carries the Mermaid text as its fallback, HTML-escaped, for when 
   expect(PAGE).toContain("Pele did not load, so this is the flowchart's Mermaid text");
   // Shown until the page script draws the flowchart.
   expect(between(PAGE, "<style>", "</style>")).toContain(".drawn #fallback{display:none}");
+});
+
+test("each claimed node's tooltip shows its holder, claim age, quiet time, and statuses, measured against fetched_at", () => {
+  // Claimed 2026-10-20T09:00, last pushed 06:30 and commented 08:00 on the 21st; fetched at 12:00.
+  expect(tooltipLines(FIXTURE, "i3", null)).toEqual([
+    "#3 #12; is not an entity", "claimed · end", "held by claude (johnrees)", "claimed 1d 3h ago", "quiet 4h 0m",
+    "pull request #31 draft", "agent-review unset · agent-threads unset · agent-hold unset", "checks missing",
+  ]);
+  // A pull request without a marker names its author alone.
+  expect(tooltipLines(FIXTURE, "i5", null).slice(0, 3)).toEqual(["#5 Ready one", "ready · M0", "held by renovate[bot]"]);
+  expect(tooltipLines(FIXTURE, "i4", null)).toContain("agent-review pending · agent-threads success · agent-hold unset");
+  // Quiet runs from the latest of the claim, its last push, and its last comment.
+  const pushed = { ...FIXTURE, issues: FIXTURE.issues.map((issue) => (issue.claim === null ? issue : { ...issue, claim: { ...issue.claim, last_push_at: "2026-10-21T11:15:00Z", last_comment_at: null } })) };
+  expect(tooltipLines(pushed, "i3", null)).toContain("quiet 45m");
+  expect(tooltipLines(FIXTURE, "i8", null)).toEqual(["#8 Held for a person", "skipped", "skipped by hold.label: needs-human"]);
+  expect(tooltipLines(FIXTURE, "i1", null).at(-1)).toBe("blocked by #14 (closed), johnrees/other#41");
+  // A blocker in another repository is found by its link.
+  expect(tooltipLines(FIXTURE, "x_johnrees_other_41", "https://github.com/johnrees/other/issues/41")).toEqual(["johnrees/other#41", "open, in another repository"]);
+  expect(tooltipLines(FIXTURE, "x_unknown", null)).toEqual([]);
+});
+
+test("the page runs the tooltip function's own source, which uses nothing outside itself", () => {
+  const inline = between(PAGE, "<script>", "</script>") as string;
+  expect(inline).toContain(`const tooltipLines = ${tooltipLines.toString()};`);
+  const isolated = new Function(`return (${tooltipLines.toString()})`)() as typeof tooltipLines;
+  expect(isolated(FIXTURE, "i3", null)).toEqual(tooltipLines(FIXTURE, "i3", null));
 });
 
 test("the heading names the milestone shown, escaped", () => {

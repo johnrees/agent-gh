@@ -57,6 +57,57 @@ ${Object.entries(STATUS_STYLES)
 .legend .outside{border-style:dashed}
 `;
 
+/**
+ * A node's tooltip, as lines of text: the issue's title, status, and
+ * milestone; for a claim its holder, how long ago it was claimed, and how
+ * long it has been quiet, as of `fetched_at`; its pull request's statuses
+ * and checks; what skips and blocks it. A blocker in another repository is
+ * found by its link, since two repositories can spell one node id. The page
+ * runs this function's own source, so it uses nothing outside itself.
+ */
+export function tooltipLines(data: GraphJson, id: string | null, href: string | null): string[] {
+  const span = (ms: number) => {
+    const minutes = Math.max(0, Math.floor(ms / 60000));
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    return hours < 24 ? `${hours}h ${minutes % 60}m` : `${Math.floor(hours / 24)}d ${hours % 24}h`;
+  };
+  const at = (time: string | null) => (time === null || time === "" ? Number.NaN : Date.parse(time));
+  const fetched = Date.parse(data.fetched_at);
+  const issue = data.issues.find((item) => `i${item.issue}` === id);
+  if (issue === undefined) {
+    for (const item of data.issues) {
+      for (const blocker of item.blocked_by) {
+        if (blocker.repo !== null && href === `https://github.com/${blocker.repo}/issues/${blocker.issue}`) {
+          return [`${blocker.repo}#${blocker.issue}`, `${blocker.open ? "open" : "closed"}, in another repository`];
+        }
+      }
+    }
+    return [];
+  }
+  const found = [`#${issue.issue} ${issue.title}`, `${issue.status.replace("_", " ")}${issue.milestone === null ? "" : ` · ${issue.milestone}`}`];
+  const claim = issue.claim;
+  if (claim !== null) {
+    found.push(`held by ${claim.family === null ? claim.author : `${claim.family} (${claim.author})`}`);
+    const created = at(claim.created_at);
+    const last = Math.max(...[claim.created_at, claim.last_push_at, claim.last_comment_at].map(at).filter((time) => !Number.isNaN(time)));
+    if (!Number.isNaN(created)) found.push(`claimed ${span(fetched - created)} ago`);
+    if (Number.isFinite(last)) found.push(`quiet ${span(fetched - last)}`);
+  }
+  const pr = issue.pr;
+  if (pr !== null) {
+    found.push(`pull request #${pr.number} ${pr.draft ? "draft" : pr.state}${pr.review_decision === null ? "" : `, ${pr.review_decision.replace("_", " ")}`}`);
+    if (pr.state === "open") {
+      const named = (context: string) => pr.statuses[context] ?? "unset";
+      found.push(`agent-review ${named("agent-review")} · agent-threads ${named("agent-threads")} · agent-hold ${named("agent-hold")}`);
+      found.push(`checks ${pr.checks ?? "none required"}`);
+    }
+  }
+  if (issue.skipped_by !== null) found.push(`skipped by ${issue.skipped_by.rule}: ${issue.skipped_by.label ?? issue.skipped_by.pattern}`);
+  if (issue.blocked_by.length > 0) found.push(`blocked by ${issue.blocked_by.map((blocker) => `${blocker.repo ?? ""}#${blocker.issue}${blocker.open ? "" : " (closed)"}`).join(", ")}`);
+  return found;
+}
+
 /** The page's own script: draw with Pele where it loaded, keep the text where not, mark staleness, and show each node's tooltip from the JSON. */
 const SCRIPT = `
 "use strict";
@@ -96,43 +147,10 @@ const SCRIPT = `
     window.open(link.getAttribute("href"), "_blank", "noopener");
   });
 
-  const issues = new Map(data.issues.map((issue) => [ "i" + issue.issue, issue ]));
-  // A blocker in another repository is found by its link, since two repositories can spell one node id.
-  const outside = new Map();
-  for (const issue of data.issues) {
-    for (const blocker of issue.blocked_by) {
-      if (blocker.repo !== null) outside.set("https://github.com/" + blocker.repo + "/issues/" + blocker.issue, blocker);
-    }
-  }
-  const at = (time) => (time === null || time === undefined || time === "" ? null : Date.parse(time));
+  const tooltipLines = ${tooltipLines.toString()};
   const lines = (node) => {
-    const issue = issues.get(node.getAttribute("data-id"));
-    if (issue === undefined) {
-      const link = node.querySelector("a[href]");
-      const blocker = link === null ? undefined : outside.get(link.getAttribute("href"));
-      return blocker === undefined ? [] : [blocker.repo + "#" + blocker.issue, blocker.open ? "open, in another repository" : "closed, in another repository"];
-    }
-    const found = [ "#" + issue.issue + " " + issue.title, issue.status.replace("_", " ") + (issue.milestone === null ? "" : " \\u00b7 " + issue.milestone) ];
-    const claim = issue.claim;
-    if (claim !== null) {
-      found.push("held by " + (claim.family === null ? claim.author : claim.family + " (" + claim.author + ")"));
-      const created = at(claim.created_at);
-      const last = Math.max(...[claim.created_at, claim.last_push_at, claim.last_comment_at].map(at).filter((time) => time !== null && !Number.isNaN(time)));
-      if (created !== null) found.push("claimed " + span(fetched - created) + " ago");
-      if (Number.isFinite(last)) found.push("quiet " + span(fetched - last));
-    }
-    const pr = issue.pr;
-    if (pr !== null) {
-      found.push("pull request #" + pr.number + " " + (pr.draft ? "draft" : pr.state) + (pr.review_decision === null ? "" : ", " + pr.review_decision.replace("_", " ")));
-      if (pr.state === "open") {
-        const named = (state) => (state === null ? "unset" : state);
-        found.push("agent-review " + named(pr.statuses["agent-review"]) + " \\u00b7 agent-threads " + named(pr.statuses["agent-threads"]) + " \\u00b7 agent-hold " + named(pr.statuses["agent-hold"]));
-        found.push("checks " + (pr.checks === null ? "none required" : pr.checks));
-      }
-    }
-    if (issue.skipped_by !== null) found.push("skipped by " + issue.skipped_by.rule + ": " + (issue.skipped_by.label === null ? issue.skipped_by.pattern : issue.skipped_by.label));
-    if (issue.blocked_by.length > 0) found.push("blocked by " + issue.blocked_by.map((blocker) => (blocker.repo === null ? "" : blocker.repo) + "#" + blocker.issue + (blocker.open ? "" : " (closed)")).join(", "));
-    return found;
+    const link = node.querySelector("a[href]");
+    return tooltipLines(data, node.getAttribute("data-id"), link === null ? null : link.getAttribute("href"));
   };
   const tooltip = document.getElementById("tooltip");
   const show = (node, x, y) => {
