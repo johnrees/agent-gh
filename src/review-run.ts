@@ -1332,7 +1332,7 @@ export const pullDiff = async (io: Pick<ReviewIo, "git">, mergeBase: string, hea
  * who cannot approve his own pull requests): findings on a line the diff
  * shows go on that line, the rest in the body. If GitHub still refuses a
  * line (422), every finding goes in the body instead. Returns when GitHub
- * says it was submitted, and its id.
+ * says it was submitted, its id, and its link.
  */
 const postReview = async (io: ReviewIo, number: number, head: string, review: Review, diff: string, body: (outside: readonly Finding[]) => string) => {
   const lines = diffLines(diff);
@@ -1344,7 +1344,7 @@ const postReview = async (io: ReviewIo, number: number, head: string, review: Re
   // When GitHub dated the review (else now), which orders it among the pull request's other markers, and its id.
   const dated = (value: unknown) => {
     const posted = record(value);
-    return { at: text(posted.submitted_at) || new Date().toISOString(), reviewId: Number.isSafeInteger(posted.id) ? (posted.id as number) : undefined };
+    return { at: text(posted.submitted_at) || new Date().toISOString(), reviewId: Number.isSafeInteger(posted.id) ? (posted.id as number) : undefined, url: text(posted.html_url) };
   };
   const first = await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(findings.filter((finding) => !onDiff(finding))), comments }, [422]);
   if (first.status !== 422) return dated(first.value);
@@ -1362,15 +1362,16 @@ const headStatus = async (io: ReviewIo, head: string): Promise<CommitStatus | un
 /**
  * Where the agent-review workflow sets the status (`status_writer:
  * "actions"`): waits up to a minute for a settled status newer than `before`
- * on the head, and prints what it reads. The review is posted either way, so
- * a slow workflow is reported, not a failure.
+ * on the head (linking `url`, when given, so a run for an earlier review is
+ * not taken for this one's), and prints what it reads. The review is posted
+ * either way, so a slow workflow is reported, not a failure.
  */
-const awaitWorkflowStatus = async (io: ReviewIo, head: string, before: CommitStatus | undefined): Promise<void> => {
+const awaitWorkflowStatus = async (io: ReviewIo, head: string, before: CommitStatus | undefined, url?: string): Promise<void> => {
   const short = head.slice(0, 8);
   let seen = before;
   for (let waited = 0; ; waited += STATUS_POLL_MS) {
     seen = await headStatus(io, head);
-    if (seen !== undefined && seen.id !== before?.id && seen.state !== "pending") {
+    if (seen !== undefined && seen.id !== before?.id && seen.state !== "pending" && (url === undefined || seen.url === url)) {
       io.print(`agent-gh: the agent-review workflow set ${STATUS_CONTEXT} on ${short}: ${seen.state} (${seen.description})`);
       return;
     }
@@ -1489,15 +1490,17 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
     };
     // The workflow's runs for an earlier family's review have long settled by the last one's, so only the last is waited for.
     if (actions && index === reviewers.length - 1) before = await headStatus(io, head);
-    const { at, reviewId } = await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
-    done.push({ reviewer, review, found: { marker, at, url: "", ...(reviewId === undefined ? {} : { reviewId }) } });
+    const { at, reviewId, url } = await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
+    done.push({ reviewer, review, found: { marker, at, url, ...(reviewId === undefined ? {} : { reviewId }) } });
     // A waiver John added meanwhile stands: no status is set over it.
     if (!actions && required !== undefined && index < reviewers.length - 1 && (await waiver(io, stage, await pull(io, stage, number), config)) === undefined) await setRequired(required);
   }
   // A waiver John added while the review ran stands: the labels are read afresh, and the verdict never overwrites it.
   let waived: string | undefined;
   if (actions) {
-    await awaitWorkflowStatus(io, head, before);
+    // Under require, the workflow's status links the latest review it counts: the one for the last review posted links it.
+    const last = done.at(-1)?.found.url;
+    await awaitWorkflowStatus(io, head, before, required === undefined || last === "" ? undefined : last);
     waived = await waiver(io, stage, await pull(io, stage, number), config);
   } else if ((waived = await recordWaiver(await pull(io, stage, number))) === undefined) {
     const [only] = done as [(typeof done)[number]];

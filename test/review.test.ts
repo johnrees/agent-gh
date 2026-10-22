@@ -321,6 +321,8 @@ type World = {
   checkResults?: { code: number; output: string; timedOut?: boolean }[];
   /** The statuses GitHub answers a posted review with, in order. */
   reviewReplies?: number[];
+  /** What GitHub answers each posted review with, in order (its id, date, and link); none when not given. */
+  postedReviews?: unknown[];
   /** The base branch's rules (rulesets), its branch record (classic protection), and the head's check runs. */
   rules?: unknown[];
   branch?: unknown;
@@ -363,13 +365,14 @@ const PATCH_ID = "c".repeat(40);
 const world = ({
   head = HEAD, labels = [], labelsLater, status = [], events = [], optedIn = true, config = EXAMPLE, answer, answers = {}, closes = "johnrees/widget", upstream = true,
   commitPulls = [{ number: 12, state: "open", head: { sha: HEAD } }], branchPulls = [{ number: 12, state: "open" }], family = "claude",
-  coAuthors = [[bot("claude")], [bot("claude")]], checkResults = [], reviewReplies = [], rules = [], branch = { protected: false }, checkRuns = [], workflowRuns = [],
+  coAuthors = [[bot("claude")], [bot("claude")]], checkResults = [], reviewReplies = [], postedReviews = [], rules = [], branch = { protected: false }, checkRuns = [], workflowRuns = [],
   statusLater = [], comments = [], issueComments = [{ id: 70, body: "Last word.", user: { login: "someone" }, created_at: "2026-10-01T00:00:00Z" }], reactions = {},
   reviews = [], reviewsAfterStatus = [], lineComments = [], ancestors = [], base = "main", issueLabels = ["model:fable-astra"], issueEvents = [], pullBody = "Closes #7.", sessions = [], session = "s-one",
 }: World = {}) => {
   let pullReads = 0;
   const statusReads = [...statusLater];
   const reviewStatuses = [...reviewReplies];
+  const postedAnswers = [...postedReviews];
   const fake = fakeGitHub({
     [`GET ${REPO}/pulls/12`]: () => {
       const names = pullReads++ === 0 ? labels : (labelsLater ?? labels);
@@ -427,7 +430,7 @@ const world = ({
     [`GET ${REPO}/issues/7/comments`]: (_, url) => reply(200, page(issueComments, url)),
     ...Object.fromEntries(Object.entries(reactions).map(([id, list]) => [`GET ${REPO}/issues/comments/${id}/reactions`, (_: string, url: URL) => reply(200, page(list, url))])),
     ["GET /repos/johnrees/tracker/issues/7"]: () => reply(200, { title: "Elsewhere", body: "Tracked elsewhere.", labels: [{ name: "model:opus-sol" }], comments: 0 }),
-    [`POST ${REPO}/pulls/12/reviews`]: () => reply(reviewStatuses.shift() ?? 200, {}),
+    [`POST ${REPO}/pulls/12/reviews`]: () => reply(reviewStatuses.shift() ?? 200, postedAnswers.shift() ?? {}),
     [`POST ${REPO}/statuses/${HEAD}`]: () => reply(201, {}),
   });
   stops.push(fake.stop);
@@ -1576,7 +1579,11 @@ test("where the workflow writes the status, each required family's review is pos
   // The status the workflow set for Codex's review, read just before Claude's is posted, is not the answer.
   const earlier = { context: "agent-review", state: "failure", description: "awaiting claude's review: run `agent-gh review full --reviewer claude`; codex approved; checks passed", id: 2 };
   const settled = { context: "agent-review", state: "success", description: "codex and claude passed: codex approved; checks passed. claude approved; checks passed", id: 3 };
-  const w = world({ config: { ...REQUIRE, status_writer: "actions" }, family: "glm", coAuthors: [[bot("glm")]], answer: approve, statusLater: [[earlier], [earlier], [settled]] });
+  // A run for Codex's review that lands after Claude's is posted links Codex's, so it is not taken for the answer either.
+  const late = { ...earlier, id: 4, target_url: "https://github.com/johnrees/widget/pull/12#pullrequestreview-1" };
+  const linked = { ...settled, id: 5, target_url: "https://github.com/johnrees/widget/pull/12#pullrequestreview-2" };
+  const postedReviews = [1, 2].map((id) => ({ id, submitted_at: `2026-10-12T00:00:0${id}Z`, html_url: `https://github.com/johnrees/widget/pull/12#pullrequestreview-${id}` }));
+  const w = world({ config: { ...REQUIRE, status_writer: "actions" }, family: "glm", coAuthors: [[bot("glm")]], answer: approve, postedReviews, statusLater: [[earlier], [late], [linked]] });
   await reviewFull(w.io, {});
   expect(posted(w.fake, `${REPO}/pulls/12/reviews`).map((review) => parseMarker(review.body as string)?.reviewer)).toEqual(["codex", "claude"]);
   expect(posted(w.fake, `${REPO}/statuses/${HEAD}`)).toEqual([]);

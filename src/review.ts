@@ -299,7 +299,7 @@ export const waivedBy = (events: readonly unknown[], waiverLabel: string): strin
   return typeof actor?.login === "string" ? actor.login : undefined;
 };
 
-export type CommitStatus = { readonly state: string; readonly description: string; readonly id: number | undefined };
+export type CommitStatus = { readonly state: string; readonly description: string; readonly id: number | undefined; readonly url?: string };
 
 /** The agent-review status (or another `context`) in a commit's combined status (GitHub lists the latest per context), if any. */
 export const agentReviewStatus = (combined: Record<string, unknown>, context: string = STATUS_CONTEXT): CommitStatus | undefined => {
@@ -308,7 +308,10 @@ export const agentReviewStatus = (combined: Record<string, unknown>, context: st
     (status) => typeof status === "object" && status !== null && (status as Record<string, unknown>).context === context,
   ) as Record<string, unknown> | undefined;
   if (found === undefined || typeof found.state !== "string") return undefined;
-  return { state: found.state, description: typeof found.description === "string" ? found.description : "", id: Number.isSafeInteger(found.id) ? (found.id as number) : undefined };
+  return {
+    state: found.state, description: typeof found.description === "string" ? found.description : "", id: Number.isSafeInteger(found.id) ? (found.id as number) : undefined,
+    ...(typeof found.target_url === "string" ? { url: found.target_url } : {}),
+  };
 };
 
 /** True when the commit's combined status has a successful agent-review status. */
