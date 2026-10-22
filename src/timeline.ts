@@ -246,19 +246,47 @@ export const focus = (json: GraphJson, layout: TimelineLayout, row: number): Foc
   return { steps, unlocks, waiting };
 };
 
-/** Each hue's shades: 1 the strongest, on what can be acted on (step 1 starts now, ↓1 is freed directly); a later step or level takes the lightest. */
-const RAMP = 3;
+/** The categorical palette's size: tones `c0`…`c5`, after Okabe–Ito without yellow. */
+export const PALETTE = 6;
 
-/** A badge in the depth column: its text, and its tone (`r1`…`r3` for a step, `g1`…`g3` for an unlock level, `wait` for a row that waits on more). */
+/**
+ * Each level group of a focus, in order (step 1, step 2, …, `∞`, then ↓1,
+ * ↓2, …), with its tone: the palette in order, cycling once it runs out.
+ * Keys are `step 1`, `step ∞`, `unlock 1`.
+ */
+export const focusGroups = (seen: Focus): ReadonlyMap<string, string> => {
+  const steps = [...seen.steps.values()];
+  const deepest = Math.max(0, ...steps.filter((step): step is number => step !== "cycle"));
+  const keys = [
+    ...Array.from({ length: deepest }, (_, at) => `step ${at + 1}`),
+    ...(steps.includes("cycle") ? ["step ∞"] : []),
+    ...Array.from({ length: Math.max(0, ...seen.unlocks.values()) }, (_, at) => `unlock ${at + 1}`),
+  ];
+  return new Map(keys.map((key, at) => [key, `c${at % PALETTE}`]));
+};
+
+const groupOf = (seen: Focus, key: string): string | undefined => {
+  const step = seen.steps.get(key);
+  if (step !== undefined) return `step ${step === "cycle" ? "∞" : step}`;
+  const level = seen.unlocks.get(key);
+  return level === undefined ? undefined : `unlock ${level}`;
+};
+
+/** A badge in the depth column: its text, and its tone (a group's `c0`…`c5`, or `wait` for a row that waits on more). */
 export type Badge = { readonly text: string; readonly tone: string };
+
+/** The summary line as text and colour chips, each chip a group's tone. */
+export type Summary = readonly (string | { readonly tone: string })[];
 
 /**
  * What hovering (or pinning) `row` shows: each edge's classes, the rows that
- * fade, each related row's badge, and the summary line.
- * - An edge from a step into a step or `row` is `blocker`, toned by its
- *   source's step.
- * - An edge from `row` or an unlocked row into an unlocked row is `child`,
- *   toned by its target's level.
+ * fade, each related row's badge, and the summary line. Each level group has
+ * its own colour (`focusGroups`); direction reads from the badge and from
+ * position, and unlock edges are dashed.
+ * - An edge from a step into a step or `row` is `blocker`, in its source's
+ *   colour.
+ * - An edge from `row` or an unlocked row into an unlocked row is `child`, in
+ *   its source's colour (its target's, out of `row`).
  * - An edge from `row`, an unlocked row, or a waiting row into a waiting
  *   row stays plain grey.
  * - Every other edge, and every row but `row`, its steps, what it unlocks,
@@ -268,17 +296,16 @@ export const timelineHover = (
   json: GraphJson,
   layout: TimelineLayout,
   row: number,
-): { readonly edges: readonly string[]; readonly faded: ReadonlySet<number>; readonly badges: ReadonlyMap<number, Badge>; readonly summary: string } => {
+): { readonly edges: readonly string[]; readonly faded: ReadonlySet<number>; readonly badges: ReadonlyMap<number, Badge>; readonly summary: Summary } => {
   const seen = focus(json, layout, row);
+  const groups = focusGroups(seen);
   const key = (at: number) => layout.rows[at]?.key ?? "";
+  const tone = (of: string) => groups.get(groupOf(seen, of) ?? "") ?? "";
   const start = key(row);
-  const tone = (level: number | "cycle") => (level === "cycle" ? RAMP : Math.min(level, RAMP));
   const edges = layout.edges.map((edge) => {
     const [from, to] = [key(edge.from), key(edge.to)];
-    const step = seen.steps.get(from);
-    if (step !== undefined && (to === start || seen.steps.has(to))) return `blocker r${tone(step)}`;
-    const level = seen.unlocks.get(to);
-    if (level !== undefined && (from === start || seen.unlocks.has(from))) return `child g${tone(level)}`;
+    if (seen.steps.has(from) && (to === start || seen.steps.has(to))) return `blocker ${tone(from)}`;
+    if (seen.unlocks.has(to) && (from === start || seen.unlocks.has(from))) return `child ${tone(from === start ? to : from)}`;
     if (seen.waiting.has(to) && (from === start || seen.unlocks.has(from) || seen.waiting.has(from))) return "";
     return "faded";
   });
@@ -287,29 +314,31 @@ export const timelineHover = (
   layout.rows.forEach((entry, at) => {
     const step = seen.steps.get(entry.key);
     const level = seen.unlocks.get(entry.key);
-    if (step !== undefined) badges.set(at, { text: step === "cycle" ? "∞" : String(step), tone: `r${tone(step)}` });
-    else if (level !== undefined) badges.set(at, { text: `↓${level}`, tone: `g${tone(level)}` });
+    if (step !== undefined) badges.set(at, { text: step === "cycle" ? "∞" : String(step), tone: tone(entry.key) });
+    else if (level !== undefined) badges.set(at, { text: `↓${level}`, tone: tone(entry.key) });
     else if (seen.waiting.has(entry.key)) badges.set(at, { text: "↓", tone: "wait" });
     else if (at !== row) faded.add(at);
   });
   return { edges, faded, badges, summary: focusSummary(start, seen) };
 };
 
-/** `#42: 3 steps (2 ∥ 1 ∥ 3 issues) · 1 ∞ in a cycle · unlocks 4`. */
-export const focusSummary = (key: string, seen: Focus): string => {
-  const counts: number[] = [];
-  let cycle = 0;
-  for (const step of seen.steps.values()) {
-    if (step === "cycle") cycle++;
-    else counts[step - 1] = (counts[step - 1] ?? 0) + 1;
-  }
-  const total = counts.reduce((sum, count) => sum + count, 0);
-  const parts = [
-    ...(counts.length === 0 ? [] : [`${counts.length} step${counts.length === 1 ? "" : "s"} (${counts.join(" ∥ ")} issue${total === 1 ? "" : "s"})`]),
-    ...(cycle === 0 ? [] : [`${cycle} ∞ in a cycle`]),
+/** `#42: 3 steps (●2 ∥ ●1 ∥ ●3) · ●2 ∞ in a cycle · unlocks ●4 ●1`, each ● its group's colour chip. */
+export const focusSummary = (key: string, seen: Focus): Summary => {
+  const groups = focusGroups(seen);
+  const count = (group: string) => [...seen.steps.keys(), ...seen.unlocks.keys()].filter((of) => groupOf(seen, of) === group).length;
+  const chip = (group: string): Summary => [{ tone: groups.get(group) ?? "" }, String(count(group))];
+  const steps = [...groups.keys()].filter((group) => group.startsWith("step ") && group !== "step ∞");
+  const unlocks = [...groups.keys()].filter((group) => group.startsWith("unlock "));
+  const parts: Summary[] = [
+    ...(steps.length === 0 ? [] : [[`${steps.length} step${steps.length === 1 ? "" : "s"} (`, ...steps.flatMap((group, at) => [...(at === 0 ? [] : [" ∥ "]), ...chip(group)]), ")"]]),
+    ...(groups.has("step ∞") ? [[...chip("step ∞"), " ∞ in a cycle"]] : []),
   ];
-  return `${key}: ${[...(parts.length === 0 ? ["nothing open blocks it"] : parts), `unlocks ${seen.unlocks.size}`].join(" · ")}`;
+  const unlocked: Summary = unlocks.length === 0 ? ["unlocks 0"] : ["unlocks", ...unlocks.flatMap((group) => [" ", ...chip(group)])];
+  return [`${key}: `, ...[...(parts.length === 0 ? [["nothing open blocks it"]] : parts), unlocked].flatMap((part, at) => [...(at === 0 ? [] : [" · "]), ...part])];
 };
+
+/** The summary as plain text, `●` for each chip. */
+export const summaryText = (summary: Summary): string => summary.map((part) => (typeof part === "string" ? part : "●")).join("");
 
 export const NONE = "—";
 
@@ -384,8 +413,8 @@ const UNSAFE = new RegExp(`[<>&${String.fromCharCode(0x2028, 0x2029)}]`, "g");
 export const scriptJson = (json: GraphJson): string => JSON.stringify(json).replace(UNSAFE, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 
 const STYLE = `
-:root { color-scheme: light dark; --fg: #1f2328; --text: #424a53; --muted: #6e7781; --bg: #f6f8fa; --surface: #ffffff; --line: #d8dee4; --band: rgba(191, 135, 0, 0.14); --edge: #8b949e; --r1: #c80f1c; --r2: #ef6b70; --r3: #f2a0a3; --g1: #137333; --g2: #45b864; --g3: #94dba6; }
-@media (prefers-color-scheme: dark) { :root { --fg: #e6e6e6; --text: #b4b8bd; --muted: #7d8590; --bg: #0b0c0e; --surface: #17181b; --line: #26282c; --band: rgba(210, 170, 60, 0.16); --r1: #ff5f56; --r2: #c0423d; --r3: #8e3c38; --g1: #4fd463; --g2: #2c8a3e; --g3: #2f6a3b; } }
+:root { color-scheme: light dark; --fg: #1f2328; --text: #424a53; --muted: #6e7781; --bg: #f6f8fa; --surface: #ffffff; --line: #d8dee4; --band: rgba(191, 135, 0, 0.14); --edge: #8b949e; --c0: #c97f00; --c1: #2f8fcc; --c2: #00916a; --c3: #d55e00; --c4: #0064a3; --c5: #b85a93; }
+@media (prefers-color-scheme: dark) { :root { --fg: #e6e6e6; --text: #b4b8bd; --muted: #7d8590; --bg: #0b0c0e; --surface: #17181b; --line: #26282c; --band: rgba(210, 170, 60, 0.16); --c0: #f0a830; --c1: #74c8f2; --c2: #2fc496; --c3: #f27a3c; --c4: #6f95ff; --c5: #e48fc3; } }
 body { margin: 0; padding: 16px; font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); background: var(--bg); }
 main { display: inline-block; min-width: min(100%, 960px); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; box-sizing: border-box; }
 h1 { font-size: 15px; font-weight: 600; color: var(--fg); margin: 0 0 4px; }
@@ -413,12 +442,14 @@ svg { display: block; }
 svg.ring { display: inline; vertical-align: -1px; margin-right: 4px; }
 .edge { fill: none; stroke: var(--edge); stroke-width: 1.25; }
 .edge.blocker, .edge.child { stroke-width: 2; }
+.edge.child { stroke-dasharray: 5 3; }
 .node { stroke: var(--surface); stroke-width: 1.5; }
 .node.foreign { fill: var(--surface); stroke: var(--muted); stroke-dasharray: 2 1.5; }
 .node.foreign.shut { fill: var(--line); }
-${["r1", "r2", "r3", "g1", "g2", "g3"].map((tone) => `.edge.${tone} { stroke: var(--${tone}); } .node.${tone} { fill: var(--${tone}); } td.${tone} { color: var(--${tone}); }`).join("\n")}
+${Array.from({ length: PALETTE }, (_, at) => `c${at}`).map((tone) => `.edge.${tone} { stroke: var(--${tone}); } .node.${tone} { fill: var(--${tone}); } td.${tone} { color: var(--${tone}); } .dot.${tone} { background: var(--${tone}); }`).join("\n")}
 .node.wait { fill: var(--edge); }
-td.depth.r1, td.depth.g1 { font-weight: 600; }
+td.depth:not(.wait) { font-weight: 600; }
+.focus .dot { margin: 0 3px 0 0; }
 ${STATUSES.map(([status, colour]) => `.s-${status} { fill: ${colour}; background: ${colour}; }`).join("\n")}
 `;
 

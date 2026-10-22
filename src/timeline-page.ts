@@ -9,7 +9,7 @@
  * keeps the toggles and the pin.
  */
 import type { GraphJson } from "./graph.ts";
-import { externalUrl, githubUrl, type Hideable, NONE, type PageState, parseHash, RADIUS, ROW, rowText, STATUSES, stateHash, timelineHover, timelineLayout, timelineSvg } from "./timeline.ts";
+import { externalUrl, githubUrl, type Hideable, NONE, PALETTE, type PageState, parseHash, RADIUS, ROW, rowText, STATUSES, stateHash, timelineHover, timelineLayout, timelineSvg } from "./timeline.ts";
 
 const SVG = "http://www.w3.org/2000/svg";
 const json = JSON.parse(document.getElementById("graph")?.textContent ?? "null") as GraphJson;
@@ -151,14 +151,14 @@ const pinned = (): number | undefined => {
   return at === -1 ? undefined : at;
 };
 
-const TONES = ["blocker", "child", "faded", "r1", "r2", "r3", "g1", "g2", "g3", "wait"];
+const TONES = ["blocker", "child", "faded", "wait", ...Array.from({ length: PALETTE }, (_, at) => `c${at}`)];
 
-// Lights a row's focus: the steps to it in red, what it unlocks in green, each shaded by level with its badge, what waits on more in grey, and the rest faded.
+// Lights a row's focus: each level group of the steps to it and of what it unlocks in its own colour with its badge, what waits on more in grey, and the rest faded.
 function light(row: number | undefined) {
   if (row === lit) return;
   lit = row;
   const hover = row === undefined ? undefined : timelineHover(json, layout, row);
-  focusLine.textContent = hover?.summary ?? HINT;
+  focusLine.replaceChildren(...(hover === undefined ? [HINT] : hover.summary.map((part) => (typeof part === "string" ? part : element("span", { class: `dot ${part.tone}` })))));
   [...body.children].forEach((tr, at) => {
     const badge = hover?.badges.get(at);
     const faded = hover?.faded.has(at) ?? false;

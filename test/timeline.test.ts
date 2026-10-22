@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { GraphJson } from "../src/graph.ts";
-import { ago, escape, externalUrl, focus, focusSummary, githubUrl, type Hideable, parseHash, RADIUS, rowText, scriptJson, stateHash, type TimelineLayout, timelineHover, timelineHtml, timelineLayout, timelineSvg } from "../src/timeline.ts";
+import { ago, escape, externalUrl, focus, focusGroups, focusSummary, githubUrl, type Hideable, parseHash, RADIUS, rowText, scriptJson, stateHash, summaryText, type TimelineLayout, timelineHover, timelineHtml, timelineLayout, timelineSvg } from "../src/timeline.ts";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "timeline-graph.json");
 const SCRIPT = join(import.meta.dir, "..", "scripts", "timeline.ts");
@@ -92,24 +92,24 @@ const chain = (...issues: readonly (readonly [number, readonly number[], GraphJs
 const focused = (json: GraphJson, key: string, hidden: ReadonlySet<Hideable> = new Set()) => {
   const layout = timelineLayout(json, { hidden });
   const seen = focus(json, layout, at(layout, key));
-  return { steps: Object.fromEntries(seen.steps), unlocks: Object.fromEntries(seen.unlocks), waiting: [...seen.waiting].sort(), summary: focusSummary(key, seen) };
+  return { steps: Object.fromEntries(seen.steps), unlocks: Object.fromEntries(seen.unlocks), waiting: [...seen.waiting].sort(), summary: summaryText(focusSummary(key, seen)) };
 };
 
 test("focus: a three-level chain is steps 1, 2, and 3, and unlocks ↓1, ↓2, and ↓3", () => {
   const json = chain([1, []], [2, [1]], [3, [2]], [4, [3]]);
-  expect(focused(json, "#4")).toEqual({ steps: { "#1": 1, "#2": 2, "#3": 3 }, unlocks: {}, waiting: [], summary: "#4: 3 steps (1 ∥ 1 ∥ 1 issues) · unlocks 0" });
-  expect(focused(json, "#1")).toEqual({ steps: {}, unlocks: { "#2": 1, "#3": 2, "#4": 3 }, waiting: [], summary: "#1: nothing open blocks it · unlocks 3" });
+  expect(focused(json, "#4")).toEqual({ steps: { "#1": 1, "#2": 2, "#3": 3 }, unlocks: {}, waiting: [], summary: "#4: 3 steps (●1 ∥ ●1 ∥ ●1) · unlocks 0" });
+  expect(focused(json, "#1")).toEqual({ steps: {}, unlocks: { "#2": 1, "#3": 2, "#4": 3 }, waiting: [], summary: "#1: nothing open blocks it · unlocks ●1 ●1 ●1" });
 });
 
 test("focus: two independent blockers share step 1", () => {
-  expect(focused(chain([1, []], [2, []], [3, [1, 2]]), "#3")).toMatchObject({ steps: { "#1": 1, "#2": 1 }, summary: "#3: 1 step (2 issues) · unlocks 0" });
+  expect(focused(chain([1, []], [2, []], [3, [1, 2]]), "#3")).toMatchObject({ steps: { "#1": 1, "#2": 1 }, summary: "#3: 1 step (●2) · unlocks 0" });
 });
 
 test("focus: in a diamond a step comes from the longest open chain, not the shortest", () => {
   // #5 waits on #4 and on #2 directly; #4 on #2 and #3; both of those on #1.
   expect(focused(chain([1, []], [2, [1]], [3, [1]], [4, [2, 3]], [5, [4, 2]]), "#5")).toMatchObject({
     steps: { "#1": 1, "#2": 2, "#3": 2, "#4": 3 },
-    summary: "#5: 3 steps (1 ∥ 2 ∥ 1 issues) · unlocks 0",
+    summary: "#5: 3 steps (●1 ∥ ●2 ∥ ●1) · unlocks 0",
   });
 });
 
@@ -123,8 +123,8 @@ test("focus: a closed blocker is done, so the walk stops there; an open blocker 
 
 test("focus: a cycle gives ∞, and a row on both sides of it is a step", () => {
   const json = chain([1, [2]], [2, [1]], [3, [2]]);
-  expect(focused(json, "#3")).toMatchObject({ steps: { "#1": "cycle", "#2": "cycle" }, summary: "#3: 2 ∞ in a cycle · unlocks 0" });
-  expect(focused(json, "#1")).toEqual({ steps: { "#2": "cycle" }, unlocks: {}, waiting: ["#3"], summary: "#1: 1 ∞ in a cycle · unlocks 0" });
+  expect(focused(json, "#3")).toMatchObject({ steps: { "#1": "cycle", "#2": "cycle" }, summary: "#3: ●2 ∞ in a cycle · unlocks 0" });
+  expect(focused(json, "#1")).toEqual({ steps: { "#2": "cycle" }, unlocks: {}, waiting: ["#3"], summary: "#1: ●1 ∞ in a cycle · unlocks 0" });
 });
 
 test("focus: a child with a second open blocker waits, even on a hidden one, and is not unlocked", () => {
@@ -135,10 +135,10 @@ test("focus: a child with a second open blocker waits, even on a hidden one, and
 });
 
 test("focus: a grandchild unlocked through ↓1 is at ↓2", () => {
-  expect(focused(chain([1, []], [2, [1]], [3, [2]], [4, [1, 2]]), "#1")).toMatchObject({ unlocks: { "#2": 1, "#3": 2, "#4": 2 }, waiting: [], summary: "#1: nothing open blocks it · unlocks 3" });
+  expect(focused(chain([1, []], [2, [1]], [3, [2]], [4, [1, 2]]), "#1")).toMatchObject({ unlocks: { "#2": 1, "#3": 2, "#4": 2 }, waiting: [], summary: "#1: nothing open blocks it · unlocks ●1 ●2" });
 });
 
-test("hovering a row: steps red and unlocks green, shaded by level; what waits on more stays grey; the rest fades", () => {
+test("hovering a row: each level group in its own colour, unlock edges dashed; what waits on more stays grey; the rest fades", () => {
   const hovered = (json: GraphJson, key: string) => {
     const layout = timelineLayout(json);
     const hover = timelineHover(json, layout, at(layout, key));
@@ -147,15 +147,21 @@ test("hovering a row: steps red and unlocks green, shaded by level; what waits o
       edges: layout.edges.map((edge, index) => `${keys[edge.from]}>${keys[edge.to]} ${hover.edges[index]}`.trim()).filter((line) => !line.endsWith("faded")),
       badges: Object.fromEntries([...hover.badges].map(([row, badge]) => [keys[row], `${badge.text} ${badge.tone}`])),
       shown: keys.filter((_, row) => !hover.faded.has(row)),
-      summary: hover.summary,
+      summary: hover.summary.map((part) => (typeof part === "string" ? part : `●${part.tone}`)).join(""),
     };
   };
-  expect(hovered(graph(), "#7")).toEqual({ edges: ["#3>#7 blocker r1", "#4>#7 blocker r1"], badges: { "#3": "1 r1", "#4": "1 r1" }, shown: ["#3", "#4", "#7"], summary: "#7: 1 step (2 issues) · unlocks 0" });
-  expect(hovered(graph(), "#3")).toEqual({ edges: ["#3>#8 child g1", "#3>#7"], badges: { "#8": "↓1 g1", "#7": "↓ wait" }, shown: ["#3", "#8", "#7"], summary: "#3: nothing open blocks it · unlocks 1" });
-  // Shades: 1 strongest, 3 for every level after; steps by their source, unlocks by their target.
-  const long = chain([1, []], [2, [1]], [3, [2]], [4, [3]], [5, [4]], [6, [5]]);
-  expect(hovered(long, "#5").edges).toEqual(["#1>#2 blocker r1", "#2>#3 blocker r2", "#3>#4 blocker r3", "#4>#5 blocker r3", "#5>#6 child g1"]);
-  expect(hovered(long, "#1").badges).toEqual({ "#2": "↓1 g1", "#3": "↓2 g2", "#4": "↓3 g3", "#5": "↓4 g3", "#6": "↓5 g3" });
+  expect(hovered(graph(), "#7")).toEqual({ edges: ["#3>#7 blocker c0", "#4>#7 blocker c0"], badges: { "#3": "1 c0", "#4": "1 c0" }, shown: ["#3", "#4", "#7"], summary: "#7: 1 step (●c02) · unlocks 0" });
+  expect(hovered(graph(), "#3")).toEqual({ edges: ["#3>#8 child c0", "#3>#7"], badges: { "#8": "↓1 c0", "#7": "↓ wait" }, shown: ["#3", "#8", "#7"], summary: "#3: nothing open blocks it · unlocks ●c01" });
+  // Groups take the palette in order, step 1 first, then ↓1; an edge takes its source's group (out of the row itself, its target's).
+  const long = chain([1, []], [2, [1]], [3, [2]], [4, [3]], [5, [4]], [6, [5]], [7, [6]]);
+  expect(hovered(long, "#4")).toMatchObject({
+    edges: ["#1>#2 blocker c0", "#2>#3 blocker c1", "#3>#4 blocker c2", "#4>#5 child c3", "#5>#6 child c3", "#6>#7 child c4"],
+    summary: "#4: 3 steps (●c01 ∥ ●c11 ∥ ●c21) · unlocks ●c31 ●c41 ●c51",
+  });
+  // A seventh group cycles back to the first colour.
+  const eight = chain([1, []], [2, [1]], [3, [2]], [4, [3]], [5, [4]], [6, [5]], [7, [6]], [8, [7]]);
+  expect(hovered(eight, "#8").badges).toEqual({ "#1": "1 c0", "#2": "2 c1", "#3": "3 c2", "#4": "4 c3", "#5": "5 c4", "#6": "6 c5", "#7": "7 c0" });
+  expect([...focusGroups(focus(eight, timelineLayout(eight), 0)).values()]).toEqual(["c0", "c1", "c2", "c3", "c4", "c5", "c0"]);
 });
 
 test("the lanes number the most source spans that cross one row, and no two spans on a lane meet", () => {
