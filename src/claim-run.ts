@@ -600,19 +600,26 @@ export const restore = async (io: ClaimIo, number: number): Promise<number> => {
   }
   // A comment without a marker is no claim, so a holder without one is a pull request.
   const pr = holder.pr as number;
-  const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){userContentEdits(last:100){nodes{editedAt diff}}}}}`;
-  const { value } = await call(io, stage, "POST", "/graphql", { query, variables: { owner: io.repo.owner, name: io.repo.name, number: pr } });
-  const errors = record(value).errors;
-  if (Array.isArray(errors) && errors.length > 0) {
-    const types = [...new Set(errors.map((error) => text(record(error).type)).filter((type) => /^[A-Z_]{1,40}$/.test(type)))];
-    throw new Failure(stage, `GitHub's GraphQL API refused the read of #${pr}'s edit history${types.length === 0 ? "" : ` (${types.join(", ")})`}`);
+  // GitHub lists the versions newest first; older pages are read only while none so far carried a marker, so a take's rewrite is never undone by the claim before it.
+  const query = `query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){userContentEdits(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{editedAt diff}}}}}`;
+  let found: { readonly at: string; readonly marker: string } | undefined;
+  let after: string | null = null;
+  for (let page = 1; page <= 10 && found === undefined; page++) {
+    const { value } = await call(io, stage, "POST", "/graphql", { query, variables: { owner: io.repo.owner, name: io.repo.name, number: pr, after } });
+    const errors = record(value).errors;
+    if (Array.isArray(errors) && errors.length > 0) {
+      const types = [...new Set(errors.map((error) => text(record(error).type)).filter((type) => /^[A-Z_]{1,40}$/.test(type)))];
+      throw new Failure(stage, `GitHub's GraphQL API refused the read of #${pr}'s edit history${types.length === 0 ? "" : ` (${types.join(", ")})`}`);
+    }
+    const edits = record(record(record(record(record(value).data).repository).pullRequest).userContentEdits);
+    found = (Array.isArray(edits.nodes) ? edits.nodes.map(record) : [])
+      .map((node) => ({ at: text(node.editedAt), marker: claimMarkerText(text(node.diff)) }))
+      .filter((version): version is { at: string; marker: string } => version.marker !== undefined && parseClaim(version.marker)?.issue === number)
+      .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))[0];
+    const info = record(edits.pageInfo);
+    if (info.hasNextPage !== true || typeof info.endCursor !== "string") break;
+    after = info.endCursor;
   }
-  const nodes = record(record(record(record(record(value).data).repository).pullRequest).userContentEdits).nodes;
-  const versions = (Array.isArray(nodes) ? nodes.map(record) : [])
-    .map((node) => ({ at: text(node.editedAt), marker: claimMarkerText(text(node.diff)) }))
-    .filter((version): version is { at: string; marker: string } => version.marker !== undefined && parseClaim(version.marker)?.issue === number)
-    .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
-  const found = versions[0];
   if (found === undefined) {
     io.print(`agent-gh: #${number} is held by ${describeClaim(holder)}, and no version of its description carried a claim marker for #${number} (a person's pull request, not a claim an edit broke); there is nothing to restore`);
     return 1;

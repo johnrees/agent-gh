@@ -29,7 +29,7 @@ export type Holder = { readonly family: string; readonly session: string };
 /** On a claim pull request: `to` took the claim `id` from `from` (`claim --take`) when the branch's head was `head`. */
 export type TakeMarker = { readonly v: 1; readonly id: string; readonly from: Holder; readonly to: Holder; readonly head: string };
 
-const CLAIM = /<!-- agent-claim (\{[^\n]*?\}) -->/;
+const CLAIM = /<!-- agent-claim (\{[^\n]*?\}) -->/g;
 const RELEASE = /<!-- agent-release (\{[^\n]*?\}) -->/;
 const TAKE = /<!-- agent-take (\{[^\n]*?\}) -->/;
 const ID = /^[0-9a-f]{8,64}$/;
@@ -39,28 +39,41 @@ export const claimMarker = (marker: ClaimMarker): string => `<!-- agent-claim ${
 export const releaseMarker = (marker: ReleaseMarker): string => `<!-- agent-release ${JSON.stringify(marker)} -->`;
 export const takeMarker = (marker: TakeMarker): string => `<!-- agent-take ${JSON.stringify(marker)} -->`;
 
-const markerObject = (pattern: RegExp, body: string): Record<string, unknown> | undefined => {
-  const match = pattern.exec(body);
-  if (match === null) return undefined;
+const objectOf = (json: string): Record<string, unknown> | undefined => {
   try {
-    const value: unknown = JSON.parse(match[1] as string);
+    const value: unknown = JSON.parse(json);
     return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
   } catch {
     return undefined;
   }
 };
 
-/** A body's claim marker; undefined when it has none or it is malformed. */
-export const parseClaim = (body: string): ClaimMarker | undefined => {
-  const value = markerObject(CLAIM, body);
+const markerObject = (pattern: RegExp, body: string): Record<string, unknown> | undefined => {
+  const match = pattern.exec(body);
+  return match === null ? undefined : objectOf(match[1] as string);
+};
+
+const readClaim = (value: Record<string, unknown> | undefined): ClaimMarker | undefined => {
   if (value?.v !== 1 || !Number.isSafeInteger(value.issue) || (value.issue as number) <= 0) return undefined;
   if (typeof value.family !== "string" || !WORD.test(value.family) || typeof value.session !== "string" || !WORD.test(value.session)) return undefined;
   if (typeof value.id !== "string" || !ID.test(value.id)) return undefined;
   return { v: 1, issue: value.issue as number, family: value.family, session: value.session, id: value.id };
 };
 
+/** The first claim marker in a body that reads, and its text; a malformed one ahead of it is passed over, so a restored marker counts. */
+const claimMatch = (body: string): { readonly text: string; readonly marker: ClaimMarker } | undefined => {
+  for (const match of body.matchAll(CLAIM)) {
+    const marker = readClaim(objectOf(match[1] as string));
+    if (marker !== undefined) return { text: match[0], marker };
+  }
+  return undefined;
+};
+
+/** A body's claim marker; undefined when it has none that reads. */
+export const parseClaim = (body: string): ClaimMarker | undefined => claimMatch(body)?.marker;
+
 /** A body's claim marker as written, to carry through a rewrite; undefined when it has none that reads. */
-export const claimMarkerText = (body: string): string | undefined => (parseClaim(body) === undefined ? undefined : CLAIM.exec(body)?.[0]);
+export const claimMarkerText = (body: string): string | undefined => claimMatch(body)?.text;
 
 /** `body` with `marker` appended on its own line: how a description that lost its marker gets it back. */
 export const withClaimMarker = (body: string, marker: string): string => `${body.replace(/\s+$/, "")}\n\n${marker}`;
@@ -256,7 +269,10 @@ export const claimCommentBody = (marker: ClaimMarker, from?: Holder): string =>
     : `${claimMarker(marker)}\nA ${marker.family} session (${marker.session}) took this issue's claim from a ${from.family} session (${from.session}) with \`agent-gh claim --take\`; \`agent-gh release ${marker.issue}\` releases it.`;
 
 /** A claim pull request's description with its marker rewritten to `marker`, as `claim --take` hands it on. */
-export const retakeBody = (body: string, marker: ClaimMarker): string => body.replace(CLAIM, () => claimMarker(marker));
+export const retakeBody = (body: string, marker: ClaimMarker): string => {
+  const found = claimMatch(body);
+  return found === undefined ? body : body.replace(found.text, () => claimMarker(marker));
+};
 
 /** The comment `claim --take` posts on the claim pull request: who took it from whom, and the head the taker continues from. */
 export const takeCommentBody = (marker: TakeMarker): string =>

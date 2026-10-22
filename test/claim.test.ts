@@ -6,6 +6,7 @@ import {
   claimBranchIssue,
   claimCommitMessage,
   claimMarker,
+  claimMarkerText,
   claimsOn,
   firstTake,
   linkedIssues,
@@ -21,6 +22,7 @@ import {
   takesOf,
   taken,
   titleSlug,
+  withClaimMarker,
 } from "../src/claim.ts";
 import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, restore, syncLabels, take, UNKNOWN } from "../src/claim-run.ts";
 import { adoptedCommits } from "../src/review-run.ts";
@@ -952,7 +954,7 @@ test("a description's claim marker is rewritten in place; a take marker reads ba
 
 /** The versions of pull request #31's description, as GraphQL lists them. */
 const history = (...versions: readonly [string, string][]) => () =>
-  reply(200, { data: { repository: { pullRequest: { userContentEdits: { nodes: versions.map(([editedAt, diff]) => ({ editedAt, diff })) } } } } });
+  reply(200, { data: { repository: { pullRequest: { userContentEdits: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: versions.map(([editedAt, diff]) => ({ editedAt, diff })) } } } } });
 
 test("claim --restore puts a dropped marker back from the description's edit history, the latest version that carried one, naming whose it is", async () => {
   const filled = "Closes #7.\n\nWhat the change does, for a newcomer.\n";
@@ -961,7 +963,7 @@ test("claim --restore puts a dropped marker back from the description's edit his
   w.routes[`GET ${PATH}/pulls/31`] = () => reply(200, made);
   w.routes[`PATCH ${PATH}/pulls/31`] = (patch) => (Object.assign(made, JSON.parse(patch)), reply(200, made));
   w.routes["POST /graphql"] = (body) => {
-    expect(JSON.parse(body).variables).toEqual({ owner: "johnrees", name: "widget", number: 31 });
+    expect(JSON.parse(body).variables).toEqual({ owner: "johnrees", name: "widget", number: 31, after: null });
     // Listed out of order: the claim, a take's rewrite, the edit that dropped the marker, and a version naming another issue.
     return history(
       ["2026-10-15T11:00:00Z", filled],
@@ -1009,4 +1011,34 @@ test("claim --restore refuses a closed issue, one nothing claims, a person's pul
   w.routes["POST /graphql"] = () => reply(200, { errors: [{ type: "FORBIDDEN", path: ["repository", "pullRequest", "userContentEdits"] }] });
   const a = session(w.fake, git, git.clone("forbidden"));
   await expect(restore(a.io, 7)).rejects.toThrow("GitHub's GraphQL API refused the read of #31's edit history (FORBIDDEN)");
+});
+
+test("a malformed claim marker ahead of a readable one is passed over by the parse, the text, and a take's rewrite, so a restored marker counts", () => {
+  const mixed = `x\n<!-- agent-claim {} -->\n${marker(7)}\ny`;
+  expect(parseClaim(mixed)).toEqual({ v: 1, issue: 7, family: "claude", session: "s-one", id: "0123456789abcdef" });
+  expect(claimMarkerText(mixed)).toBe(marker(7));
+  expect(retakeBody(mixed, { v: 1, issue: 7, family: "codex", session: "s-two", id: "0123456789abcdef" })).toBe(`x\n<!-- agent-claim {} -->\n${marker(7, "codex", "s-two")}\ny`);
+  expect(claimMarkerText("<!-- agent-claim {} -->")).toBeUndefined();
+  expect(parseClaim(withClaimMarker("Closes #7.\n<!-- agent-claim {} -->\n", marker(7)))?.issue).toBe(7);
+  expect(withClaimMarker("Closes #7.\n\n", marker(7))).toBe(`Closes #7.\n\n${marker(7)}`);
+});
+
+test("claim --restore reads the newest versions first and older pages only while none carried a marker", async () => {
+  const w = world({ pulls: [pull(31, "Closes #7.")] });
+  const made = w.state.pulls[0] as NonNullable<(typeof w.state.pulls)[0]>;
+  w.routes[`GET ${PATH}/pulls/31`] = () => reply(200, made);
+  w.routes[`PATCH ${PATH}/pulls/31`] = (patch) => (Object.assign(made, JSON.parse(patch)), reply(200, made));
+  const cursors: (string | null)[] = [];
+  w.routes["POST /graphql"] = (body) => {
+    const after = JSON.parse(body).variables.after as string | null;
+    cursors.push(after);
+    return after === null
+      ? reply(200, { data: { repository: { pullRequest: { userContentEdits: { pageInfo: { hasNextPage: true, endCursor: "c1" }, nodes: [{ editedAt: "2026-10-15T11:00:00Z", diff: "Closes #7." }] } } } } })
+      : history(["2026-10-15T10:00:00Z", `Closes #7.\n\n${marker(7, "codex", "s-two")}`])();
+  };
+  const git = origin();
+  const a = session(w.fake, git, git.clone("pages"));
+  expect(await restore(a.io, 7)).toBe(0);
+  expect(cursors).toEqual([null, "c1"]);
+  expect(parseClaim(made.body)?.session).toBe("s-two");
 });

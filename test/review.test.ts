@@ -1052,9 +1052,12 @@ test("gh pr edit --body or --body-file keeps a claim pull request's marker when 
   stdin = "New text";
   expect(await dispatchGh(["pr", "edit", "-R", "johnrees/widget", "-F", "-"], here, deps(claimed.io))).toBe(0);
   expect(await dispatchGh(["pr", "edit", "12", "-Rjohnrees/widget", "-t", "Done", "-bShort"], here, deps(claimed.io))).toBe(0);
+  // `-b=` is an empty description with the value in the word, as gh reads it, so `12` stays the selector.
+  expect(await dispatchGh(["pr", "edit", "-b=", "12"], here, deps(claimed.io))).toBe(0);
   expect(calls).toEqual([
     "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "-R", "johnrees/widget", "--body", `New text\n\n${marker}`])}`,
     "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "-Rjohnrees/widget", "-t", "Done", "--body", `Short\n\n${marker}`])}`,
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `\n\n${marker}`])}`,
   ]);
   // A new description that carries a marker, a pull request without one, an edit that leaves the description alone, both flags at once, and a selector the lookup cannot resolve: as given.
   calls.length = 0;

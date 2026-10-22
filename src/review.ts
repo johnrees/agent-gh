@@ -413,8 +413,9 @@ const ghArgs = (args: readonly string[], valued: ValueFlags) => {
       for (let at = 1; at < arg.length; at++) {
         const short = arg[at] as string;
         if (!valued.short.includes(short)) continue;
-        const rest = arg.slice(at + 1).replace(/^=/, "");
-        values.push([short, rest !== "" ? rest : (args[++index] ?? "")]);
+        // As pflag reads it: `-bx` and `-b=x` carry the value in the word (`-b=` an empty one); only a bare `-b` takes the next argument.
+        const attached = arg.slice(at + 1);
+        values.push([short, attached !== "" ? attached.replace(/^=/, "") : (args[++index] ?? "")]);
         spans.push({ start, end: index, ...(at > 1 ? { keep: arg.slice(0, at) } : {}) });
         break;
       }
