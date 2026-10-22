@@ -340,8 +340,8 @@ type World = {
   /** Issue #7's labels and label events, the issue the pull request closes. */
   issueLabels?: string[];
   issueEvents?: unknown[];
-  /** The pull request's description. */
-  pullBody?: string;
+  /** The pull request's description, or what it is at each read. */
+  pullBody?: string | (() => string);
   /** Each head commit's Agent-Session trailer, newest first; undefined for a commit without one. */
   sessions?: (string | undefined)[];
   /** The reviewing session's id; null when its environment names none. */
@@ -377,7 +377,7 @@ const world = ({
     [`GET ${REPO}/pulls/12`]: () => {
       const names = pullReads++ === 0 ? labels : (labelsLater ?? labels);
       return reply(200, {
-        state: "open", title: "Do it", body: pullBody, head: { sha: head }, base: { ref: base }, labels: names.map((name) => ({ name })),
+        state: "open", title: "Do it", body: typeof pullBody === "function" ? pullBody() : pullBody, head: { sha: head }, base: { ref: base }, labels: names.map((name) => ({ name })),
         created_at: CREATED, user: { login: "johnrees", type: "User" },
       });
     },
@@ -1062,6 +1062,14 @@ test("gh pr edit --body or --body-file keeps a claim pull request's marker when 
   // A new description that carries a marker, a pull request without one, an edit that leaves the description alone, both flags at once or one with no value, and a selector the lookup cannot resolve: as given.
   calls.length = 0;
   expect(await dispatchGh(["pr", "edit", "12", "--body", `Done.\n${marker}`], here, deps(claimed.io))).toBe(0);
+  // The marker is read after the input: a `claim --take` that rewrote it while stdin waited is what gets kept.
+  const taken = claimMarker({ v: 1, issue: 7, family: "codex", session: "s-two", id: "0123456789abcdef" });
+  let current = `Closes #7.\n\n${marker}`;
+  const racing = world({ pullBody: () => current });
+  const racingDeps = { ...deps(racing.io), readStdin: async () => ((current = `Closes #7.\n\n${taken}`), "Taken text") };
+  expect(await dispatchGh(["pr", "edit", "12", "--body-file", "-"], here, racingDeps)).toBe(0);
+  expect(calls.at(-1)).toBe(`gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Taken text\n\n${taken}`])}`);
+  calls.length = 0;
   // Stdin or a file read here (it may be a pipe) is gone for gh, so a description from either that carries a marker goes on as --body.
   stdin = `Done.\n${marker}`;
   expect(await dispatchGh(["pr", "edit", "12", "-F-"], here, deps(claimed.io))).toBe(0);
