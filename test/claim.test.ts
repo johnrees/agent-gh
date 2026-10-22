@@ -797,6 +797,21 @@ test("a take comment GitHub stored without answering is found and deleted, so it
   expect(parseClaim(w.state.pulls[0]?.body ?? "")).toMatchObject({ family: "glm", session: "s-three" });
 }, 15_000);
 
+test("claim --take reads a marker that lags its rewrite again, and goes ahead once GitHub shows it", async () => {
+  const w = world();
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  expect(await claim(a.io, { issue: 7, refs: false, noPr: false })).toBe(0);
+  const read = w.routes[`GET ${PATH}/pulls/31`] as (body: string, url: URL) => Response;
+  const stale = { ...(w.state.pulls[0] as Pull) };
+  let reads = 0;
+  w.routes[`GET ${PATH}/pulls/31`] = (body, url) => (++reads === 3 ? reply(200, stale) : read(body, url));
+  const b = session(w.fake, git, git.clone("b"), "codex", "s-two");
+  expect(await take(b.io, 7)).toBe(0);
+  expect(reads).toBe(4);
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("claude/7-fix-the-widget");
+});
+
 test("claim --take whose rewrite cannot be confirmed keeps its comment and the clone on the claim branch, and says so", async () => {
   const w = world();
   const git = origin();

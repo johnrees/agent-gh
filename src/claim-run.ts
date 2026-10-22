@@ -538,15 +538,23 @@ export const take = async (io: ClaimIo, number: number): Promise<number> => {
     return lost(error.marker);
   }
   // Rewritten: the comment stays whatever follows, since a take from this session builds its chain on it.
-  await io.sleep(io.recheckMs);
+  // A read that still shows the previous holder's marker may lag the rewrite, so it is read again.
   let written: ClaimMarker | undefined;
-  try {
-    const after = record((await call(io, stage, "GET", `${repoPath(io)}/pulls/${pr}`)).value);
-    // A pull request closed meanwhile holds nothing, whatever its marker says.
-    written = text(after.state) === "open" ? parseClaim(text(after.body)) : undefined;
-  } catch (error) {
-    if (!(error instanceof Failure)) throw error;
-    io.print(`agent-gh: rewrote #${pr}'s claim marker to this session, but could not read it back (${error.detail}); this clone is on ${branch}: run \`agent-gh claims\` to confirm`);
+  for (let round = 1; round <= READ_BACK_ROUNDS; round++) {
+    await io.sleep(io.recheckMs * round);
+    try {
+      const after = record((await call(io, stage, "GET", `${repoPath(io)}/pulls/${pr}`)).value);
+      // A pull request closed meanwhile holds nothing, whatever its marker says.
+      written = text(after.state) === "open" ? parseClaim(text(after.body)) : undefined;
+    } catch (error) {
+      if (!(error instanceof Failure)) throw error;
+      io.print(`agent-gh: rewrote #${pr}'s claim marker to this session, but could not read it back (${error.detail}); this clone is on ${branch}: run \`agent-gh claims\` to confirm`);
+      return UNKNOWN;
+    }
+    if (!sameClaim(written, from)) break;
+  }
+  if (sameClaim(written, from)) {
+    io.print(`agent-gh: rewrote #${pr}'s claim marker to this session, but GitHub still shows the previous holder's; this clone is on ${branch}: run \`agent-gh claims\` to confirm`);
     return UNKNOWN;
   }
   if (!sameClaim(written, { family: io.family, session: io.session })) {
