@@ -836,11 +836,10 @@ const dispatchEdit = async (args: readonly string[], edit: EditCommand, repo: Re
     if (number === undefined) return deps.runWith(args, env);
     const marker = claimMarkerText(text(record((await call(io, EDIT_STAGE, "GET", `${repoPath(io)}/pulls/${number}`)).value).body));
     if (marker === undefined) return deps.runWith(args, env);
-    const stdin = "file" in edit.body && edit.body.file === "-";
-    const body = "text" in edit.body ? edit.body.text : stdin ? await deps.readStdin() : await deps.readFile(edit.body.file);
+    const body = "text" in edit.body ? edit.body.text : edit.body.file === "-" ? await deps.readStdin() : await deps.readFile(edit.body.file);
     if (body === undefined) return deps.runWith(args, env);
-    // Stdin, once read here, is gone for gh, so what was read goes on as `--body` even when it needs no marker.
-    if (claimMarkerText(body) !== undefined) return deps.runWith(stdin ? withFlags(edit.rest, ["--body", body]) : args, env);
+    // A file read here may have been a pipe or stdin, gone for gh, so what was read goes on as `--body` even when it needs no marker.
+    if (claimMarkerText(body) !== undefined) return deps.runWith("text" in edit.body ? args : withFlags(edit.rest, ["--body", body]), env);
     io.print(`agent-gh: kept #${number}'s claim marker at the end of its new description; the commit hook reads it to tell the holder's commits`);
     return deps.runWith(withFlags(edit.rest, ["--body", withClaimMarker(body, marker)]), env);
   });

@@ -1062,14 +1062,16 @@ test("gh pr edit --body or --body-file keeps a claim pull request's marker when 
   // A new description that carries a marker, a pull request without one, an edit that leaves the description alone, both flags at once, and a selector the lookup cannot resolve: as given.
   calls.length = 0;
   expect(await dispatchGh(["pr", "edit", "12", "--body", `Done.\n${marker}`], here, deps(claimed.io))).toBe(0);
-  // Stdin read here is gone for gh, so a description from it that carries a marker goes on as --body.
+  // Stdin or a file read here (it may be a pipe) is gone for gh, so a description from either that carries a marker goes on as --body.
   stdin = `Done.\n${marker}`;
   expect(await dispatchGh(["pr", "edit", "12", "-F-"], here, deps(claimed.io))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "12", "--body-file", "/dev/fd/3"], here, deps(claimed.io, { "/dev/fd/3": `Done.\n${marker}` }))).toBe(0);
   expect(await dispatchGh(["pr", "edit", "12", "--body=Done."], here, deps(world({ pullBody: "Closes #7." }).io))).toBe(0);
   expect(await dispatchGh(["pr", "edit", "12", "--title", "Done"], here, deps(claimed.io))).toBe(0);
   expect(await dispatchGh(["pr", "edit", "12", "--body", "x", "--body-file", "y"], here, deps(claimed.io))).toBe(0);
   expect(await dispatchGh(["pr", "edit", "nowhere", "--body", "Done."], here, deps(world({ branchPulls: [] }).io))).toBe(0);
   expect(calls).toEqual([
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Done.\n${marker}`])}`,
     "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Done.\n${marker}`])}`,
     "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Done.\n${marker}`])}`,
     "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body=Done."])}`,
