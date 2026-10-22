@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { type GrantMarker, GRANT_LABEL, grantCommand, grantProblem, parseGrant, validTag } from "./allow.ts";
-import { parseClaim, takesOf } from "./claim.ts";
+import { claimMarkerText, parseClaim, takesOf, withClaimMarker } from "./claim.ts";
 import { agentApps, REGISTRY } from "./config.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { familyNames } from "./family.ts";
@@ -45,6 +45,8 @@ import {
   type Finding,
   fullPrompt,
   type HoldConfig,
+  type EditCommand,
+  editCommand,
   graphqlMerges,
   graphqlRefWrites,
   graphqlReleaseRefusal,
@@ -766,6 +768,8 @@ export interface GhDispatch {
   withToken: (repo: Repo | undefined, use: (env: Record<string, string>) => Promise<number>) => Promise<number>;
   /** Reads a file `gh api` would read (`--input`, `-F name=@file`), or undefined when it cannot. */
   readFile: (path: string) => Promise<string | undefined>;
+  /** Reads what gh would read from stdin (`--body-file -`), or undefined when it cannot. */
+  readStdin: () => Promise<string | undefined>;
   io: (repo: Repo, env: Record<string, string>) => ReviewIo;
   /** Runs gh with the token the gate used. */
   runWith: (args: readonly string[], env: Record<string, string>) => Promise<number>;
@@ -780,6 +784,8 @@ export interface GhDispatch {
  * here; a person's gh never reaches it.
  */
 export const dispatchGh = async (args: readonly string[], repo: Repo | undefined, deps: GhDispatch): Promise<number> => {
+  const edit = editCommand(args);
+  if (edit !== undefined) return dispatchEdit(args, edit, repo, deps);
   const ready = readyTarget(args);
   const merge = ready === undefined ? mergeCommand(args) : undefined;
   const target = ready ?? merge?.target;
@@ -807,6 +813,37 @@ export const dispatchGh = async (args: readonly string[], repo: Repo | undefined
       throw new Failure(MERGE_STAGE, `--match-head-commit ${merge.headCommit.slice(0, 8)} is not the head whose checks passed (${head.slice(0, 8)})`);
     }
     return deps.runWith(merge.headCommit === undefined ? withFlags(args, ["--match-head-commit", head]) : args, env);
+  });
+};
+
+const EDIT_STAGE: Stage = "editing the pull request";
+
+/**
+ * `gh pr edit --body`/`--body-file` on a claim pull request: the new
+ * description replaces the whole old one, claim marker included, and the
+ * commit hook then reads the pull request as a person's and refuses the
+ * holder's own commits. So when the pull request's description carries a
+ * marker and the new one has none, gh gets the new text with the old marker
+ * appended. Any other edit, and one of a pull request the lookup cannot
+ * find, runs as given (gh reports its own errors).
+ */
+const dispatchEdit = async (args: readonly string[], edit: EditCommand, repo: Repo | undefined, deps: GhDispatch): Promise<number> => {
+  const target = "repo" in edit.target && edit.target.repo !== undefined ? parseRepo(edit.target.repo) : edit.repo !== undefined ? parseRepo(edit.repo) : repo;
+  if (target === undefined) return deps.run(args);
+  return deps.withToken(target, async (env) => {
+    const io = deps.io(target, env);
+    const number = await pullNumber(io, EDIT_STAGE, edit.target);
+    if (number === undefined) return deps.runWith(args, env);
+    const body = "text" in edit.body ? edit.body.text : edit.body.file === "-" ? await deps.readStdin() : await deps.readFile(edit.body.file);
+    if (body === undefined) return deps.runWith(args, env);
+    // A file read here may have been a pipe or stdin, gone for gh, so what was read goes on as `--body` even when it needs no marker.
+    const given = "text" in edit.body ? args : withFlags(edit.rest, ["--body", body]);
+    if (claimMarkerText(body) !== undefined) return deps.runWith(given, env);
+    // The marker is read after the input, which may have waited, so a take that rewrote it meanwhile is what gets kept.
+    const marker = claimMarkerText(text(record((await call(io, EDIT_STAGE, "GET", `${repoPath(io)}/pulls/${number}`)).value).body));
+    if (marker === undefined) return deps.runWith(given, env);
+    io.print(`agent-gh: kept #${number}'s claim marker at the end of its new description; the commit hook reads it to tell the holder's commits`);
+    return deps.runWith(withFlags(edit.rest, ["--body", withClaimMarker(body, marker)]), env);
   });
 };
 

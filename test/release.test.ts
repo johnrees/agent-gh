@@ -112,6 +112,7 @@ const deps = (io: ReviewIo, calls: string[], files: Record<string, string> = {},
     return use({ GH_TOKEN: "t" });
   },
   readFile: async (path) => files[path],
+  readStdin: async () => undefined,
   io: () => io,
   runWith: async (args) => {
     calls.push(`gh ${args.join(" ")}`);

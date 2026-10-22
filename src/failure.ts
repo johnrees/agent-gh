@@ -54,6 +54,8 @@ export type Stage =
   | "deriving the statuses"
   | "claiming"
   | "releasing"
+  | "restoring a claim"
+  | "editing the pull request"
   | "listing claims"
   | "finding the next issue"
   | "reading the graph";

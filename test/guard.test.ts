@@ -42,9 +42,9 @@ const NEVER: ClaimCheck = {
 };
 
 /** The claim on #64 as `claims` would report it: draft #65 by a session, or (both null) a person's pull request. */
-const claimBy = (session: string | null, family: string | null = "claude"): Claim => ({
+const claimBy = (session: string | null, family: string | null = "claude", branch = "claude/64-fix"): Claim => ({
   issue: 64, kind: "pr", pr: 65, comment: null, url: "https://github.com/johnrees/penmon/pull/65", author: "someone", family, session,
-  id: family === null ? null : "0123456789abcdef", branch: "claude/64-fix", draft: true, createdAt: "2026-10-21T00:00:00Z",
+  id: family === null ? null : "0123456789abcdef", branch, draft: true, createdAt: "2026-10-21T00:00:00Z",
 });
 
 /**
@@ -124,8 +124,15 @@ test("a commit on the session's own claim branch is credited with its session; o
   expect(other.message).toBe("work\n");
   // Another family's claim branch is a claim branch too, and a person's pull request holds an issue as well.
   expect((await hookOn("codex/64-fix", claimBy("s-two", "codex"))).verdict.code).toBe(1);
-  const person = await hookOn("claude/64-fix", claimBy(null, null));
+  const person = await hookOn("claude/64-fix", claimBy(null, null, "fix-64"));
   expect(person.verdict.message).toContain("#64 is held by draft #65 by someone (https://github.com/johnrees/penmon/pull/65), not this claude session (s-one)");
+  // This branch's own pull request with no marker: an edit of its description dropped it, so the hook names the marker and its restore, not another session.
+  const dropped = await hookOn("claude/64-fix", claimBy(null, null));
+  expect(dropped.verdict).toEqual({
+    code: 1,
+    message: `agent-gh guard: branch \`claude/64-fix\` is #64's claim branch, and its draft #65 (https://github.com/johnrees/penmon/pull/65) carries no agent-claim marker, so nothing says which session holds #64 (an edit of the description dropped it); run \`agent-gh claim --restore 64\` to put it back from the description's edit history, then commit again.\n${NEXT_STEP}`,
+  });
+  expect(dropped.message).toBe("work\n");
   // A session with no id in its environment holds nothing the hook can see, and is told how to say who it is.
   const anonymous = await hookOn("claude/64-fix", claimBy("s-two"), { id: "f00d", generated: true });
   expect(anonymous.verdict.message).toContain("not this session, which has no id in its environment (set AGENT_GH_SESSION to the id its claim printed)");

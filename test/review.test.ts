@@ -340,8 +340,8 @@ type World = {
   /** Issue #7's labels and label events, the issue the pull request closes. */
   issueLabels?: string[];
   issueEvents?: unknown[];
-  /** The pull request's description. */
-  pullBody?: string;
+  /** The pull request's description, or what it is at each read. */
+  pullBody?: string | (() => string);
   /** Each head commit's Agent-Session trailer, newest first; undefined for a commit without one. */
   sessions?: (string | undefined)[];
   /** The reviewing session's id; null when its environment names none. */
@@ -377,7 +377,7 @@ const world = ({
     [`GET ${REPO}/pulls/12`]: () => {
       const names = pullReads++ === 0 ? labels : (labelsLater ?? labels);
       return reply(200, {
-        state: "open", title: "Do it", body: pullBody, head: { sha: head }, base: { ref: base }, labels: names.map((name) => ({ name })),
+        state: "open", title: "Do it", body: typeof pullBody === "function" ? pullBody() : pullBody, head: { sha: head }, base: { ref: base }, labels: names.map((name) => ({ name })),
         created_at: CREATED, user: { login: "johnrees", type: "User" },
       });
     },
@@ -994,6 +994,7 @@ test("gh pr ready runs only after the gate passes, with the gate's token; other 
       return use({ GH_TOKEN: "t" });
     },
     readFile: async () => undefined,
+    readStdin: async () => undefined,
     io: () => io,
     runWith: async (args, env) => {
       calls.push(`gated gh ${args.join(" ")} ${env.GH_TOKEN}`);
@@ -1018,6 +1019,79 @@ test("gh pr ready runs only after the gate passes, with the gate's token; other 
   calls.length = 0;
   await dispatchGh(["pr", "ready", "https://github.com/johnrees/widget/pull/12"], parseRepo("someone/else"), deps(done));
   expect(calls[0]).toBe("token johnrees/widget");
+});
+
+test("gh pr edit --body or --body-file keeps a claim pull request's marker when the new description has none; other edits run as given", async () => {
+  const calls: string[] = [];
+  let stdin: string | undefined;
+  const deps = (io: ReviewIo, files: Record<string, string> = {}): GhDispatch => ({
+    withToken: async (repo, use) => {
+      calls.push(`token ${repo === undefined ? "none" : slug(repo)}`);
+      return use({ GH_TOKEN: "t" });
+    },
+    readFile: async (path) => files[path],
+    readStdin: async () => stdin,
+    io: () => io,
+    runWith: async (args) => {
+      calls.push(`gated gh ${JSON.stringify(args)}`);
+      return 0;
+    },
+    run: async (args) => {
+      calls.push(`gh ${JSON.stringify(args)}`);
+      return 0;
+    },
+  });
+  const here = parseRepo("johnrees/widget");
+  const marker = claimMarker({ v: 1, issue: 7, family: "claude", session: "s-one", id: "0123456789abcdef" });
+  const claimed = world({ pullBody: `Closes #7.\n\nA claude session claimed #7 with \`agent-gh claim\`.\n\n${marker}` });
+  expect(await dispatchGh(["pr", "edit", "12", "--body-file", "/work/body.md"], here, deps(claimed.io, { "/work/body.md": "Closes #7.\n\nWhat it does.\n" }))).toBe(0);
+  expect(calls).toEqual(["token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Closes #7.\n\nWhat it does.\n\n${marker}`])}`]);
+  expect(claimed.printed).toEqual(["agent-gh: kept #12's claim marker at the end of its new description; the commit hook reads it to tell the holder's commits"]);
+  // The marker is read after the input: a `claim --take` that rewrote it while stdin waited is what gets kept.
+  const taken = claimMarker({ v: 1, issue: 7, family: "codex", session: "s-two", id: "0123456789abcdef" });
+  let current = `Closes #7.\n\n${marker}`;
+  const racing = world({ pullBody: () => current });
+  const racingDeps = { ...deps(racing.io), readStdin: async () => ((current = `Closes #7.\n\n${taken}`), "Taken text") };
+  expect(await dispatchGh(["pr", "edit", "12", "--body-file", "-"], here, racingDeps)).toBe(0);
+  expect(calls.at(-1)).toBe(`gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Taken text\n\n${taken}`])}`);
+  // The current branch's pull request, the description from stdin, and a value attached to -b.
+  calls.length = 0;
+  stdin = "New text";
+  expect(await dispatchGh(["pr", "edit", "-R", "johnrees/widget", "-F", "-"], here, deps(claimed.io))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "12", "-Rjohnrees/widget", "-t", "Done", "-bShort"], here, deps(claimed.io))).toBe(0);
+  // `-b=` is an empty description with the value in the word, as gh reads it, so `12` stays the selector.
+  expect(await dispatchGh(["pr", "edit", "-b=", "12"], here, deps(claimed.io))).toBe(0);
+  expect(calls).toEqual([
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "-R", "johnrees/widget", "--body", `New text\n\n${marker}`])}`,
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "-Rjohnrees/widget", "-t", "Done", "--body", `Short\n\n${marker}`])}`,
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `\n\n${marker}`])}`,
+  ]);
+  // A new description that carries a marker, a pull request without one, an edit that leaves the description alone, both flags at once or one with no value, and a selector the lookup cannot resolve: as given.
+  calls.length = 0;
+  expect(await dispatchGh(["pr", "edit", "12", "--body", `Done.\n${marker}`], here, deps(claimed.io))).toBe(0);
+  // Stdin or a file read here (it may be a pipe) is gone for gh, so a description from either that carries a marker goes on as --body.
+  stdin = `Done.\n${marker}`;
+  expect(await dispatchGh(["pr", "edit", "12", "-F-"], here, deps(claimed.io))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "12", "--body-file", "/dev/fd/3"], here, deps(claimed.io, { "/dev/fd/3": `Done.\n${marker}` }))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "12", "--body=Done."], here, deps(world({ pullBody: "Closes #7." }).io))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "12", "--body-file", "/work/plain.md"], here, deps(world({ pullBody: "Closes #7." }).io, { "/work/plain.md": "Plain." }))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "12", "--title", "Done"], here, deps(claimed.io))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "12", "--body", "x", "--body-file", "y"], here, deps(claimed.io))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "12", "--body"], here, deps(claimed.io))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "12", "-F"], here, deps(claimed.io))).toBe(0);
+  expect(await dispatchGh(["pr", "edit", "nowhere", "--body", "Done."], here, deps(world({ branchPulls: [] }).io))).toBe(0);
+  expect(calls).toEqual([
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Done.\n${marker}`])}`,
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Done.\n${marker}`])}`,
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", `Done.\n${marker}`])}`,
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body=Done."])}`,
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "12", "--body", "Plain."])}`,
+    `gh ${JSON.stringify(["pr", "edit", "12", "--title", "Done"])}`,
+    `gh ${JSON.stringify(["pr", "edit", "12", "--body", "x", "--body-file", "y"])}`,
+    `gh ${JSON.stringify(["pr", "edit", "12", "--body"])}`,
+    `gh ${JSON.stringify(["pr", "edit", "12", "-F"])}`,
+    "token johnrees/widget", `gated gh ${JSON.stringify(["pr", "edit", "nowhere", "--body", "Done."])}`,
+  ]);
 });
 
 /** A config with a hold, which the workflow's statuses need. */
@@ -1146,6 +1220,7 @@ const PASSED = { status: [{ context: "agent-review", state: "success" }], checkR
 const mergeDeps = (io: ReviewIo, calls: string[], files: Record<string, string> = {}): GhDispatch => ({
   withToken: async (_, use) => use({ GH_TOKEN: "t" }),
   readFile: async (path) => files[path],
+  readStdin: async () => undefined,
   io: () => io,
   runWith: async (args) => {
     calls.push(`gh ${args.join(" ")}`);

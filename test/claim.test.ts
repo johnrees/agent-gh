@@ -6,6 +6,7 @@ import {
   claimBranchIssue,
   claimCommitMessage,
   claimMarker,
+  claimMarkerText,
   claimsOn,
   firstTake,
   linkedIssues,
@@ -21,8 +22,9 @@ import {
   takesOf,
   taken,
   titleSlug,
+  withClaimMarker,
 } from "../src/claim.ts";
-import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, syncLabels, take, UNKNOWN } from "../src/claim-run.ts";
+import { claim, type ClaimIo, claimsLines, eventIssues, holderOf, listClaims, release, restore, syncLabels, take, UNKNOWN } from "../src/claim-run.ts";
 import { adoptedCommits } from "../src/review-run.ts";
 import { apiReader, claimNext } from "../src/next-run.ts";
 import { fakeGitHub, reply } from "./fake-github.ts";
@@ -117,6 +119,9 @@ test("the commands parse as the usage says", () => {
   expect(parseClaimArgs("claim", ["7", "--take"])).toEqual({ command: "take", issue: 7 });
   for (const bad of [["--take"], ["--take", "7", "--refs"], ["--take", "7", "--no-pr"], ["--take", "--next"], ["--take", "7", "8"], ["--take", "--take", "7"]]) expect(parseClaimArgs("claim", bad)).toBeUndefined();
   expect(parseClaimArgs("claim", ["--take", "7", "--skip-label", "x"])).toBeUndefined();
+  expect(parseClaimArgs("claim", ["--restore", "7", "-R", "o/r"])).toEqual({ command: "restore", issue: 7 });
+  expect(parseClaimArgs("claim", ["7", "--restore"])).toEqual({ command: "restore", issue: 7 });
+  for (const bad of [["--restore"], ["--restore", "7", "--refs"], ["--take", "--restore", "7"], ["--restore", "7", "8"], ["--restore", "7", "--skip-label", "x"]]) expect(parseClaimArgs("claim", bad)).toBeUndefined();
   expect(parseClaimArgs("release", ["7"])).toEqual({ command: "release", issue: 7 });
   expect(parseClaimArgs("claims", ["--json", "-Ro/r"])).toEqual({ command: "claims", json: true });
   expect(parseClaimArgs("claims", [])).toEqual({ command: "claims", json: false });
@@ -945,4 +950,95 @@ test("a description's claim marker is rewritten in place; a take marker reads ba
   const good = { v: 1, id: "0123456789abcdef", from: { family: "claude", session: "s-one" }, to: { family: "codex", session: "s-two" }, head: "a".repeat(40) };
   expect(parseTake(`<!-- agent-take ${JSON.stringify(good)} -->`)).toEqual(good as never);
   for (const bad of [{ ...good, head: "abc" }, { ...good, from: { family: "claude" } }, { ...good, id: "x" }, { ...good, v: 2 }]) expect(parseTake(`<!-- agent-take ${JSON.stringify(bad)} -->`)).toBeUndefined();
+});
+
+/** The versions of pull request #31's description, as GraphQL lists them. */
+const history = (...versions: readonly [string, string][]) => () =>
+  reply(200, { data: { repository: { pullRequest: { userContentEdits: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: versions.map(([editedAt, diff]) => ({ editedAt, diff })) } } } } });
+
+test("claim --restore puts a dropped marker back from the description's edit history, the latest version that carried one, naming whose it is", async () => {
+  const filled = "Closes #7.\n\nWhat the change does, for a newcomer.\n";
+  const w = world({ pulls: [pull(31, filled)] });
+  const made = w.state.pulls[0] as NonNullable<(typeof w.state.pulls)[0]>;
+  w.routes[`GET ${PATH}/pulls/31`] = () => reply(200, made);
+  w.routes[`PATCH ${PATH}/pulls/31`] = (patch) => (Object.assign(made, JSON.parse(patch)), reply(200, made));
+  w.routes["POST /graphql"] = (body) => {
+    expect(JSON.parse(body).variables).toEqual({ owner: "johnrees", name: "widget", number: 31, after: null });
+    // Listed out of order: the claim, a take's rewrite, the edit that dropped the marker, and a version naming another issue.
+    return history(
+      ["2026-10-15T11:00:00Z", filled],
+      ["2026-10-15T10:00:00Z", `Closes #7.\n\n${marker(7, "claude", "s-one")}`],
+      ["2026-10-15T10:30:00Z", `Closes #7.\n\n${marker(7, "codex", "s-two")}`],
+      ["2026-10-15T10:45:00Z", `Closes #7.\n\n${marker(8, "codex", "s-two")}`],
+    )();
+  };
+  const git = origin();
+  const a = session(w.fake, git, git.clone("a"));
+  expect(await restore(a.io, 7)).toBe(0);
+  expect(made.body).toBe(`${filled.trimEnd()}\n\n${marker(7, "codex", "s-two")}`);
+  expect(a.printed).toEqual([
+    "agent-gh: restored #31's claim marker on #7 from its description's version of 2026-10-15T10:30:00Z; it names a codex session (s-two), and `agent-gh claim --take 7` hands the claim to this one",
+    "https://github.com/johnrees/widget/pull/31",
+  ]);
+  // The hook now sees that session as the holder, and a second restore finds the marker in place.
+  const holder = await holderOf(a.io, "checking the commit", 7);
+  expect(holder !== undefined && mine(holder, "codex", "s-two")).toBe(true);
+  expect(await restore(a.io, 7)).toBe(1);
+  expect(a.printed.at(-1)).toBe("agent-gh: #7 is held by draft #31 by a codex session (s-two) (https://github.com/johnrees/widget/pull/31), whose marker is in place; there is nothing to restore");
+  expect(sent(w.fake, "PATCH", `${PATH}/pulls/31`)).toHaveLength(1);
+  // Restored for this session, it says so and exits 0 again.
+  const b = session(w.fake, git, git.clone("b"), "codex", "s-two");
+  expect(await restore(b.io, 7)).toBe(0);
+  expect(b.printed).toEqual(["agent-gh: #7 is held by draft #31 by a codex session (s-two) (https://github.com/johnrees/widget/pull/31), whose marker is in place; there is nothing to restore"]);
+});
+
+test("claim --restore refuses a closed issue, one nothing claims, a person's pull request whose description never carried a marker, and reports a GraphQL refusal", async () => {
+  const git = origin();
+  const cases: [Parameters<typeof world>[0], string][] = [
+    [{ issues: [{ ...OPEN, state: "closed", labels: [] }] }, "#7 is closed; there is no claim to restore"],
+    [{}, "nothing claims #7, so there is no marker to restore; claim it with `agent-gh claim 7`"],
+    [{ pulls: [pull(5, "Fixes #7", { user: { login: "someone" }, draft: false })] }, "#7 is held by #5 by someone (https://github.com/johnrees/widget/pull/5), and no version of its description carried a claim marker for #7"],
+  ];
+  for (const [setup, expected] of cases) {
+    const w = world(setup);
+    w.routes["POST /graphql"] = history(["2026-10-15T10:00:00Z", "Fixes #7"]);
+    const a = session(w.fake, git, git.clone(`restore-${Math.random()}`));
+    expect(await restore(a.io, 7)).toBe(1);
+    expect(a.printed.join("\n")).toContain(expected);
+    expect(w.fake.log.filter((entry) => entry.method !== "GET" && entry.path !== "/graphql")).toEqual([]);
+  }
+  const w = world({ pulls: [pull(31, "Closes #7.")] });
+  w.routes["POST /graphql"] = () => reply(200, { errors: [{ type: "FORBIDDEN", path: ["repository", "pullRequest", "userContentEdits"] }] });
+  const a = session(w.fake, git, git.clone("forbidden"));
+  await expect(restore(a.io, 7)).rejects.toThrow("GitHub's GraphQL API refused the read of #31's edit history (FORBIDDEN)");
+});
+
+test("a malformed claim marker ahead of a readable one is passed over by the parse, the text, and a take's rewrite, so a restored marker counts", () => {
+  const mixed = `x\n<!-- agent-claim {} -->\n${marker(7)}\ny`;
+  expect(parseClaim(mixed)).toEqual({ v: 1, issue: 7, family: "claude", session: "s-one", id: "0123456789abcdef" });
+  expect(claimMarkerText(mixed)).toBe(marker(7));
+  expect(retakeBody(mixed, { v: 1, issue: 7, family: "codex", session: "s-two", id: "0123456789abcdef" })).toBe(`x\n<!-- agent-claim {} -->\n${marker(7, "codex", "s-two")}\ny`);
+  expect(claimMarkerText("<!-- agent-claim {} -->")).toBeUndefined();
+  expect(parseClaim(withClaimMarker("Closes #7.\n<!-- agent-claim {} -->\n", marker(7)))?.issue).toBe(7);
+  expect(withClaimMarker("Closes #7.\n\n", marker(7))).toBe(`Closes #7.\n\n${marker(7)}`);
+});
+
+test("claim --restore reads the newest versions first and older pages only while none carried a marker", async () => {
+  const w = world({ pulls: [pull(31, "Closes #7.")] });
+  const made = w.state.pulls[0] as NonNullable<(typeof w.state.pulls)[0]>;
+  w.routes[`GET ${PATH}/pulls/31`] = () => reply(200, made);
+  w.routes[`PATCH ${PATH}/pulls/31`] = (patch) => (Object.assign(made, JSON.parse(patch)), reply(200, made));
+  const cursors: (string | null)[] = [];
+  w.routes["POST /graphql"] = (body) => {
+    const after = JSON.parse(body).variables.after as string | null;
+    cursors.push(after);
+    return after === null
+      ? reply(200, { data: { repository: { pullRequest: { userContentEdits: { pageInfo: { hasNextPage: true, endCursor: "c1" }, nodes: [{ editedAt: "2026-10-15T11:00:00Z", diff: "Closes #7." }] } } } } })
+      : history(["2026-10-15T10:00:00Z", `Closes #7.\n\n${marker(7, "codex", "s-two")}`])();
+  };
+  const git = origin();
+  const a = session(w.fake, git, git.clone("pages"));
+  expect(await restore(a.io, 7)).toBe(0);
+  expect(cursors).toEqual([null, "c1"]);
+  expect(parseClaim(made.body)?.session).toBe("s-two");
 });

@@ -391,8 +391,13 @@ const ghArgs = (args: readonly string[], valued: ValueFlags) => {
   const words: string[] = [];
   const flags: string[] = [];
   const values: [string, string][] = [];
+  /** Where each value's flag and value sit in `args`, and what of a short cluster stays when they go (`-sb x` leaves `-s`). */
+  const spans: { readonly start: number; readonly end: number; readonly keep?: string }[] = [];
+  /** Flags that take a value but ended the arguments without one, which gh refuses. */
+  const missing: string[] = [];
   for (let index = 0; index < args.length; index++) {
     const arg = args[index] as string;
+    const start = index;
     if (arg === "--") {
       words.push(...args.slice(index + 1));
       break;
@@ -400,21 +405,41 @@ const ghArgs = (args: readonly string[], valued: ValueFlags) => {
     if (arg.startsWith("--")) {
       flags.push(arg);
       const [name, attached] = arg.includes("=") ? [arg.slice(2, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg.slice(2), undefined];
-      if (valued.long.includes(name)) values.push([name, attached ?? (args[++index] ?? "")]);
+      if (valued.long.includes(name)) {
+        const value = attached ?? args[++index];
+        if (value === undefined) missing.push(name);
+        values.push([name, value ?? ""]);
+        spans.push({ start, end: index });
+      }
     } else if (arg.startsWith("-") && arg.length > 1) {
       flags.push(arg);
       // A cluster of short flags (`-sd`); the first that takes a value takes the rest of the word, or the next one.
       for (let at = 1; at < arg.length; at++) {
         const short = arg[at] as string;
         if (!valued.short.includes(short)) continue;
-        const rest = arg.slice(at + 1).replace(/^=/, "");
-        values.push([short, rest !== "" ? rest : (args[++index] ?? "")]);
+        // As pflag reads it: `-bx` and `-b=x` carry the value in the word (`-b=` an empty one); only a bare `-b` takes the next argument.
+        const attached = arg.slice(at + 1);
+        const value = attached !== "" ? attached.replace(/^=/, "") : args[++index];
+        if (value === undefined) missing.push(short);
+        values.push([short, value ?? ""]);
+        spans.push({ start, end: index, ...(at > 1 ? { keep: arg.slice(0, at) } : {}) });
         break;
       }
     } else words.push(arg);
   }
   const last = (...names: string[]) => values.findLast(([name]) => names.includes(name))?.[1];
-  return { words, flags, values, last };
+  /** `args` without the named flags and their values, the rest as it was. */
+  const without = (names: readonly string[]): string[] => {
+    const kept: (string | undefined)[] = [...args];
+    values.forEach(([name], at) => {
+      const span = spans[at];
+      if (!names.includes(name) || span === undefined) return;
+      for (let index = span.start; index <= span.end; index++) kept[index] = undefined;
+      if (span.keep !== undefined) kept[span.start] = span.keep;
+    });
+    return kept.filter((arg): arg is string => arg !== undefined);
+  };
+  return { words, flags, values, last, without, missing };
 };
 
 /**
@@ -475,6 +500,35 @@ export const mergeCommand = (
   const admin = lastBoolean(flags, "admin", true);
   if (!admin && lastBoolean(flags, "disable-auto", false)) return undefined;
   return { target: selector(words[2]), admin, auto: lastBoolean(flags, "auto", false), headCommit: last("match-head-commit") };
+};
+
+const EDIT_FLAGS: ValueFlags = {
+  long: ["repo", "body", "body-file", "title", "base", "milestone", "add-assignee", "remove-assignee", "add-label", "remove-label", "add-project", "remove-project", "add-reviewer", "remove-reviewer"],
+  short: "RbFtBm",
+};
+
+/** `gh pr edit` with a new description: the pull request, the description (text, or a file; `-` is stdin), `-R`, and the arguments without the description flags. */
+export type EditCommand = {
+  readonly target: ReadyTarget;
+  readonly body: { readonly text: string } | { readonly file: string };
+  readonly repo: string | undefined;
+  readonly rest: readonly string[];
+};
+
+/**
+ * `gh pr edit --body <text>` or `--body-file <path>`, as gh reads it: the
+ * last of a repeated flag wins. Undefined for an edit that leaves the
+ * description alone, for one giving both flags (gh refuses that itself), and
+ * for any other command.
+ */
+export const editCommand = (args: readonly string[]): EditCommand | undefined => {
+  const { words, last, without, missing } = ghArgs(args, EDIT_FLAGS);
+  if (words[0] !== "pr" || words[1] !== "edit") return undefined;
+  const text = last("b", "body");
+  const file = last("F", "body-file");
+  // Both flags, or one with no value: gh refuses the command itself.
+  if ((text === undefined) === (file === undefined) || missing.some((name) => ["b", "body", "F", "body-file"].includes(name))) return undefined;
+  return { target: selector(words[2]), body: text !== undefined ? { text } : { file: file as string }, repo: last("R", "repo"), rest: without(["b", "body", "F", "body-file"]) };
 };
 
 /**
