@@ -26,7 +26,6 @@ import {
   releaseCommentBody,
   retakeBody,
   takeCommentBody,
-  type TakeMarker,
   type Taken,
   taken,
 } from "./claim.ts";
@@ -493,27 +492,32 @@ export const take = async (io: ClaimIo, number: number): Promise<number> => {
     posted = record((await call(io, stage, "POST", `${repoPath(io)}/issues/${pr}/comments`, { body: takeBody })).value).id;
     // GitHub has no compare-and-swap, so of several sessions taking this claim at once, the one whose take comment is listed first goes ahead.
     const holding: ClaimMarker = { ...marker, family: from.family, session: from.session };
-    let first: { readonly id: number; readonly marker: TakeMarker } | undefined;
+    let first: ReturnType<typeof firstTake>;
     for (let round = 1; round <= READ_BACK_ROUNDS && first === undefined; round++) {
       await io.sleep(io.recheckMs * round);
       first = firstTake(await comments(io, stage, pr), holding);
     }
     // This session's own earlier take, one whose rewrite went unanswered, goes ahead as this one.
     if (first?.id !== posted && !(first !== undefined && first.marker.to.family === io.family && first.marker.to.session === io.session)) {
-      throw new Lost(undefined, first === undefined ? "GitHub does not list this take's comment yet" : "another session's take of it was posted first");
+      throw new Lost(
+        undefined,
+        first === undefined
+          ? "GitHub does not list this take's comment yet"
+          : `a ${first.marker.to.family} session's (${first.marker.to.session}) take of it was posted first (${first.url}; if that take was abandoned before it rewrote the marker, delete that comment)`,
+      );
     }
     // Read again just before the rewrite, and after it: of two sessions taking at once, the one whose rewrite stands holds the claim.
     const now = record((await call(io, stage, "GET", `${repoPath(io)}/pulls/${pr}`)).value);
     if (text(now.state) !== "open") throw new Lost(undefined, `#${pr} was closed while this take ran`);
     if (!sameClaim(parseClaim(text(now.body)), from)) throw new Lost(parseClaim(text(now.body)));
-    // Unanswered, the rewrite may have landed; answered with an error, it did not.
+    // Unanswered, or failed on GitHub's side (5xx), the rewrite may have landed; refused (4xx), it did not.
     rewritten = undefined;
     const { status } = await request(io.api, stage, "PATCH", `${repoPath(io)}/pulls/${pr}`, io.token, { body: retakeBody(text(now.body), marker) });
-    rewritten = status >= 200 && status < 300;
+    rewritten = status >= 200 && status < 300 ? true : status >= 500 ? undefined : false;
     if (!rewritten) throw new Failure(stage, `HTTP ${status} from PATCH ${repoPath(io)}/pulls/${pr}`);
   } catch (error) {
     if (rewritten === undefined) {
-      io.print(`agent-gh: rewriting #${pr}'s claim marker went unanswered, so whether this session took #${number} is unknown; this clone stays on ${branch}: run \`agent-gh claims\`, and switch back if it is still another session's`);
+      io.print(`agent-gh: rewriting #${pr}'s claim marker went unanswered or failed on GitHub's side, so whether this session took #${number} is unknown; this clone stays on ${branch}: run \`agent-gh claims\`, and switch back if it is still another session's`);
       return UNKNOWN;
     }
     // A take comment whose marker was never rewritten hands nothing on (`takesOf`), but would go ahead of the next session's take (`firstTake`), so it is deleted;
@@ -528,7 +532,7 @@ export const take = async (io: ClaimIo, number: number): Promise<number> => {
     await back();
     if (!(error instanceof Lost)) throw error;
     if (error.why !== undefined) {
-      io.print(`agent-gh: ${error.why}, so this session took nothing from #${pr}; run \`agent-gh claims\`, and take again if it is still another session's`);
+      io.print(`agent-gh: this session took nothing from #${pr}: ${error.why}; run \`agent-gh claims\`, and take again if it is still another session's`);
       return 1;
     }
     return lost(error.marker);

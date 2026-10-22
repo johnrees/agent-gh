@@ -689,8 +689,8 @@ test("claim --take of a pull request claim refuses uncommitted changes, and a lo
   expect(parseClaim(w.state.pulls[0]?.body ?? "")?.session).toBe("s-one");
   // GitHub refusing the marker's rewrite leaves the claim with its holder and the clone where it was.
   git.run(["branch", "-q", "-D", "claude/7-fix-the-widget"], b.dir);
-  w.routes[`PATCH ${PATH}/pulls/31`] = () => reply(500, {});
-  await expect(take(b.io, 7)).rejects.toThrow("HTTP 500 from PATCH");
+  w.routes[`PATCH ${PATH}/pulls/31`] = () => reply(422, {});
+  await expect(take(b.io, 7)).rejects.toThrow("HTTP 422 from PATCH");
   expect(parseClaim(w.state.pulls[0]?.body ?? "")?.session).toBe("s-one");
   const [made] = sent(w.fake, "POST", `${PATH}/issues/31/comments`);
   expect(parseTake(String(made?.body))?.to).toEqual({ family: "codex", session: "s-two" });
@@ -734,7 +734,9 @@ test("of two sessions taking one claim at once, the one whose take comment is li
   expect(codes.sort()).toEqual([0, 1]);
   const won = parseClaim(w.state.pulls[0]?.body ?? "");
   const [winner, loser] = won?.session === "s-two" ? [b, c] : [c, b];
-  expect(loser.printed.at(-1)).toBe("agent-gh: another session's take of it was posted first, so this session took nothing from #31; run `agent-gh claims`, and take again if it is still another session's");
+  expect(loser.printed.at(-1)).toBe(
+    `agent-gh: this session took nothing from #31: a ${winner === b ? "codex" : "glm"} session's (${won?.session}) take of it was posted first (https://github.com/johnrees/widget/issues/7#issuecomment-500; if that take was abandoned before it rewrote the marker, delete that comment); run \`agent-gh claims\`, and take again if it is still another session's`,
+  );
   expect((w.state.comments[31] ?? []).map((item) => parseTake(String((item as { body: string }).body))?.to.session)).toEqual([won?.session]);
   expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], loser.dir).stdout).toBe("main");
   expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], winner.dir).stdout).toBe("claude/7-fix-the-widget");
@@ -747,11 +749,15 @@ test("a take whose rewrite went unanswered goes ahead when run again; one whose 
   expect(await claim(a.io, { issue: 7, refs: false, noPr: false })).toBe(0);
   const theirs = work(git, a.dir, "a.txt", "s-one");
   const patch = w.routes[`PATCH ${PATH}/pulls/31`] as (body: string, url: URL) => Response;
-  // GitHub never answers the rewrite (and never applies it).
+  // GitHub never answers the rewrite (and never applies it), then fails on its side.
   w.routes[`PATCH ${PATH}/pulls/31`] = async () => (await Bun.sleep(2500), reply(504, {}));
   const b = session(w.fake, git, git.clone("b"), "codex", "s-two");
   expect(await take(b.io, 7)).toBe(UNKNOWN);
-  expect(b.printed.at(-1)).toContain("rewriting #31's claim marker went unanswered, so whether this session took #7 is unknown");
+  expect(b.printed.at(-1)).toContain("rewriting #31's claim marker went unanswered or failed on GitHub's side, so whether this session took #7 is unknown");
+  expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("claude/7-fix-the-widget");
+  w.routes[`PATCH ${PATH}/pulls/31`] = () => reply(502, {});
+  expect(await take(b.io, 7)).toBe(UNKNOWN);
+  expect(w.fake.log.filter((entry) => entry.method === "DELETE")).toEqual([]);
   expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], b.dir).stdout).toBe("claude/7-fix-the-widget");
   w.routes[`PATCH ${PATH}/pulls/31`] = patch;
   expect(await take(b.io, 7)).toBe(0);
@@ -764,9 +770,9 @@ test("a take whose rewrite went unanswered goes ahead when run again; one whose 
   w.routes[`GET ${PATH}/pulls/31`] = (body, url) => (++reads === 2 ? reply(200, { ...(w.state.pulls[0] as Pull), state: "closed" }) : read(body, url));
   const posts = sent(w.fake, "POST", `${PATH}/issues/31/comments`).length;
   expect(await take(c.io, 7)).toBe(1);
-  expect(c.printed.at(-1)).toBe("agent-gh: #31 was closed while this take ran, so this session took nothing from #31; run `agent-gh claims`, and take again if it is still another session's");
+  expect(c.printed.at(-1)).toBe("agent-gh: this session took nothing from #31: #31 was closed while this take ran; run `agent-gh claims`, and take again if it is still another session's");
   expect(sent(w.fake, "POST", `${PATH}/issues/31/comments`)).toHaveLength(posts + 1);
-  expect((w.state.comments[31] ?? []).map((item) => parseTake(String((item as { body: string }).body))?.to.session)).toEqual(["s-two", "s-two"]);
+  expect((w.state.comments[31] ?? []).map((item) => parseTake(String((item as { body: string }).body))?.to.session)).toEqual(["s-two", "s-two", "s-two"]);
   expect(git.run(["rev-parse", "--abbrev-ref", "HEAD"], c.dir).stdout).toBe("main");
 }, 15_000);
 

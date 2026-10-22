@@ -281,17 +281,17 @@ export const takesOf = (comments: readonly unknown[], holder: ClaimMarker): Take
 /**
  * Of the takes of `holder`'s claim from its holder, posted since a take made
  * it the holder (or since the claim opened), the comment id of the first,
- * by people with write access, and its marker: the one take that goes ahead
+ * by people with write access, its URL, and its marker: the one take that goes ahead
  * when several sessions take the same claim at once. Undefined when none is
  * listed.
  */
-export const firstTake = (comments: readonly unknown[], holder: ClaimMarker): { readonly id: number; readonly marker: TakeMarker } | undefined => {
+export const firstTake = (comments: readonly unknown[], holder: ClaimMarker): { readonly id: number; readonly url: string; readonly marker: TakeMarker } | undefined => {
   const takes = comments
     .map(record)
     .filter((item) => TRUSTED.includes(text(item.author_association)))
     .flatMap((item) => {
       const marker = parseTake(text(item.body));
-      return marker === undefined || marker.id !== holder.id ? [] : [{ id: integer(item.id), marker }];
+      return marker === undefined || marker.id !== holder.id ? [] : [{ id: integer(item.id), url: text(item.html_url), marker }];
     });
   const since = takes.findLastIndex((item) => same(item.marker.to, holder));
   return takes.slice(since + 1).find((item) => same(item.marker.from, holder));
