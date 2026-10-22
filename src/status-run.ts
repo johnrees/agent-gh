@@ -70,15 +70,14 @@ const pullCommits = async (io: ApiIo, number: number): Promise<Record<string, un
 const message = (commit: Record<string, unknown>): string => text(record(commit.commit).message);
 
 /**
- * A commit message's `Co-authored-by` trailers, as git reads trailers: only
- * from its last paragraph, and only when every line there is a trailer (or
- * continues one), so an example in the body credits no one.
+ * A commit message's `Co-authored-by` values, from its trailers as git itself
+ * parses them (`git interpret-trailers`, which `git log`'s `%(trailers)`
+ * shares), so the workflow and `review full` credit the same App, and an
+ * example in the body credits no one. None when git cannot parse it.
  */
-export const coAuthorTrailers = (body: string): string[] => {
-  const paragraphs = body.replace(/\r\n/g, "\n").trim().split(/\n[ \t]*\n/);
-  const last = paragraphs.length < 2 ? [] : (paragraphs.at(-1) as string).split("\n");
-  if (last.length === 0 || !last.every((line) => /^[A-Za-z0-9-]+:\s/.test(line) || /^[ \t]+\S/.test(line))) return [];
-  return last.flatMap((line) => /^Co-authored-by:\s*(.+)$/i.exec(line)?.[1]?.trim() ?? []);
+export const coAuthorTrailers = async (io: Pick<StatusIo, "git">, body: string): Promise<string[]> => {
+  const parsed = await io.git(["interpret-trailers", "--parse", "--no-divider"], body.endsWith("\n") ? body : `${body}\n`);
+  return (parsed ?? "").split("\n").flatMap((line) => /^Co-authored-by:\s*(.+)$/i.exec(line)?.[1]?.trim() ?? []);
 };
 
 /**
@@ -86,9 +85,12 @@ export const coAuthorTrailers = (body: string): string[] => {
  * full` reads its author (`authorFamily`); undefined for none, a mix, or
  * commits GitHub did not list in full.
  */
-const commitsAuthor = (commits: readonly Record<string, unknown>[] | undefined, apps: readonly AgentApp[]): string | undefined => {
+const commitsAuthor = async (io: StatusIo, commits: readonly Record<string, unknown>[] | undefined, apps: readonly AgentApp[]): Promise<string | undefined> => {
   if (commits === undefined) return undefined;
-  const credits = commits.filter((commit) => !(Array.isArray(commit.parents) && commit.parents.length > 1)).map((commit) => coAuthorTrailers(message(commit)));
+  const credits: string[][] = [];
+  for (const commit of commits) {
+    if (!(Array.isArray(commit.parents) && commit.parents.length > 1)) credits.push(await coAuthorTrailers(io, message(commit)));
+  }
   return authorFamily(credits, Object.fromEntries(apps.map((app) => [app.family, app.bot])));
 };
 
@@ -263,7 +265,8 @@ export const deriveStatuses = async (io: StatusIo, number: number): Promise<Deri
   const owner = await repoOwner(io, STAGE);
   const waivedBy = await waiver(io, STAGE, pr, config);
   const markers = validMarkers(await markerPosts(io, STAGE, number), owner, apps);
-  const author = pullAuthor(commitsAuthor(commits, apps), markers);
+  // The author matters only where require names some.
+  const author = Object.keys(config.require).length === 0 ? undefined : pullAuthor(await commitsAuthor(io, commits, apps), markers);
   const families = author !== undefined && Object.hasOwn(config.require, author) ? config.require[author] : undefined;
   let review: Status;
   if (families !== undefined) {

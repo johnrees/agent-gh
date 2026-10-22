@@ -1525,6 +1525,23 @@ test("--reviewer reruns one required family; the status still needs every requir
   expect(wrong.commands).toEqual([]);
 });
 
+test("the required families' status counts each family's latest review as GitHub dates it, and never overwrites a waiver added meanwhile", async () => {
+  const approve = { verdict: "approve", spec: "Done.", findings: [] };
+  // A concurrent `--reviewer codex` run's block, posted after this run's approval, is Codex's latest.
+  const later = {
+    id: 900, user: { login: "johnrees" }, submitted_at: "2099-01-01T00:00:00Z", html_url: "https://github.com/johnrees/widget/pull/12#review-900",
+    body: reviewMarker({ v: 1, head: HEAD, merge_base: OLD, patch_id: PATCH_ID, verdict: "changes_requested", checks: "passed", reviewer: "codex", priorities: [], author: "glm" }),
+  };
+  const concurrent = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answer: approve, reviews: [later] });
+  await reviewFull(concurrent.io, {});
+  expect(posted(concurrent.fake, `${REPO}/statuses/${HEAD}`).at(-1)).toEqual({ state: "failure", context: "agent-review", description: "codex blocks: changes requested; checks passed" });
+  // John waives the review while Codex runs: no status is set over it, and the waiver is recorded at the end.
+  const waived = world({ config: REQUIRE, family: "glm", coAuthors: [[bot("glm")]], answer: approve, labelsLater: ["review-waived"], events: [labeled("johnrees", null)] });
+  await reviewFull(waived.io, {});
+  expect(waived.commands).toHaveLength(2);
+  expect(posted(waived.fake, `${REPO}/statuses/${HEAD}`)).toEqual([{ state: "success", context: "agent-review", description: "waived by johnrees" }]);
+});
+
 test("each required family's re-review is judged against its own earlier review", async () => {
   const approve = { verdict: "approve", spec: "Done.", findings: [] };
   // The earlier review of PRIOR is Codex's; Claude has none, so Claude's is a full review.

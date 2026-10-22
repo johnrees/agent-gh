@@ -195,12 +195,15 @@ test("agent-review where require names the author: every required family's revie
   expect(reviewStatus({ ...base, agent: false, required: required(undefined, undefined) })).toMatchObject({ state: "success", description: "not an agent PR" });
 });
 
-test("a commit's co-authors are its trailers, as git reads them: the last paragraph, all trailers; an example in the body credits no one", () => {
-  expect(coAuthorTrailers(credits("glm"))).toEqual(["johnrees-glm[bot] <1+johnrees-glm[bot]@users.noreply.github.com>"]);
-  expect(coAuthorTrailers("Fix\r\n\r\nCo-Authored-By: Claude <noreply@anthropic.com>\r\n")).toEqual(["Claude <noreply@anthropic.com>"]);
-  expect(coAuthorTrailers("Fix\n\nCo-authored-by: johnrees-codex[bot] <x>\n\nMore prose after the example.")).toEqual([]);
-  expect(coAuthorTrailers("Fix\n\nCo-authored-by: johnrees-codex[bot] <x>\nnot a trailer")).toEqual([]);
-  expect(coAuthorTrailers("Co-authored-by: johnrees-codex[bot] <x>")).toEqual([]);
+test("a commit's co-authors are its trailers, as git itself parses them; an example in the body credits no one", async () => {
+  const home = mkdtempSync(join(tmpdir(), "agent-gh-trailers-"));
+  const io = { git: async (args: readonly string[], input?: string) => runGit(gitEnv(home), home, args, input) };
+  expect(await coAuthorTrailers(io, credits("glm"))).toEqual(["johnrees-glm[bot] <1+johnrees-glm[bot]@users.noreply.github.com>"]);
+  // git accepts no space after the colon, and a "---" line in the message is not a patch's divider.
+  expect(await coAuthorTrailers(io, "Fix\n\nWhy.\n---\nMore.\n\nCo-authored-by:johnrees-glm[bot] <x>\nAgent-Harness: pi")).toEqual(["johnrees-glm[bot] <x>"]);
+  expect(await coAuthorTrailers(io, "Fix\n\nCo-Authored-By: Claude <noreply@anthropic.com>")).toEqual(["Claude <noreply@anthropic.com>"]);
+  expect(await coAuthorTrailers(io, "Fix\n\nCo-authored-by: johnrees-codex[bot] <x>\n\nMore prose after the example.")).toEqual([]);
+  expect(await coAuthorTrailers(io, "Co-authored-by: johnrees-codex[bot] <x>")).toEqual([]);
 });
 
 test("the workflow reads the author from the commits' one co-credited family App, else from the latest marker that records one", () => {

@@ -15,6 +15,7 @@ import {
   AWAITING,
   byReviewer,
   type FamilyReview,
+  type FoundMarker,
   HOLD_CONTEXT,
   holdLink,
   type HoldThread,
@@ -1330,7 +1331,8 @@ export const pullDiff = async (io: Pick<ReviewIo, "git">, mergeBase: string, hea
  * Posts the review as a COMMENT-type pull request review (agents act as John,
  * who cannot approve his own pull requests): findings on a line the diff
  * shows go on that line, the rest in the body. If GitHub still refuses a
- * line (422), every finding goes in the body instead.
+ * line (422), every finding goes in the body instead. Returns when GitHub
+ * says it was submitted.
  */
 const postReview = async (io: ReviewIo, number: number, head: string, review: Review, diff: string, body: (outside: readonly Finding[]) => string) => {
   const lines = diffLines(diff);
@@ -1339,11 +1341,13 @@ const postReview = async (io: ReviewIo, number: number, head: string, review: Re
   const inline = findings.filter(onDiff);
   const path = `${repoPath(io)}/pulls/${number}/reviews`;
   const comments = inline.map((finding) => ({ path: finding.file, line: finding.line, side: "RIGHT", body: inlineComment(finding) }));
+  // When GitHub dated the review (else now): what orders it among the pull request's other markers.
+  const dated = (value: unknown) => text(record(value).submitted_at) || new Date().toISOString();
   const first = await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(findings.filter((finding) => !onDiff(finding))), comments }, [422]);
-  if (first.status !== 422) return;
+  if (first.status !== 422) return dated(first.value);
   if (comments.length === 0) throw new Failure("reviewing", `HTTP 422 from POST ${path}`);
   io.print("agent-gh: GitHub refused a finding's line, so every finding is in the review's body");
-  await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(findings), comments: [] });
+  return dated((await call(io, "reviewing", "POST", path, { commit_id: head, event: "COMMENT", body: body(findings), comments: [] })).value);
 };
 
 const STATUS_WAIT_MS = 60_000;
@@ -1437,7 +1441,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   await Bun.write(files.schema, JSON.stringify(REVIEW_SCHEMA));
   const base: PullBase = { ref: target.base, sha: mergeBase };
   const checks: ChecksResult = config.checks.length === 0 ? { state: "not run" } : await inClone(io, head, (cwd) => runChecks(io, config, cwd, base), base);
-  const done: { readonly reviewer: Reviewer; readonly review: Review; readonly marker: ReviewMarker }[] = [];
+  const done: { readonly reviewer: Reviewer; readonly review: Review; readonly found: FoundMarker }[] = [];
   /**
    * Where `require` names the author and agent-gh sets the status: every
    * required family's latest review of this head, this run's and those
@@ -1445,11 +1449,9 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
    * that fails never leaves an earlier success over a block just posted.
    */
   const setRequired = async (families: readonly ReviewerFamily[]): Promise<void> => {
-    const posted = validMarkers(await markerPosts(io, stage, number), await repoOwner(io, stage), agentApps());
-    const reviews = families.map((family): FamilyReview => {
-      const mine = done.find((entry) => entry.reviewer.family === family);
-      return { family, current: mine === undefined ? markerFor(posted, head, family) : { marker: mine.marker, at: "", url: "" }, carried: undefined };
-    });
+    // This run's reviews as GitHub dated them, with every other: a later one (a concurrent `--reviewer` run's) is the latest.
+    const posted = [...validMarkers(await markerPosts(io, stage, number), await repoOwner(io, stage), agentApps()), ...done.map((entry) => entry.found)].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+    const reviews = families.map((family): FamilyReview => ({ family, current: markerFor(posted, head, family), carried: undefined }));
     const status = requiredStatus(number, reviews, config);
     await setStatus(io, head, status.state === "success" ? "success" : "failure", status.description);
   };
@@ -1470,9 +1472,10 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
     };
     // The workflow's runs for an earlier family's review have long settled by the last one's, so only the last is waited for.
     if (actions && index === reviewers.length - 1) before = await headStatus(io, head);
-    await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
-    done.push({ reviewer, review, marker });
-    if (!actions && required !== undefined && index < reviewers.length - 1) await setRequired(required);
+    const at = await postReview(io, number, head, review, diff, (outside) => reviewBody(review, { marker, reviewer, effort, issue: tick.ref, checks, postOutput: config.postChecksOutput, since: prior?.reachable ? prior.head : undefined, adopted }, outside));
+    done.push({ reviewer, review, found: { marker, at, url: "" } });
+    // A waiver John added meanwhile stands: no status is set over it.
+    if (!actions && required !== undefined && index < reviewers.length - 1 && (await waiver(io, stage, await pull(io, stage, number), config)) === undefined) await setRequired(required);
   }
   // A waiver John added while the review ran stands: the labels are read afresh, and the verdict never overwrites it.
   let waived: string | undefined;
@@ -1482,7 +1485,7 @@ export const reviewFull = async (io: ReviewIo, options: FullOptions): Promise<vo
   } else if ((waived = await recordWaiver(await pull(io, stage, number))) === undefined) {
     const [only] = done as [(typeof done)[number]];
     if (required === undefined) {
-      await setStatus(io, head, reviewState(only.marker, config), `${outcomeSummary(only.marker, config, checksSummary(checks))}: ${only.review.findings.length} finding(s) by ${only.reviewer.model} at ${effort}`);
+      await setStatus(io, head, reviewState(only.found.marker, config), `${outcomeSummary(only.found.marker, config, checksSummary(checks))}: ${only.review.findings.length} finding(s) by ${only.reviewer.model} at ${effort}`);
     } else {
       await setRequired(required);
     }
