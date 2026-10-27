@@ -6,7 +6,7 @@ Agents publish to GitHub as John through one GitHub App per model family (claude
 - **Commits**: a global `commit-msg` hook (git's config-based hooks, set by `install-shims`), or a repository's own, adds `Agent-Harness` (with `Agent-Model` and `Agent-Effort` when the harness reports them, and `Agent-Session` when the session has an id) and `Co-authored-by: johnrees-<family>[bot]` to an agent session's commits, and refuses a commit on another session's claim branch ([Repository hooks](#repository-hooks)). A person's commits, and repositories with no github.com remote, are left as written.
 - **Pushes**: on a machine you use, git pushes with your own login. On an agent machine, GitHub remotes use HTTPS, an agent session's git uses its family's App wherever that App is installed and the read-only App (`johnrees-read`) elsewhere, and anyone else's git only reads.
 
-API queries or fields containing placeholders keep the existing repository gate and `GH_REPO`, so gh does not resolve them against a different remote. Ambiguous targets and multiple search repository filters also keep the normal family App gate.
+Authorization checks the actual read target while gh keeps its original `GH_REPO` context for branch and placeholder resolution. API path, query or field placeholders (including legacy `:owner`, `:repo`, `:branch`) keep the existing repository gate; the exact leading `repos/{owner}/{repo}` pair is recognized as the current repository. Ambiguous targets and multiple search repository filters also keep the normal family App gate.
 
 ## Install
 

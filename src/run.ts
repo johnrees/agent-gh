@@ -70,5 +70,7 @@ export const runAs = async (context: Context, command: readonly string[]): Promi
     (context.print ?? console.error)(`agent-gh: reading public repository ${slug(read.repo)} with the ${config.slug} App (not installed on this repository).`);
   }
   // Never retry a command after it has started, even if its failure resembles an auth error.
-  return (await runChild(command, childEnv(context.env, token, target.repo))).code;
+  // The authorization target must not retarget gh's placeholders or branch
+  // resolution. Explicit flags/URLs/endpoints still tell gh what to read.
+  return (await runChild(command, childEnv(context.env, token, context.repo))).code;
 };

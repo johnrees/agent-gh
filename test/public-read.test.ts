@@ -79,12 +79,18 @@ test("REST GET reuses the method gate and resolves actual repository endpoints",
   expect(publicRead(["api", "repos/{owner}/{repo}/issues"], undefined)).toBeUndefined();
 });
 
-test("API query and field placeholders preserve normal repository resolution", () => {
+test("API path, query and field placeholders preserve normal repository resolution", () => {
   for (const args of [
     ["api", "search/issues?q=repo:{owner}/{repo}+is:open"],
+    ["api", "search/issues?q=repo::owner/:repo+is:open"],
     ["api", "repos/o/r/issues?ref={branch}"],
+    ["api", "repos/o/r/contents/{owner}/{repo}/README.md"],
+    ["api", "repos/o/r/commits/{branch}"],
+    ["api", "repos/{owner}/{repo}/commits/{branch}"],
     ["api", "search/issues", "-XGET", "-F", "q=repo:{owner}/{repo}"],
     ["api", "search/issues", "-XGET", "-f", "q=repo:{owner}/{repo}"],
+    ["api", "search/issues", "-XGET", "-F", "q=repo::owner/:repo"],
+    ["api", "repos/o/r/commits", "-XGET", "-F", "author=:owner"],
   ]) expect(publicRead(args, cwd)).toBeUndefined();
 });
 

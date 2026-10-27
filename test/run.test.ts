@@ -142,7 +142,7 @@ group("known public gh reads without a family installation", () => {
     expect(result.args).toEqual(command.slice(1));
     expect(result.env.GH_TOKEN).toBe(ACCESS);
     expect(result.env.GITHUB_TOKEN).toBe(ACCESS);
-    expect(result.env.GH_REPO).toBe("cloudflare/workerd");
+    expect(result.env.GH_REPO).toBe("johnrees/penmon");
     expect(result.env.GH_DEBUG).toBeUndefined();
     expect(lines).toEqual(["agent-gh: reading public repository cloudflare/workerd with the johnrees-claude App (not installed on this repository)."]);
     clean(lines.join("\n"));
@@ -169,9 +169,10 @@ group("known public gh reads without a family installation", () => {
       ["pr", "view", "https://github.com/cloudflare/workerd/pull/7910"],
       ["repo", "view", "cloudflare/workerd"],
     ]) {
-      const { context, child } = publicSetup();
+      const { context, child, fake } = publicSetup();
       expect(await runAs(context, ["gh", ...args])).toBe(0);
-      expect(child()[0].env.GH_REPO).toBe("cloudflare/workerd");
+      expect(fake.log.at(-1)?.path).toBe("/repos/cloudflare/workerd");
+      expect(child()[0].env.GH_REPO).toBe("johnrees/penmon");
       expect(child()[0].env.GH_TOKEN).toBe(ACCESS);
     }
     const { context, fake, child } = publicSetup();
@@ -239,16 +240,22 @@ group("known public gh reads without a family installation", () => {
   test("repository-scoped search checks its explicit target instead of clearing it", async () => {
     const { context, child } = publicSetup();
     expect(await runAs(context, ["gh", "search", "issues", "bug", "--repo", "cloudflare/workerd"])).toBe(0);
-    expect(child()[0].env.GH_REPO).toBe("cloudflare/workerd");
+    expect(child()[0].env.GH_REPO).toBe("johnrees/penmon");
     const privateState = publicSetup({ ...PUBLIC_ROUTES, "GET /repos/cloudflare/workerd": () => reply(200, { full_name: "cloudflare/workerd", private: true }) });
     const error = await failure(runAs(privateState.context, ["gh", "search", "issues", "bug", "--repo", "cloudflare/workerd"]));
     expect(error.detail).toContain("App is not installed on cloudflare/workerd");
     expect(existsSync(privateState.out)).toBe(false);
   });
 
-  test("API query placeholders keep the checked checkout as GH_REPO", async () => {
+  test("API placeholders keep the checked checkout as GH_REPO", async () => {
+    for (const endpoint of ["search/issues?q=repo:{owner}/{repo}+is:open", "search/issues?q=repo::owner/:repo+is:open", "repos/cloudflare/workerd/contents/{owner}/{repo}/README.md", "repos/cloudflare/workerd/commits/{branch}"]) {
+      const { context, fake, child } = publicSetup();
+      expect(await runAs(context, ["gh", "api", endpoint])).toBe(0);
+      expect(child()[0].env.GH_REPO).toBe("johnrees/penmon");
+      expect(fake.log.map((entry) => entry.path)).toEqual(["/user/installations", "/user/installations/42/repositories"]);
+    }
     const { context, fake, child } = publicSetup();
-    expect(await runAs(context, ["gh", "api", "search/issues?q=repo:{owner}/{repo}+is:open"])).toBe(0);
+    expect(await runAs(context, ["gh", "api", "repos/cloudflare/workerd/commits", "-XGET", "-F", "author=:owner"])).toBe(0);
     expect(child()[0].env.GH_REPO).toBe("johnrees/penmon");
     expect(fake.log.map((entry) => entry.path)).toEqual(["/user/installations", "/user/installations/42/repositories"]);
   });

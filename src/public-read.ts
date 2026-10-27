@@ -9,6 +9,8 @@ type Parsed = { readonly words: readonly string[]; readonly values: readonly [st
 const REPO: Flags = { values: ["repo", "R"], booleans: [] };
 const FORMAT = ["json", "jq", "q", "template", "t"];
 const BOOL = /^(?:1|0|t|f|T|F|true|false|TRUE|FALSE|True|False)$/;
+// gh also supports legacy colon placeholders (cli/cli pkg/cmd/api/api.go).
+const PLACEHOLDER = /[{}]|:(?:owner|repo|branch)\b/;
 
 /** Deliberately narrower than gh's evolving CLI: a new/unknown flag is not a read grant. */
 const parse = (args: readonly string[], flags: Flags): Parsed | undefined => {
@@ -110,15 +112,19 @@ const apiRead = (args: readonly string[], fallbackRepo: Repo | undefined): Publi
   // gh expands placeholders in queries/fields using GH_REPO/remotes too. Keep
   // the existing gate and GH_REPO for those ambiguous cross-repository reads.
   const suffix = endpoint.slice((endpoint.split(/[?#]/)[0] as string).length);
-  if (/[{}]/.test(suffix) || call.fields.some((field) => /[{}]/.test(field.value))) return undefined;
+  if (PLACEHOLDER.test(suffix) || call.fields.some((field) => PLACEHOLDER.test(field.value))) return undefined;
   if (/[:\\]/.test(endpoint.split(/[?#]/)[0] as string) || endpoint.startsWith("//")) return undefined;
   const path = (endpoint.split(/[?#]/)[0] as string).replace(/^\//, "").replace(/\/$/, "");
   const parts = path.split("/");
   if (parts.some((part) => part === "." || part === ".." || part === "" || part.includes("%"))) return undefined;
+  const currentPrefix = parts[0]?.toLowerCase() === "repos" && parts[1] === "{owner}" && parts[2] === "{repo}";
+  // Changing GH_REPO would also change any later path placeholder. Only the
+  // exact leading owner/repo pair has an unambiguous current-repository target.
+  if (/[{}]/.test((currentPrefix ? parts.slice(3) : parts).join("/"))) return undefined;
   if (parts[0]?.toLowerCase() === "graphql") return undefined;
   const current = fallbackRepo;
   if (parts[0]?.toLowerCase() === "repos") {
-    if (parts[1] === "{owner}" && parts[2] === "{repo}") return current ? { repo: current } : undefined;
+    if (currentPrefix) return current ? { repo: current } : undefined;
     const target = repository(`${parts[1] ?? ""}/${parts[2] ?? ""}`);
     return target ? { repo: target } : undefined;
   }
