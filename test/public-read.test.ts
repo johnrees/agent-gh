@@ -47,14 +47,23 @@ test("explicit PR/issue URLs and repo-view arguments override unrelated cwd and 
 
 test("global and owner-scoped known reads never inherit a random checkout", () => {
   for (const args of [
-    ["repo", "list"], ["repo", "list", "lalalune", "--visibility", "public"],
+    ["repo", "list"], ["repo", "list", "--source", "lalalune", "--visibility", "public"],
     ["search", "issues", "allocator", "--state", "closed"],
     ["search", "prs", "allocator", "context", "--sort", "updated"],
-    ["search", "repos", "solana"], ["search", "commits", "fix"],
+    ["search", "repos", "solana"], ["search", "repos", "--include-forks=only", "solana"], ["search", "commits", "fix"],
     ["api", "user"], ["api", "search/code?q=solana"],
   ]) expect(publicRead(args, cwd)).toEqual({ repo: undefined });
   expect(publicRead(["search", "code", "finish_grow", "--repo", "lalalune/pumpfun-source"], cwd)).toEqual({ repo: target });
   expect(publicRead(["search", "issues", "bug", "--repo", "first/private", "--repo", "other/public"], cwd)).toBeUndefined();
+});
+
+test("search boolean switches cannot swallow an explicit repository filter", () => {
+  for (const args of [
+    ["search", "issues", "--archived", "--repo", "lalalune/pumpfun-source", "foo"],
+    ["search", "issues", "--archived=false", "-R", "lalalune/pumpfun-source", "foo"],
+    ["search", "prs", "--merged", "--repo", "lalalune/pumpfun-source", "foo"],
+  ]) expect(publicRead(args, cwd)).toEqual({ repo: target });
+  expect(publicRead(["search", "prs", "--merged", "--repo", "first/private", "--repo", "other/public"], cwd)).toBeUndefined();
 });
 
 test("REST GET reuses the method gate and resolves actual repository endpoints", () => {
@@ -68,6 +77,15 @@ test("REST GET reuses the method gate and resolves actual repository endpoints",
   ]) expect(publicRead(args, cwd)).toEqual({ repo: target });
   expect(publicRead(["api", "repos/{owner}/{repo}/issues"], cwd)).toEqual({ repo: cwd });
   expect(publicRead(["api", "repos/{owner}/{repo}/issues"], undefined)).toBeUndefined();
+});
+
+test("API query and field placeholders preserve normal repository resolution", () => {
+  for (const args of [
+    ["api", "search/issues?q=repo:{owner}/{repo}+is:open"],
+    ["api", "repos/o/r/issues?ref={branch}"],
+    ["api", "search/issues", "-XGET", "-F", "q=repo:{owner}/{repo}"],
+    ["api", "search/issues", "-XGET", "-f", "q=repo:{owner}/{repo}"],
+  ]) expect(publicRead(args, cwd)).toBeUndefined();
 });
 
 test("writes, aliases, extensions and unknown operations never receive a read grant", () => {

@@ -84,14 +84,14 @@ const reads: Readonly<Record<string, Flags>> = {
   "issue list": { values: ["assignee", "a", "author", "A", "label", "l", "limit", "L", "mention", "mentions", "milestone", "m", "search", "S", "state", "s", "app"], booleans: [] },
   "issue status": { values: [], booleans: [] },
   "repo view": { values: ["branch", "b"], booleans: [] },
-  "repo list": { values: ["language", "l", "limit", "L", "source", "visibility", "topic"], booleans: ["archived", "no-archived", "fork"] },
+  "repo list": { values: ["language", "l", "limit", "L", "visibility", "topic"], booleans: ["archived", "no-archived", "fork", "source"] },
   "release view": { values: [], booleans: [] },
   "release list": { values: ["limit", "L", "order", "O"], booleans: ["exclude-drafts", "exclude-pre-releases"] },
   "release download": { values: ["archive", "A", "dir", "D", "pattern", "p", "output", "O"], booleans: ["clobber", "skip-existing"] },
 };
 const SEARCH: Flags = {
-  values: ["archived", "assignee", "author", "base", "closed", "commenter", "comments", "committer", "committer-date", "committer-email", "committer-name", "created", "extension", "filename", "head", "involves", "label", "language", "license", "limit", "L", "match", "mentions", "merged", "milestone", "number", "order", "owner", "parent", "project", "reactions", "repo", "R", "review", "review-requested", "reviewed-by", "size", "sort", "stars", "state", "team-mentions", "topic", "updated", "visibility"],
-  booleans: ["draft", "include-forks", "is-locked", "is-merged", "is-open", "is-closed", "no-assignee", "no-label", "no-milestone", "no-project"],
+  values: ["assignee", "author", "base", "closed", "commenter", "comments", "committer", "committer-date", "committer-email", "committer-name", "created", "extension", "filename", "head", "include-forks", "involves", "label", "language", "license", "limit", "L", "match", "mentions", "milestone", "number", "order", "owner", "parent", "project", "reactions", "repo", "R", "review", "review-requested", "reviewed-by", "size", "sort", "stars", "state", "team-mentions", "topic", "updated", "visibility"],
+  booleans: ["archived", "draft", "merged", "no-assignee", "no-label", "no-milestone", "no-project"],
 };
 const API: Flags = {
   values: ["method", "X", "header", "H", "raw-field", "f", "field", "F", "input", "jq", "q", "template", "t", "cache", "hostname", "preview", "p"],
@@ -107,6 +107,10 @@ const apiRead = (args: readonly string[], fallbackRepo: Repo | undefined): Publi
   const call = apiCall(args);
   if (!call || call.method !== "GET" || call.endpoint !== parsed.words[0] || call.endpoint === undefined || call.input !== undefined) return undefined;
   const endpoint = call.endpoint.replace(/^https:\/\/api\.github\.com\//i, "");
+  // gh expands placeholders in queries/fields using GH_REPO/remotes too. Keep
+  // the existing gate and GH_REPO for those ambiguous cross-repository reads.
+  const suffix = endpoint.slice((endpoint.split(/[?#]/)[0] as string).length);
+  if (/[{}]/.test(suffix) || call.fields.some((field) => /[{}]/.test(field.value))) return undefined;
   if (/[:\\]/.test(endpoint.split(/[?#]/)[0] as string) || endpoint.startsWith("//")) return undefined;
   const path = (endpoint.split(/[?#]/)[0] as string).replace(/^\//, "").replace(/\/$/, "");
   const parts = path.split("/");

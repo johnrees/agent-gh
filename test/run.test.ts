@@ -246,6 +246,23 @@ group("known public gh reads without a family installation", () => {
     expect(existsSync(privateState.out)).toBe(false);
   });
 
+  test("API query placeholders keep the checked checkout as GH_REPO", async () => {
+    const { context, fake, child } = publicSetup();
+    expect(await runAs(context, ["gh", "api", "search/issues?q=repo:{owner}/{repo}+is:open"])).toBe(0);
+    expect(child()[0].env.GH_REPO).toBe("johnrees/penmon");
+    expect(fake.log.map((entry) => entry.path)).toEqual(["/user/installations", "/user/installations/42/repositories"]);
+  });
+
+  test("search switches before --repo cannot bypass a private target's check", async () => {
+    for (const [verb, flag] of [["issues", "--archived"], ["prs", "--merged"]]) {
+      const { context, out, fake } = publicSetup({ ...PUBLIC_ROUTES, "GET /repos/cloudflare/workerd": () => reply(200, { full_name: "cloudflare/workerd", private: true }) });
+      const error = await failure(runAs(context, ["gh", "search", verb!, flag!, "--repo", "cloudflare/workerd", "foo"]));
+      expect(error.detail).toContain("App is not installed on cloudflare/workerd");
+      expect(fake.log.at(-1)?.path).toBe("/repos/cloudflare/workerd");
+      expect(existsSync(out)).toBe(false);
+    }
+  });
+
   test("visibility rate limits and redirects retain the installation refusal with a diagnostic", async () => {
     for (const status of [403, 429, 301]) {
       const { context, out } = publicSetup({ ...PUBLIC_ROUTES, "GET /repos/cloudflare/workerd": () => reply(status, { message: SECRET_BODY }) });
