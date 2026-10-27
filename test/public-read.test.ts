@@ -48,12 +48,13 @@ test("explicit PR/issue URLs and repo-view arguments override unrelated cwd and 
 test("global and owner-scoped known reads never inherit a random checkout", () => {
   for (const args of [
     ["repo", "list"], ["repo", "list", "lalalune", "--visibility", "public"],
-    ["search", "code", "finish_grow", "--language", "Rust", "--repo", "lalalune/pumpfun-source"],
     ["search", "issues", "allocator", "--state", "closed"],
     ["search", "prs", "allocator", "context", "--sort", "updated"],
     ["search", "repos", "solana"], ["search", "commits", "fix"],
     ["api", "user"], ["api", "search/code?q=solana"],
   ]) expect(publicRead(args, cwd)).toEqual({ repo: undefined });
+  expect(publicRead(["search", "code", "finish_grow", "--repo", "lalalune/pumpfun-source"], cwd)).toEqual({ repo: target });
+  expect(publicRead(["search", "issues", "bug", "--repo", "first/private", "--repo", "other/public"], cwd)).toBeUndefined();
 });
 
 test("REST GET reuses the method gate and resolves actual repository endpoints", () => {

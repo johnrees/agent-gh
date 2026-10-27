@@ -147,7 +147,11 @@ export const publicRead = (args: readonly string[], fallbackRepo: Repo | undefin
   const explicit = last(parsed, "repo", "R");
   const current = explicit === undefined ? fallbackRepo : repository(explicit);
   if (explicit !== undefined && current === undefined) return undefined;
-  if (search) return { repo: undefined };
+  if (search) {
+    // Multiple repo filters are not a single public target we can confirm.
+    if (parsed.values.filter(([name]) => ["repo", "R"].includes(name)).length > 1) return undefined;
+    return { repo: explicit === undefined ? undefined : current };
+  }
   if (parsed.words.length > 1) return undefined;
   const target = parsed.words[0];
   if (command === "repo" && verb === "list") return target === undefined || /^[A-Za-z0-9-]+$/.test(target) ? { repo: undefined } : undefined;

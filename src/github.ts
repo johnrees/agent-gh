@@ -24,16 +24,16 @@ const json = async (response: Response, stage: Stage): Promise<Record<string, un
   throw new Failure(stage, response.ok ? "invalid response" : `HTTP ${response.status}`);
 };
 
-const get = async (api: Api, stage: Stage, path: string, token?: string): Promise<Response> => {
+const get = async (api: Api, stage: Stage, path: string, token: string, redirect: "error" | "manual" = "error"): Promise<Response> => {
   try {
     return await fetch(`${api.base}${path}`, {
       headers: {
         Accept: "application/vnd.github+json",
-        ...(token === undefined ? {} : { Authorization: `Bearer ${token}` }),
+        Authorization: `Bearer ${token}`,
         "User-Agent": "agent-gh",
         "X-GitHub-Api-Version": "2022-11-28",
       },
-      redirect: "error",
+      redirect,
       signal: AbortSignal.timeout(api.timeoutMs),
     });
   } catch {
@@ -166,10 +166,10 @@ const fullName = (item: Record<string, unknown>): string | undefined => {
 /** Only an absent installation, never an API/authentication failure. */
 export class MissingInstallation extends Failure {}
 
-/** Confirm public visibility without sending any credential or following redirects. */
-export const isPublicRepo = async (api: Api, repo: Repo): Promise<boolean> => {
+/** Confirm public visibility with the existing App login, without following redirects. */
+export const isPublicRepo = async (api: Api, repo: Repo, token: string): Promise<boolean> => {
   const stage = "finding the installation";
-  const response = await get(api, stage, `/repos/${repo.owner}/${repo.name}`);
+  const response = await get(api, stage, `/repos/${repo.owner}/${repo.name}`, token, "manual");
   if (response.status === 404) return false;
   if (!response.ok) throw new Failure(stage, `HTTP ${response.status}`);
   const body = await json(response, stage);

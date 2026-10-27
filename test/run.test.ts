@@ -115,15 +115,12 @@ group("a command runs as John through the family App", () => {
 
 group("known public gh reads without a family installation", () => {
   const PUBLIC = { owner: "cloudflare", name: "workerd" };
-  const READ_ACCESS = "ghu_read_only_test";
   const PUBLIC_ROUTES = {
     ...HAPPY,
     "GET /repos/cloudflare/workerd": () => reply(200, { full_name: "cloudflare/workerd", private: false }),
   };
   const publicSetup = (routes: Routes = PUBLIC_ROUTES, code = 0) => {
     const state = setup(routes);
-    writeFileSync(join(state.creds.dir, "read.json"), JSON.stringify({ ...CONFIG, slug: "johnrees-read", bot_login: "johnrees-read[bot]" }), { mode: 0o600 });
-    loggedIn(state.creds.dir, NOW, { access_token: READ_ACCESS }, "read");
     const bin = mkdtempSync(join(tmpdir(), "agent-gh-public-bin-"));
     writeFileSync(join(bin, "gh"), `#!${process.execPath}\nconst fs = require('node:fs');\nfs.appendFileSync(process.env.OUT, JSON.stringify({env:process.env,args:process.argv.slice(2)})+'\\n');\nprocess.exit(${code});\n`, { mode: 0o755 });
     const lines: string[] = [];
@@ -132,30 +129,30 @@ group("known public gh reads without a family installation", () => {
   };
   const command = ["gh", "pr", "view", "7910", "-R", "cloudflare/workerd", "--json", "title,files"];
 
-  test("public visibility is checked anonymously, then the read App is used and logged", async () => {
+  test("public visibility is checked with the existing App login, then the read is logged", async () => {
     const { fake, context, lines, child } = publicSetup();
     expect(await runAs(context, command)).toBe(0);
     expect(fake.log.map((entry) => [entry.path, entry.auth])).toEqual([
       ["/user/installations", `Bearer ${ACCESS}`],
       ["/user/installations/42/repositories", `Bearer ${ACCESS}`],
-      ["/repos/cloudflare/workerd", ""],
+      ["/repos/cloudflare/workerd", `Bearer ${ACCESS}`],
     ]);
     expect(child()).toHaveLength(1);
     const result = child()[0];
     expect(result.args).toEqual(command.slice(1));
-    expect(result.env.GH_TOKEN).toBe(READ_ACCESS);
-    expect(result.env.GITHUB_TOKEN).toBe(READ_ACCESS);
+    expect(result.env.GH_TOKEN).toBe(ACCESS);
+    expect(result.env.GITHUB_TOKEN).toBe(ACCESS);
     expect(result.env.GH_REPO).toBe("cloudflare/workerd");
     expect(result.env.GH_DEBUG).toBeUndefined();
-    expect(lines).toEqual(["agent-gh: reading public repository cloudflare/workerd with the read App (family App not installed)."]);
-    clean(lines.join("\n"), [READ_ACCESS]);
+    expect(lines).toEqual(["agent-gh: reading public repository cloudflare/workerd with the johnrees-claude App (not installed on this repository)."]);
+    clean(lines.join("\n"));
   });
 
   test("an App absent from every installation still permits a confirmed public read", async () => {
     const { context, fake, child } = publicSetup({ ...PUBLIC_ROUTES, "GET /user/installations": () => reply(200, { total_count: 0, installations: [] }) });
     expect(await runAs(context, command)).toBe(0);
     expect(fake.log.map((entry) => entry.path)).toEqual(["/user/installations", "/repos/cloudflare/workerd"]);
-    expect(child()[0].env.GH_TOKEN).toBe(READ_ACCESS);
+    expect(child()[0].env.GH_TOKEN).toBe(ACCESS);
   });
 
   test("an installed read keeps the family token and never probes visibility", async () => {
@@ -175,7 +172,7 @@ group("known public gh reads without a family installation", () => {
       const { context, child } = publicSetup();
       expect(await runAs(context, ["gh", ...args])).toBe(0);
       expect(child()[0].env.GH_REPO).toBe("cloudflare/workerd");
-      expect(child()[0].env.GH_TOKEN).toBe(READ_ACCESS);
+      expect(child()[0].env.GH_TOKEN).toBe(ACCESS);
     }
     const { context, fake, child } = publicSetup();
     expect(await runAs(context, ["gh", "search", "repos", "solana"])).toBe(0);
@@ -231,12 +228,42 @@ group("known public gh reads without a family installation", () => {
     }
   });
 
-  test("a missing read login fails without using the family or personal token", async () => {
+  test("an explicit public URL outside a clone needs no additional App configuration or login", async () => {
+    const { context, creds, child } = publicSetup();
+    expect(existsSync(join(creds.dir, "read.json"))).toBe(false);
+    expect(existsSync(join(creds.dir, "read.token.json"))).toBe(false);
+    expect(await runAs({ ...context, repo: undefined }, ["gh", "pr", "view", "https://github.com/cloudflare/workerd/pull/7910"])).toBe(0);
+    expect(child()[0].env.GH_TOKEN).toBe(ACCESS);
+  });
+
+  test("repository-scoped search checks its explicit target instead of clearing it", async () => {
+    const { context, child } = publicSetup();
+    expect(await runAs(context, ["gh", "search", "issues", "bug", "--repo", "cloudflare/workerd"])).toBe(0);
+    expect(child()[0].env.GH_REPO).toBe("cloudflare/workerd");
+    const privateState = publicSetup({ ...PUBLIC_ROUTES, "GET /repos/cloudflare/workerd": () => reply(200, { full_name: "cloudflare/workerd", private: true }) });
+    const error = await failure(runAs(privateState.context, ["gh", "search", "issues", "bug", "--repo", "cloudflare/workerd"]));
+    expect(error.detail).toContain("App is not installed on cloudflare/workerd");
+    expect(existsSync(privateState.out)).toBe(false);
+  });
+
+  test("visibility rate limits and redirects retain the installation refusal with a diagnostic", async () => {
+    for (const status of [403, 429, 301]) {
+      const { context, out } = publicSetup({ ...PUBLIC_ROUTES, "GET /repos/cloudflare/workerd": () => reply(status, { message: SECRET_BODY }) });
+      const error = await failure(runAs(context, command));
+      expect(error.detail).toContain("App is not installed on cloudflare/workerd");
+      expect(error.detail).toContain(`public visibility check failed: HTTP ${status}`);
+      expect(error.network).toBe(false);
+      expect(existsSync(out)).toBe(false);
+      clean(describe(error));
+    }
+  });
+
+  test("a missing family login never falls back to a personal login", async () => {
     const { context, creds, out } = publicSetup();
-    unlinkSync(join(creds.dir, "read.token.json"));
+    unlinkSync(join(creds.dir, "claude.token.json"));
     const error = await failure(runAs(context, command));
     expect(error.stage).toBe("reading the login");
-    expect(error.detail).toContain("no login for read");
+    expect(error.detail).toContain("no login for claude");
     expect(existsSync(out)).toBe(false);
   });
 

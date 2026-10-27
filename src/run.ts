@@ -1,7 +1,7 @@
 import { runChild } from "./child.ts";
 import { readConfig, type AppConfig, type Registry } from "./config.ts";
-import { readToken } from "./credential.ts";
 import { childEnv } from "./env.ts";
+import { Failure } from "./failure.ts";
 import { type Api, isPublicRepo, MissingInstallation, requireInstallation } from "./github.ts";
 import type { Env, Identity } from "./harness.ts";
 import { userToken } from "./login.ts";
@@ -23,6 +23,16 @@ export type Context = {
   readonly print?: (line: string) => void;
 };
 
+const familyLogin = async (context: Context) => {
+  const { family } = context.identity;
+  const config = readConfig(context.configDir, family, context.registry);
+  const token = await userToken(config, family, {
+    api: context.api, dir: context.configDir,
+    nowSeconds: context.nowSeconds, sleep: context.sleep,
+  });
+  return { config, token };
+};
+
 /**
  * John's user access token for the family's App, after checking with that
  * token that the App is installed on the context's repository, when the
@@ -35,34 +45,30 @@ export const withToken = async <T>(
   context: Context,
   use: (env: Record<string, string>, config: AppConfig) => Promise<T>,
 ): Promise<T> => {
-  const { family } = context.identity;
-  const config = readConfig(context.configDir, family, context.registry);
-  const token = await userToken(config, family, {
-    api: context.api,
-    dir: context.configDir,
-    nowSeconds: context.nowSeconds,
-    sleep: context.sleep,
-  });
-  if (context.repo !== undefined) await requireInstallation(context.api, config, family, token, context.repo);
+  const { config, token } = await familyLogin(context);
+  if (context.repo !== undefined) await requireInstallation(context.api, config, context.identity.family, token, context.repo);
   return use(childEnv(context.env, token, context.repo), config);
 };
 
-/** Known gh reads can use the read App on a repository confirmed public. */
+/** Known gh reads can use the existing App login on a repository confirmed public. */
 export const runAs = async (context: Context, command: readonly string[]): Promise<number> => {
   const read = command[0] === "gh" ? publicRead(command.slice(1), context.repo) : undefined;
   const target = read === undefined ? context : { ...context, repo: read.repo };
-  let env: Record<string, string>;
+  const { config, token } = await familyLogin(target);
   try {
-    env = await withToken(target, async (value) => value);
+    if (target.repo !== undefined) await requireInstallation(target.api, config, target.identity.family, token, target.repo);
   } catch (error) {
-    if (!(error instanceof MissingInstallation) || read?.repo === undefined || !await isPublicRepo(context.api, read.repo)) throw error;
-    const token = await readToken({
-      api: context.api, dir: context.configDir, registry: context.registry,
-      nowSeconds: context.nowSeconds, sleep: context.sleep,
-    });
-    env = childEnv(context.env, token, read.repo);
-    (context.print ?? console.error)(`agent-gh: reading public repository ${slug(read.repo)} with the read App (family App not installed).`);
+    if (!(error instanceof MissingInstallation) || read?.repo === undefined) throw error;
+    let visible: boolean;
+    try {
+      visible = await isPublicRepo(context.api, read.repo, token);
+    } catch (probe) {
+      if (!(probe instanceof Failure)) throw probe;
+      throw new Failure(error.stage, `${error.detail}; public visibility check failed: ${probe.detail}`, probe.network);
+    }
+    if (!visible) throw error;
+    (context.print ?? console.error)(`agent-gh: reading public repository ${slug(read.repo)} with the ${config.slug} App (not installed on this repository).`);
   }
   // Never retry a command after it has started, even if its failure resembles an auth error.
-  return (await runChild(command, env)).code;
+  return (await runChild(command, childEnv(context.env, token, target.repo))).code;
 };
