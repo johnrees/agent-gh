@@ -1,10 +1,12 @@
 import { runChild } from "./child.ts";
 import { readConfig, type AppConfig, type Registry } from "./config.ts";
+import { readToken } from "./credential.ts";
 import { childEnv } from "./env.ts";
-import { type Api, requireInstallation } from "./github.ts";
+import { type Api, isPublicRepo, MissingInstallation, requireInstallation } from "./github.ts";
 import type { Env, Identity } from "./harness.ts";
 import { userToken } from "./login.ts";
-import type { Repo } from "./repo.ts";
+import { publicRead } from "./public-read.ts";
+import { type Repo, slug } from "./repo.ts";
 
 export type Context = {
   readonly identity: Identity;
@@ -17,6 +19,8 @@ export type Context = {
   readonly registry: Registry;
   readonly nowSeconds: () => number;
   readonly sleep: (ms: number) => Promise<void>;
+  /** Diagnostics go to stderr, leaving gh's JSON/stdout untouched. */
+  readonly print?: (line: string) => void;
 };
 
 /**
@@ -43,6 +47,22 @@ export const withToken = async <T>(
   return use(childEnv(context.env, token, context.repo), config);
 };
 
-/** Runs `gh` through the family's App and returns the child's exit code. */
-export const runAs = async (context: Context, command: readonly string[]): Promise<number> =>
-  withToken(context, async (env) => (await runChild(command, env)).code);
+/** Known gh reads can use the read App on a repository confirmed public. */
+export const runAs = async (context: Context, command: readonly string[]): Promise<number> => {
+  const read = command[0] === "gh" ? publicRead(command.slice(1), context.repo) : undefined;
+  const target = read === undefined ? context : { ...context, repo: read.repo };
+  let env: Record<string, string>;
+  try {
+    env = await withToken(target, async (value) => value);
+  } catch (error) {
+    if (!(error instanceof MissingInstallation) || read?.repo === undefined || !await isPublicRepo(context.api, read.repo)) throw error;
+    const token = await readToken({
+      api: context.api, dir: context.configDir, registry: context.registry,
+      nowSeconds: context.nowSeconds, sleep: context.sleep,
+    });
+    env = childEnv(context.env, token, read.repo);
+    (context.print ?? console.error)(`agent-gh: reading public repository ${slug(read.repo)} with the read App (family App not installed).`);
+  }
+  // Never retry a command after it has started, even if its failure resembles an auth error.
+  return (await runChild(command, env)).code;
+};

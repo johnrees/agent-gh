@@ -24,12 +24,12 @@ const json = async (response: Response, stage: Stage): Promise<Record<string, un
   throw new Failure(stage, response.ok ? "invalid response" : `HTTP ${response.status}`);
 };
 
-const get = async (api: Api, stage: Stage, path: string, token: string): Promise<Response> => {
+const get = async (api: Api, stage: Stage, path: string, token?: string): Promise<Response> => {
   try {
     return await fetch(`${api.base}${path}`, {
       headers: {
         Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${token}`,
+        ...(token === undefined ? {} : { Authorization: `Bearer ${token}` }),
         "User-Agent": "agent-gh",
         "X-GitHub-Api-Version": "2022-11-28",
       },
@@ -163,6 +163,22 @@ const fullName = (item: Record<string, unknown>): string | undefined => {
   return typeof login === "string" && typeof item.name === "string" ? `${login}/${item.name}` : undefined;
 };
 
+/** Only an absent installation, never an API/authentication failure. */
+export class MissingInstallation extends Failure {}
+
+/** Confirm public visibility without sending any credential or following redirects. */
+export const isPublicRepo = async (api: Api, repo: Repo): Promise<boolean> => {
+  const stage = "finding the installation";
+  const response = await get(api, stage, `/repos/${repo.owner}/${repo.name}`);
+  if (response.status === 404) return false;
+  if (!response.ok) throw new Failure(stage, `HTTP ${response.status}`);
+  const body = await json(response, stage);
+  if (typeof body.private !== "boolean" || typeof body.full_name !== "string" || body.full_name.toLowerCase() !== slug(repo).toLowerCase()) {
+    throw new Failure(stage, "invalid response");
+  }
+  return body.private === false;
+};
+
 /**
  * Refuses up front when the family's App is not installed on the repository:
  * gh's own error for that case does not say why. Uses John's user token for
@@ -179,7 +195,7 @@ export const requireInstallation = async (
   const stage = "finding the installation";
   const relogin = `run \`agent-gh login ${family}\` in your own terminal`;
   const missing = () =>
-    new Failure(
+    new MissingInstallation(
       stage,
       `the ${config.slug} App is not installed on ${slug(repo)}; install it at https://github.com/apps/${config.slug}/installations/new and select ${slug(repo)}`,
     );

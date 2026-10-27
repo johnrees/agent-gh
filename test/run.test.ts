@@ -1,5 +1,5 @@
 import { afterEach, describe as group, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, Failure } from "../src/failure.ts";
@@ -111,6 +111,141 @@ group("a command runs as John through the family App", () => {
     expect(await runAs(context, recorder(3))).toBe(3);
   });
 
+});
+
+group("known public gh reads without a family installation", () => {
+  const PUBLIC = { owner: "cloudflare", name: "workerd" };
+  const READ_ACCESS = "ghu_read_only_test";
+  const PUBLIC_ROUTES = {
+    ...HAPPY,
+    "GET /repos/cloudflare/workerd": () => reply(200, { full_name: "cloudflare/workerd", private: false }),
+  };
+  const publicSetup = (routes: Routes = PUBLIC_ROUTES, code = 0) => {
+    const state = setup(routes);
+    writeFileSync(join(state.creds.dir, "read.json"), JSON.stringify({ ...CONFIG, slug: "johnrees-read", bot_login: "johnrees-read[bot]" }), { mode: 0o600 });
+    loggedIn(state.creds.dir, NOW, { access_token: READ_ACCESS }, "read");
+    const bin = mkdtempSync(join(tmpdir(), "agent-gh-public-bin-"));
+    writeFileSync(join(bin, "gh"), `#!${process.execPath}\nconst fs = require('node:fs');\nfs.appendFileSync(process.env.OUT, JSON.stringify({env:process.env,args:process.argv.slice(2)})+'\\n');\nprocess.exit(${code});\n`, { mode: 0o755 });
+    const lines: string[] = [];
+    const context: Context = { ...state.context, env: { ...state.context.env, PATH: `${bin}:${process.env.PATH}` }, print: (line) => lines.push(line) };
+    return { ...state, context, lines, child: () => readFileSync(state.out, "utf8").trim().split("\n").map((line) => JSON.parse(line)) };
+  };
+  const command = ["gh", "pr", "view", "7910", "-R", "cloudflare/workerd", "--json", "title,files"];
+
+  test("public visibility is checked anonymously, then the read App is used and logged", async () => {
+    const { fake, context, lines, child } = publicSetup();
+    expect(await runAs(context, command)).toBe(0);
+    expect(fake.log.map((entry) => [entry.path, entry.auth])).toEqual([
+      ["/user/installations", `Bearer ${ACCESS}`],
+      ["/user/installations/42/repositories", `Bearer ${ACCESS}`],
+      ["/repos/cloudflare/workerd", ""],
+    ]);
+    expect(child()).toHaveLength(1);
+    const result = child()[0];
+    expect(result.args).toEqual(command.slice(1));
+    expect(result.env.GH_TOKEN).toBe(READ_ACCESS);
+    expect(result.env.GITHUB_TOKEN).toBe(READ_ACCESS);
+    expect(result.env.GH_REPO).toBe("cloudflare/workerd");
+    expect(result.env.GH_DEBUG).toBeUndefined();
+    expect(lines).toEqual(["agent-gh: reading public repository cloudflare/workerd with the read App (family App not installed)."]);
+    clean(lines.join("\n"), [READ_ACCESS]);
+  });
+
+  test("an App absent from every installation still permits a confirmed public read", async () => {
+    const { context, fake, child } = publicSetup({ ...PUBLIC_ROUTES, "GET /user/installations": () => reply(200, { total_count: 0, installations: [] }) });
+    expect(await runAs(context, command)).toBe(0);
+    expect(fake.log.map((entry) => entry.path)).toEqual(["/user/installations", "/repos/cloudflare/workerd"]);
+    expect(child()[0].env.GH_TOKEN).toBe(READ_ACCESS);
+  });
+
+  test("an installed read keeps the family token and never probes visibility", async () => {
+    const { context, fake, lines, child } = publicSetup();
+    expect(await runAs(context, ["gh", "issue", "list"])).toBe(0);
+    expect(child()[0].env.GH_TOKEN).toBe(ACCESS);
+    expect(fake.log).toHaveLength(2);
+    expect(lines).toEqual([]);
+  });
+
+  test("API and URL targets override an unrelated checkout, globals do not inherit it", async () => {
+    for (const args of [
+      ["api", "repos/cloudflare/workerd/pulls/7910"],
+      ["pr", "view", "https://github.com/cloudflare/workerd/pull/7910"],
+      ["repo", "view", "cloudflare/workerd"],
+    ]) {
+      const { context, child } = publicSetup();
+      expect(await runAs(context, ["gh", ...args])).toBe(0);
+      expect(child()[0].env.GH_REPO).toBe("cloudflare/workerd");
+      expect(child()[0].env.GH_TOKEN).toBe(READ_ACCESS);
+    }
+    const { context, fake, child } = publicSetup();
+    expect(await runAs(context, ["gh", "search", "repos", "solana"])).toBe(0);
+    expect(fake.log).toEqual([]);
+    expect(child()[0].env.GH_TOKEN).toBe(ACCESS);
+  });
+
+  test("private and inaccessible repositories retain the installation refusal", async () => {
+    for (const route of [() => reply(200, { full_name: "cloudflare/workerd", private: true }), () => reply(404, { message: SECRET_BODY })]) {
+      const { context, out, lines } = publicSetup({ ...PUBLIC_ROUTES, "GET /repos/cloudflare/workerd": route });
+      const error = await failure(runAs(context, command));
+      expect(error.detail).toContain("App is not installed on cloudflare/workerd");
+      expect(existsSync(out)).toBe(false);
+      expect(lines).toEqual([]);
+      clean(describe(error));
+    }
+  });
+
+  test("writes, unknown commands, POST APIs and GraphQL never probe or fall back", async () => {
+    for (const args of [
+      ["pr", "comment", "7910", "-R", "cloudflare/workerd", "--body", "test"],
+      ["issue", "create", "-R", "cloudflare/workerd", "--title", "test"],
+      ["api", "repos/cloudflare/workerd/issues", "-XPOST"],
+      ["api", "repos/cloudflare/workerd/issues/1/reactions", "-fcontent=+1"],
+      ["api", "graphql", "-XGET"], ["new-command"],
+    ]) {
+      const { context, fake, out, lines } = publicSetup();
+      await failure(runAs({ ...context, repo: PUBLIC }, ["gh", ...args]));
+      expect(fake.log.map((entry) => entry.path)).toEqual(["/user/installations", "/user/installations/42/repositories"]);
+      expect(existsSync(out)).toBe(false);
+      expect(lines).toEqual([]);
+    }
+  });
+
+  test("authentication, API and invalid visibility responses cannot trigger a fallback", async () => {
+    for (const status of [401, 403, 500]) {
+      const { context, fake, out } = publicSetup({ ...PUBLIC_ROUTES, "GET /user/installations": () => reply(status, { message: SECRET_BODY }) });
+      clean(describe(await failure(runAs(context, command))));
+      expect(fake.log).toHaveLength(1);
+      expect(existsSync(out)).toBe(false);
+    }
+    for (const route of [
+      () => reply(500, { message: SECRET_BODY }),
+      () => reply(200, { full_name: "cloudflare/workerd" }),
+      () => reply(200, { full_name: "other/public", private: false }),
+      () => new Response(SECRET_BODY, { status: 200 }),
+      () => new Response(null, { status: 302, headers: { Location: "https://evil.example/" } }),
+    ]) {
+      const { context, out, lines } = publicSetup({ ...PUBLIC_ROUTES, "GET /repos/cloudflare/workerd": route });
+      clean(describe(await failure(runAs(context, command))));
+      expect(existsSync(out)).toBe(false);
+      expect(lines).toEqual([]);
+    }
+  });
+
+  test("a missing read login fails without using the family or personal token", async () => {
+    const { context, creds, out } = publicSetup();
+    unlinkSync(join(creds.dir, "read.token.json"));
+    const error = await failure(runAs(context, command));
+    expect(error.stage).toBe("reading the login");
+    expect(error.detail).toContain("no login for read");
+    expect(existsSync(out)).toBe(false);
+  });
+
+  test("a failing child runs exactly once and retains its exit status", async () => {
+    const { context, child, fake } = publicSetup(PUBLIC_ROUTES, 7);
+    expect(await runAs(context, command)).toBe(7);
+    expect(child()).toHaveLength(1);
+    expect(fake.log).toHaveLength(3);
+  });
 });
 
 group("the login refreshes before it expires, once, under a lock", () => {
