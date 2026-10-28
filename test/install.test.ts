@@ -157,3 +157,14 @@ test("a failed login still installs the shims and runs the checklist, and the in
   expect(release({ doctorFails: true }).run().code).toBe(1);
   expect(release().run(["--agentmachine"]).code).toBe(2);
 });
+
+
+test("installer forwards the explicit Codex sandbox opt-in, with or without agent-machine", () => {
+  const { run } = release();
+  const first = run(["--codex-sandbox"]);
+  expect(first.code).toBe(0);
+  expect(first.calls).toContain("install-shims --codex-sandbox");
+  const again = run(["--agent-machine", "--codex-sandbox"]);
+  expect(again.code).toBe(0);
+  expect(again.calls).toContain("install-shims --agent-machine --codex-sandbox");
+});

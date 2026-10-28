@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { claudeHookState, instructionFiles, pathOwner, staleInstructions } from "./agents.ts";
+import { codexSandboxCheck, tokenStorageCheck } from "./codex.ts";
 import { isConfigured, READ_APP } from "./config.ts";
 import { familyNames } from "./family.ts";
 import type { Api } from "./github.ts";
@@ -95,6 +96,10 @@ export const machineDoctor = async (
     const usable = loginUsable(deps.configDir, READ_APP, deps.nowSeconds());
     add(usable ? "ok" : machine.agent_machine ? "FAIL" : "note", "login read", usable ? "usable" : `not logged in; ${RERUN} (or \`agent-gh login read\`)`);
   }
+
+  lines.push(tokenStorageCheck(deps.configDir));
+  const codex = codexSandboxCheck(deps.home, deps.configDir, deps.env);
+  if (codex !== undefined) lines.push(codex);
 
   const gh = findReal("gh", deps.env.PATH, "");
   const shimmed = gh !== undefined && gh.startsWith(`${deps.shims}/`);

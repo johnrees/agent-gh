@@ -16,6 +16,30 @@ curl -fsSL https://raw.githubusercontent.com/johnrees/agent-gh/main/install.sh |
 
 It installs the checked release and gitleaks in `~/.local/bin`, logs in each App (you enter the device-flow codes it prints), puts the gh shim first on PATH, tells the agent harnesses installed here how to reach it (below), and ends with `agent-gh doctor --machine`, whose every failure names its fix. A rerun updates everything. `agent-gh doctor`, in a repository, checks who is acting and the App's access there: from an agent session with its family App, and from a person's shell with the read App. `AGENT_GH_FAMILIES=claude,codex` limits the logins.
 
+## Codex CLI sandbox access
+
+Codex's default workspace sandbox can read an existing login but cannot refresh it outside the workspace, and network access may be blocked. A cached token can therefore work until it expires, then fail creating `codex.token.lock` with `EPERM`. This does not mean the GitHub login is broken.
+
+To opt in on a new machine, run in your own terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/johnrees/agent-gh/main/install.sh | bash -s -- --codex-sandbox
+# Or, after installing:
+agent-gh install-shims --codex-sandbox
+```
+
+This selects `workspace-write`, adds the absolute agent-gh credential directory to `sandbox_workspace_write.writable_roots`, and sets `network_access = true` in `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). **It grants sandboxed commands write access to that credential directory and outbound networking to all hosts, not just GitHub.** Without the flag, installation leaves Codex permissions unchanged. Combine it with `--agent-machine` when needed.
+
+The opt-in preserves other setting values and existing writable roots, saves a private `config.toml.agent-gh.<id>.bak` before rewriting existing TOML, and makes no changes on a repeated run. TOML formatting and comments are normalized; the backup preserves the original text. It refuses malformed config, named permission profiles (`default_permissions`), and explicit sandbox modes other than `workspace-write`, rather than replacing those policies. For named profiles, configure token-directory writes and networking in your chosen profile using [Codex permission settings](https://learn.chatgpt.com/docs/config-file/config-reference). Administrator-managed requirements still apply.
+
+Restart Codex after setup. Existing sessions, selected profiles, project config and command-line overrides may retain different permissions. From the affected Codex session, run:
+
+```sh
+agent-gh doctor --sandbox
+```
+
+This checks temporary lock creation and atomic replacement in the credential directory without reading or changing tokens, then probes HTTPS access to `api.github.com` and `github.com` without credentials. Running it in your ordinary terminal only tests that terminal's permissions. `doctor --machine` also checks token storage in its current process and reports the base Codex config separately; a valid stored login alone does not prove refresh will work in a sandbox. If a sandboxed check fails but an approved elevated check succeeds, fix the sandbox policy instead of resetting the login.
+
 ## Agents find the shim
 
 Shell startup files are not enough on their own: a harness may start its tools from a snapshot of the environment it was launched in, and a version manager (mise, asdf, Homebrew's shellenv, Nix) can put its own gh back ahead of the shim after the startup files run. So `install-shims` also, for each harness that has run on the machine (its directory exists):
