@@ -508,11 +508,11 @@ const main = async (argv: readonly string[]): Promise<number> => {
     if (inAgentSession(env)) {
       throw new Failure("installing the shims", "an agent does not change its own guardrails; run the install line in your own terminal");
     }
+    installShims(shimDeps(env), agentMachine, limitedFamilies(familyNames(), env.AGENT_GH_FAMILIES));
     if (rest.includes("--codex-sandbox")) {
       const deps = shimDeps(env);
       console.log(configureCodexSandbox(deps.home, deps.configDir, env));
     }
-    installShims(shimDeps(env), agentMachine, limitedFamilies(familyNames(), env.AGENT_GH_FAMILIES));
     return 0;
   }
   if (first === "git") {

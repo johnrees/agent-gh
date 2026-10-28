@@ -14,7 +14,7 @@ const sha256 = (path: string) => createHash("sha256").update(readFileSync(path))
  * each call, and a fake gitleaks release, as install.sh downloads them. The
  * fake agent-gh's `login --all` and `doctor --machine` fail when told to.
  */
-const release = ({ loginFails = false, doctorFails = false } = {}) => {
+const release = ({ loginFails = false, doctorFails = false, shimsFail = false } = {}) => {
   const root = mkdtempSync(join(tmpdir(), "agent-gh-release-"));
   const home = join(root, "home");
   mkdirSync(home);
@@ -30,6 +30,7 @@ const release = ({ loginFails = false, doctorFails = false } = {}) => {
       "  --version) echo 'agent-gh v0.1.0' ;;",
       `  login) exit ${loginFails ? 1 : 0} ;;`,
       `  doctor) exit ${doctorFails ? 1 : 0} ;;`,
+      `  install-shims) exit ${shimsFail ? 1 : 0} ;;`,
       "esac",
       "",
     ].join("\n"),
@@ -167,4 +168,13 @@ test("installer forwards the explicit Codex sandbox opt-in, with or without agen
   const again = run(["--agent-machine", "--codex-sandbox"]);
   expect(again.code).toBe(0);
   expect(again.calls).toContain("install-shims --agent-machine --codex-sandbox");
+});
+
+
+test("a refused optional sandbox setup still runs doctor and makes installation fail", () => {
+  const { run } = release({ shimsFail: true });
+  const result = run(["--codex-sandbox"]);
+  expect(result.code).toBe(1);
+  expect(result.calls).toContain("install-shims --codex-sandbox");
+  expect(result.calls.at(-1)).toBe("doctor --machine");
 });

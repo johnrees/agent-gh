@@ -119,8 +119,9 @@ login_ok=1
 shim_args=(install-shims)
 if [ "$agent_machine" = 1 ]; then shim_args+=(--agent-machine); fi
 if [ "$codex_sandbox" = 1 ]; then shim_args+=(--codex-sandbox); fi
-"$BIN/agent-gh" "${shim_args[@]}" < "$tty"
+shim_ok=1
+"$BIN/agent-gh" "${shim_args[@]}" < "$tty" || shim_ok=0
 
 # 5. The checklist.
 "$BIN/agent-gh" doctor --machine || exit 1
-[ "$login_ok" = 1 ] || exit 1
+[ "$login_ok" = 1 ] && [ "$shim_ok" = 1 ] || exit 1

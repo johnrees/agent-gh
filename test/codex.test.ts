@@ -145,3 +145,36 @@ test("CLI refuses an agent's sandbox opt-in before writing config", () => {
   expect(result.stderr.toString()).toContain("an agent does not change its own guardrails");
   expect(existsSync(path)).toBe(false);
 });
+
+test("doctor does not recommend automatic setup for an explicitly read-only mode or call unset mode configured", () => {
+  const { home, dir, path } = fixture('sandbox_mode = "read-only"\n');
+  expect(codexSandboxCheck(home, dir, {})?.detail).toContain("choose workspace-write yourself");
+  writeFileSync(path, `[sandbox_workspace_write]\nwritable_roots = [${JSON.stringify(dir)}]\nnetwork_access = true\n`);
+  expect(codexSandboxCheck(home, dir, {})?.state).toBe("note");
+  configureCodexSandbox(home, dir, {});
+  expect(codexSandboxCheck(home, dir, {})?.state).toBe("ok");
+});
+
+test("creates a missing dotfiles target privately while preserving its config symlink", () => {
+  const { home, dir, path } = fixture();
+  mkdirSync(join(home, ".codex"));
+  const target = join(home, "missing.toml");
+  symlinkSync("../missing.toml", path);
+  configureCodexSandbox(home, dir, {});
+  expect(lstatSync(path).isSymbolicLink()).toBe(true);
+  expect(statSync(target).mode & 0o777).toBe(0o600);
+  expect(codexSandboxCheck(home, dir, {})?.state).toBe("ok");
+});
+
+test("a refused optional Codex setup still installs shims and preserves the custom config", () => {
+  const original = 'default_permissions = "custom"\n';
+  const { home, path } = fixture(original);
+  const result = Bun.spawnSync([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), "install-shims", "--codex-sandbox"], {
+    env: { HOME: home, PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1" },
+    stdout: "pipe", stderr: "pipe",
+  });
+  expect(result.exitCode).toBe(1);
+  expect(result.stderr.toString()).toContain("uses named permission profiles");
+  expect(existsSync(join(home, ".local", "share", "agent-gh", "shims", "gh"))).toBe(true);
+  expect(readFileSync(path, "utf8")).toBe(original);
+});
