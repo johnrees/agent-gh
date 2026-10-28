@@ -12,8 +12,8 @@
 #
 # The only thing you do is enter the device-flow codes it prints. It needs no
 # sudo. AGENT_GH_FAMILIES=claude,codex limits which family Apps it logs in.
-# --codex-sandbox opts in to Codex token-directory writes and outbound network
-# access to all hosts. Existing config values are preserved; original TOML is backed up.
+# --codex-sandbox sets Codex's global default to workspace-write, with token-directory
+# writes and outbound network access to all hosts. Existing config values are preserved; original TOML is backed up.
 set -euo pipefail
 
 REPO="johnrees/agent-gh"

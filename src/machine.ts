@@ -55,7 +55,10 @@ export const tokenStorageCheck = (dir: string): Line => {
     rmSync(probe, { recursive: true });
     probe = undefined;
     return { state: "ok", name: "token refresh storage", detail: `${dir}: lock creation and atomic replacement work in this process` };
-  } catch {
+  } catch (error) {
+    if (probe === undefined && typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return { state: "FAIL", name: "token refresh storage", detail: `${dir}: directory is missing; rerun the install line to set up logins` };
+    }
     return { state: "FAIL", name: "token refresh storage", detail: `${dir}: refresh writes failed; check sandbox and filesystem permissions, not the GitHub login` };
   } finally {
     if (probe !== undefined) {

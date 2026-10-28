@@ -30,7 +30,9 @@ for (const custom of [false, true]) {
   test(`fresh CLI opt-in installs config and instructions (custom CODEX_HOME: ${custom})`, () => {
     const { home, dir, cli } = fixture();
     const codexHome = join(home, custom ? "custom codex" : ".codex");
-    expect(cli(custom ? { CODEX_HOME: codexHome } : {}).exitCode).toBe(0);
+    const result = cli(custom ? { CODEX_HOME: codexHome } : {});
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain("set the global default sandbox_mode to workspace-write");
     const path = join(codexHome, "config.toml");
     expect(Bun.TOML.parse(readFileSync(path, "utf8"))).toEqual({ sandbox_mode: "workspace-write", sandbox_workspace_write: { writable_roots: [dir], network_access: true } });
     expect(statSync(path).mode & 0o777).toBe(0o600);
@@ -54,7 +56,7 @@ test("setup merges settings, privately backs up original text, and is idempotent
   expect(readdirSync(join(home, ".codex"))).toHaveLength(2);
 });
 
-for (const text of ['default_permissions = "custom"', 'sandbox_mode = "read-only"', 'sandbox_mode = "danger-full-access"', 'sandbox_workspace_write = 2026-10-28', '[sandbox_workspace_write]\nwritable_roots = "bad"', 'secret = "do-not-print"\nmalformed [']) {
+for (const text of ['default_permissions = "custom"', 'sandbox_mode = "read-only"', 'default_permissions = "custom"\nsandbox_mode = "danger-full-access"', 'sandbox_workspace_write = 2026-10-28', '[sandbox_workspace_write]\nwritable_roots = "bad"', 'secret = "do-not-print"\nmalformed [']) {
   test(`refuses unsupported config without mutation or parser-secret leaks: ${text.split("\n")[0]}`, () => {
     const { home, dir, path } = fixture(text);
     expect(() => configureCodexSandbox(home, dir, {})).toThrow();
@@ -114,4 +116,25 @@ test.skipIf(process.getuid?.() === 0)("doctor detects denied refresh writes with
     expect(refreshes).toBe(1);
     expect(existsSync(join(dir, "claude.token.lock"))).toBe(false);
   } finally { chmodSync(dir, 0o700); github.stop(); }
+});
+
+
+test("existing full access is a successful no-op, including CLI installation", () => {
+  const original = '# user policy\nsandbox_mode = "danger-full-access"\n';
+  const { home, dir, path, cli } = fixture(original);
+  const inode = statSync(path).ino;
+  expect(configureCodexSandbox(home, dir, {})).toContain("already configured; unchanged");
+  expect(cli().exitCode).toBe(0);
+  expect(readFileSync(path, "utf8")).toBe(original);
+  expect(statSync(path).ino).toBe(inode);
+  expect(readdirSync(join(home, ".codex")).some((name) => name.endsWith(".bak"))).toBe(false);
+});
+
+test("doctor reports missing storage as setup work without creating it", () => {
+  const { dir } = fixture();
+  rmSync(dir, { recursive: true });
+  const result = tokenStorageCheck(dir);
+  expect(result.state).toBe("FAIL");
+  expect(result.detail).toContain("directory is missing; rerun the install line");
+  expect(existsSync(dir)).toBe(false);
 });

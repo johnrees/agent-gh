@@ -13,6 +13,7 @@ export const configureCodexSandbox = (home: string, dir: string, env: Env): stri
   try {
     const original = existsSync(path) ? readFileSync(path, "utf8") : "";
     const data = Bun.TOML.parse(original) as Record<string, unknown>;
+    if (data.default_permissions === undefined && data.sandbox_mode === "danger-full-access") return `${path}: full filesystem and network access already configured; unchanged`;
     if (data.default_permissions !== undefined || (data.sandbox_mode !== undefined && data.sandbox_mode !== "workspace-write")) {
       throw fail("uses a different permission policy; configure agent-gh directory writes and networking in that policy manually");
     }
@@ -33,7 +34,7 @@ export const configureCodexSandbox = (home: string, dir: string, env: Env): stri
     // Create privately without truncating; append also follows a dangling dotfiles symlink.
     if (!existsSync(path)) writeFileSync(path, "", { flag: "a", mode: 0o600 });
     writeAtomic(path, output);
-    return `${path}: enabled writes to ${resolve(dir)} and outbound networking to all hosts; ${original === "" ? "new config" : `backup: ${backup}`}. Restart Codex; active profiles and managed policy may override these defaults`;
+    return `${path}: set the global default sandbox_mode to workspace-write; enabled writes to ${resolve(dir)} and outbound networking to all hosts; ${original === "" ? "new config" : `backup: ${backup}`}. Restart Codex; active profiles and managed policy may override these defaults`;
   } catch (error) {
     if (error instanceof Failure) throw error;
     // TOML parser errors may quote secrets from the config.

@@ -47,7 +47,7 @@ const USAGE = `usage:
   agent-gh setup <family>           create johnrees-<family> (${familyNames().join(", ")}, or read); run it yourself, not from an agent
   agent-gh login <family>|--all     authorize johnrees-<family> to act as you (device flow); --all: every App not yet logged in
   agent-gh install-shims [--agent-machine] [--codex-sandbox]
-                                    --codex-sandbox: opt in to Codex token-directory writes and outbound networking (all hosts)
+                                    --codex-sandbox: set Codex's global default to workspace-write, allow token-directory writes and outbound networking (all hosts)
                                     the gh shim first on PATH; --agent-machine: git reads with the read App and pushes with the family App, gh logged out
   agent-gh doctor --machine         check this machine: release, gitleaks, logins, shims, and agent-machine settings
   agent-gh --version
