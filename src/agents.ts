@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Failure } from "./failure.ts";
 import { writeAtomic } from "./files.ts";
+import type { Env } from "./harness.ts";
 
 /**
  * What install-shims tells the agent harnesses themselves, beside the shell
@@ -116,18 +117,18 @@ const withInstructions = (text: string, block: string): string => {
 };
 
 /** Each harness's global instructions file, for harnesses that have run here (their directory exists). */
-export const instructionFiles = (home: string): string[] =>
+export const instructionFiles = (home: string, env: Env = {}): string[] =>
   [
-    [".claude", "CLAUDE.md"],
-    [".codex", "AGENTS.md"],
-    [".config/opencode", "AGENTS.md"],
-    [".pi/agent", "AGENTS.md"],
+    [join(home, ".claude"), "CLAUDE.md"],
+    [env.CODEX_HOME?.trim() || join(home, ".codex"), "AGENTS.md"],
+    [join(home, ".config/opencode"), "AGENTS.md"],
+    [join(home, ".pi/agent"), "AGENTS.md"],
   ]
-    .filter(([dir]) => existsSync(join(home, dir as string)))
-    .map(([dir, file]) => join(home, dir as string, file as string));
+    .filter(([dir]) => existsSync(dir as string))
+    .map(([dir, file]) => join(dir as string, file as string));
 
-export const installInstructions = (home: string): string[] => {
-  const files = instructionFiles(home);
+export const installInstructions = (home: string, env: Env = {}): string[] => {
+  const files = instructionFiles(home, env);
   const block = instructionsBlock();
   for (const path of files) {
     const text = existsSync(path) ? readFileSync(path, "utf8") : "";
@@ -141,8 +142,8 @@ export const installInstructions = (home: string): string[] => {
 };
 
 /** Instruction files that lack the current block. */
-export const staleInstructions = (home: string): string[] =>
-  instructionFiles(home).filter((path) => !existsSync(path) || !readFileSync(path, "utf8").includes(instructionsBlock()));
+export const staleInstructions = (home: string, env: Env = {}): string[] =>
+  instructionFiles(home, env).filter((path) => !existsSync(path) || !readFileSync(path, "utf8").includes(instructionsBlock()));
 
 /**
  * Names a version manager or package manager from the directory of the gh

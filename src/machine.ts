@@ -140,8 +140,8 @@ export const machineDoctor = async (
         : `${hook === "stale" ? "names another agent-gh" : "missing"} from ~/.claude/settings.json; ${RERUN}`,
     );
   }
-  const stale = staleInstructions(deps.home);
-  if (instructionFiles(deps.home).length > 0) add(stale.length === 0 ? "ok" : "FAIL", "agent instructions", stale.length === 0 ? "each harness's global instructions say how to reach GitHub" : `missing or out of date in ${stale.join(", ")}; ${RERUN}`);
+  const stale = staleInstructions(deps.home, deps.env);
+  if (instructionFiles(deps.home, deps.env).length > 0) add(stale.length === 0 ? "ok" : "FAIL", "agent instructions", stale.length === 0 ? "each harness's global instructions say how to reach GitHub" : `missing or out of date in ${stale.join(", ")}; ${RERUN}`);
   const git = join(deps.shims, "git");
   if (existsSync(git) && isShim(git)) add("FAIL", "git shim", `${git} is left from an older agent-gh; ${RERUN}`);
 

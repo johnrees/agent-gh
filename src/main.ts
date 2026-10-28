@@ -508,11 +508,20 @@ const main = async (argv: readonly string[]): Promise<number> => {
     if (inAgentSession(env)) {
       throw new Failure("installing the shims", "an agent does not change its own guardrails; run the install line in your own terminal");
     }
-    installShims(shimDeps(env), agentMachine, limitedFamilies(familyNames(), env.AGENT_GH_FAMILIES));
+    // Create CODEX_HOME before installing harness instructions on a fresh machine,
+    // but an optional config refusal must not prevent the shim installation.
+    let codexFailure: Failure | undefined;
     if (rest.includes("--codex-sandbox")) {
       const deps = shimDeps(env);
-      console.log(configureCodexSandbox(deps.home, deps.configDir, env));
+      try {
+        console.log(configureCodexSandbox(deps.home, deps.configDir, env));
+      } catch (error) {
+        if (!(error instanceof Failure)) throw error;
+        codexFailure = error;
+      }
     }
+    installShims(shimDeps(env), agentMachine, limitedFamilies(familyNames(), env.AGENT_GH_FAMILIES));
+    if (codexFailure !== undefined) throw codexFailure;
     return 0;
   }
   if (first === "git") {

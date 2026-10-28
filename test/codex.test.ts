@@ -178,3 +178,28 @@ test("a refused optional Codex setup still installs shims and preserves the cust
   expect(existsSync(join(home, ".local", "share", "agent-gh", "shims", "gh"))).toBe(true);
   expect(readFileSync(path, "utf8")).toBe(original);
 });
+
+test("fresh CLI opt-in installs Codex instructions along with the new config", () => {
+  const { home, path } = fixture();
+  const result = Bun.spawnSync([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), "install-shims", "--codex-sandbox"], {
+    env: { HOME: home, PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1" },
+    stdout: "pipe", stderr: "pipe",
+  });
+  expect(result.exitCode).toBe(0);
+  expect(existsSync(path)).toBe(true);
+  expect(readFileSync(join(home, ".codex", "AGENTS.md"), "utf8")).toContain("GitHub (managed by `agent-gh install-shims`)");
+});
+
+
+test("CLI opt-in writes harness instructions to a custom CODEX_HOME too", () => {
+  const { home } = fixture();
+  const codexHome = join(home, "custom codex");
+  const result = Bun.spawnSync([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), "install-shims", "--codex-sandbox"], {
+    env: { HOME: home, CODEX_HOME: codexHome, PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1" },
+    stdout: "pipe", stderr: "pipe",
+  });
+  expect(result.exitCode).toBe(0);
+  expect(existsSync(join(codexHome, "config.toml"))).toBe(true);
+  expect(readFileSync(join(codexHome, "AGENTS.md"), "utf8")).toContain("GitHub (managed by `agent-gh install-shims`)");
+  expect(existsSync(join(home, ".codex"))).toBe(false);
+});
