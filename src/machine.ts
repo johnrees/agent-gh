@@ -1,7 +1,6 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { claudeHookState, instructionFiles, pathOwner, staleInstructions } from "./agents.ts";
-import { codexSandboxCheck, tokenStorageCheck } from "./codex.ts";
 import { isConfigured, READ_APP } from "./config.ts";
 import { familyNames } from "./family.ts";
 import type { Api } from "./github.ts";
@@ -44,6 +43,26 @@ export const shimAdvice = (gh: string | undefined): string => {
 };
 
 type Line = { readonly state: "ok" | "FAIL" | "note"; readonly name: string; readonly detail: string };
+
+/** Probe refresh writes without reading credentials or touching a live token lock. */
+export const tokenStorageCheck = (dir: string): Line => {
+  let probe: string | undefined;
+  try {
+    probe = mkdtempSync(join(dir, ".agent-gh-doctor-"));
+    writeFileSync(join(probe, "lock"), "probe", { flag: "wx", mode: 0o600 });
+    writeFileSync(join(probe, "token"), "old", { mode: 0o600 });
+    renameSync(join(probe, "lock"), join(probe, "token"));
+    rmSync(probe, { recursive: true });
+    probe = undefined;
+    return { state: "ok", name: "token refresh storage", detail: `${dir}: lock creation and atomic replacement work in this process` };
+  } catch {
+    return { state: "FAIL", name: "token refresh storage", detail: `${dir}: refresh writes failed; check sandbox and filesystem permissions, not the GitHub login` };
+  } finally {
+    if (probe !== undefined) {
+      try { rmSync(probe, { recursive: true, force: true }); } catch { /* The failed probe reports cleanup denial too. */ }
+    }
+  }
+};
 
 /** The newest release's tag, or undefined when GitHub does not say (a private repository, or offline). */
 export const latestRelease = async (api: Api, repo: string): Promise<string | undefined> => {
@@ -98,8 +117,6 @@ export const machineDoctor = async (
   }
 
   lines.push(tokenStorageCheck(deps.configDir));
-  const codex = codexSandboxCheck(deps.home, deps.configDir, deps.env);
-  if (codex !== undefined) lines.push(codex);
 
   const gh = findReal("gh", deps.env.PATH, "");
   const shimmed = gh !== undefined && gh.startsWith(`${deps.shims}/`);

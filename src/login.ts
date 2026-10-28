@@ -135,7 +135,7 @@ const lock = async (deps: LoginDeps, family: string): Promise<() => void> => {
     } catch (error) {
       if (code(error) !== "EEXIST") {
         const hint = code(error) === "EPERM" || code(error) === "EACCES"
-          ? `; token refresh needs write access to ${deps.dir}. Check sandbox and filesystem permissions with agent-gh doctor --sandbox; this is not a GitHub authentication failure`
+          ? `; token refresh needs write access to ${deps.dir}. Check sandbox and filesystem permissions with agent-gh doctor --machine; this is not a GitHub authentication failure`
           : "";
         throw new Failure("refreshing the login", `${path} could not be created (${code(error)})${hint}`);
       }

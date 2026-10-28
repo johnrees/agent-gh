@@ -17,7 +17,7 @@ import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, waves
 import { parseGraphArgs } from "./graph.ts";
 import { readGraph } from "./graph-run.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
-import { configureCodexSandbox, sandboxNetworkChecks, tokenStorageCheck } from "./codex.ts";
+import { configureCodexSandbox } from "./codex.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
 import { doctor, PERSON } from "./doctor.ts";
 import { describe, Failure, NEXT_STEP } from "./failure.ts";
@@ -49,7 +49,6 @@ const USAGE = `usage:
   agent-gh install-shims [--agent-machine] [--codex-sandbox]
                                     --codex-sandbox: opt in to Codex token-directory writes and outbound networking (all hosts)
                                     the gh shim first on PATH; --agent-machine: git reads with the read App and pushes with the family App, gh logged out
-  agent-gh doctor --sandbox         probe token-directory writes and GitHub connectivity in the current process; run inside Codex
   agent-gh doctor --machine         check this machine: release, gitleaks, logins, shims, and agent-machine settings
   agent-gh --version
   agent-gh credential get           git's credential helper on agent machines: an agent session's family App where installed, else the read App
@@ -458,12 +457,6 @@ const main = async (argv: readonly string[]): Promise<number> => {
   if (first === "read-token") {
     console.log(await readToken({ api: GITHUB, dir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) }));
     return 0;
-  }
-  if (first === "doctor" && rest.length === 1 && rest[0] === "--sandbox") {
-    console.log("Checking this process's permissions; run inside the affected Codex session to test its sandbox.");
-    const lines = [tokenStorageCheck(defaultConfigDir()), ...await sandboxNetworkChecks()];
-    for (const line of lines) console.log(formatLine(line));
-    return lines.some((line) => line.state === "FAIL") ? 1 : 0;
   }
   if (first === "doctor" && rest[0] === "--machine") {
     const lines = await machineDoctor({

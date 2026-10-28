@@ -18,27 +18,17 @@ It installs the checked release and gitleaks in `~/.local/bin`, logs in each App
 
 ## Codex CLI sandbox access
 
-Codex's default workspace sandbox can read an existing login but cannot refresh it outside the workspace, and network access may be blocked. A cached token can therefore work until it expires, then fail creating `codex.token.lock` with `EPERM`. This does not mean the GitHub login is broken.
-
-To opt in on a new machine, run in your own terminal:
+Codex's workspace sandbox can read a cached login but fail refreshing it: `codex.token.lock` is outside the workspace, and network access may also be blocked. To opt in during installation, add `-s -- --codex-sandbox` to the install line above, or run in your own terminal:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/johnrees/agent-gh/main/install.sh | bash -s -- --codex-sandbox
-# Or, after installing:
 agent-gh install-shims --codex-sandbox
 ```
 
-This selects `workspace-write`, adds the absolute agent-gh credential directory to `sandbox_workspace_write.writable_roots`, and sets `network_access = true` in `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). **It grants sandboxed commands write access to that credential directory and outbound networking to all hosts, not just GitHub.** Without the flag, installation leaves Codex permissions unchanged. Combine it with `--agent-machine` when needed.
+This selects `workspace-write`, adds the absolute agent-gh credential directory to `sandbox_workspace_write.writable_roots`, and sets `network_access = true` in `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). **It grants credential-directory writes and outbound networking to all hosts, not just GitHub.** Without the flag, Codex permissions are unchanged. It can be combined with `--agent-machine`.
 
-The opt-in preserves other setting values and existing writable roots, saves a private `config.toml.agent-gh.<id>.bak` before rewriting existing TOML, and makes no changes on a repeated run. TOML formatting and comments are normalized; the backup preserves the original text. It refuses malformed config, named permission profiles (`default_permissions`), and explicit sandbox modes other than `workspace-write`, rather than replacing those policies. For named profiles, configure token-directory writes and networking in your chosen profile using [Codex permission settings](https://learn.chatgpt.com/docs/config-file/config-reference). If the optional sandbox step is refused, the shim installation still completes and the installer runs doctor, then exits unsuccessfully so the unresolved configuration is visible. Administrator-managed requirements still apply.
+Other setting values and writable roots are preserved, and repeated setup is a no-op. The original TOML is saved privately as `config.toml.agent-gh.<id>.bak`; rewriting normalizes formatting and comments. Malformed config, named permission profiles, and explicit modes other than `workspace-write` require manual configuration. Refusal still installs the shims and runs doctor, but installation exits unsuccessfully.
 
-Restart Codex after setup. Existing sessions, selected profiles, project config and command-line overrides may retain different permissions. From the affected Codex session, run:
-
-```sh
-agent-gh doctor --sandbox
-```
-
-This checks temporary lock creation and atomic replacement in the credential directory without reading or changing tokens, then probes HTTPS access to `api.github.com` and `github.com` without credentials. Running it in your ordinary terminal only tests that terminal's permissions. `doctor --machine` also checks token storage in its current process and reports the base Codex config separately; a valid stored login alone does not prove refresh will work in a sandbox. If a sandboxed check fails but an approved elevated check succeeds, fix the sandbox policy instead of resetting the login.
+Restart Codex, then run `agent-gh doctor --machine` inside the affected session to check refresh writes, and `agent-gh doctor` inside a repository to check GitHub API and Git access. A check in your ordinary terminal only tests that terminal's permissions. Active profiles, project settings, CLI overrides and managed policy can override the defaults. If an approved elevated retry works, fix the sandbox permissions rather than resetting the login. See [Codex permission settings](https://learn.chatgpt.com/docs/config-file/config-reference) for custom profiles.
 
 ## Agents find the shim
 
