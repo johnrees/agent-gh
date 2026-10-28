@@ -16,12 +16,26 @@ curl -fsSL https://raw.githubusercontent.com/johnrees/agent-gh/main/install.sh |
 
 It installs the checked release and gitleaks in `~/.local/bin`, logs in each App (you enter the device-flow codes it prints), puts the gh shim first on PATH, tells the agent harnesses installed here how to reach it (below), and ends with `agent-gh doctor --machine`, whose every failure names its fix. A rerun updates everything. `agent-gh doctor`, in a repository, checks who is acting and the App's access there: from an agent session with its family App, and from a person's shell with the read App. `AGENT_GH_FAMILIES=claude,codex` limits the logins.
 
+## Codex CLI sandbox access
+
+Codex's workspace sandbox can read a cached login but fail refreshing it: `codex.token.lock` is outside the workspace, and network access may also be blocked. To opt in during installation, add `-s -- --codex-sandbox` to the install line above, or run in your own terminal:
+
+```sh
+agent-gh install-shims --codex-sandbox
+```
+
+This sets the global `sandbox_mode` default to `workspace-write` (including when previously unset), adds the absolute agent-gh credential directory to `sandbox_workspace_write.writable_roots`, and sets `network_access = true` in `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). **It grants credential-directory writes and outbound networking to all hosts, not just GitHub.** Without the flag, Codex permissions are unchanged. It can be combined with `--agent-machine`.
+
+Other setting values and writable roots are preserved, and repeated setup is a no-op. The original TOML is saved privately as `config.toml.agent-gh.<id>.bak`; rewriting normalizes formatting and comments. An existing `danger-full-access` mode is left unchanged. Malformed config, named permission profiles, and other explicit modes require manual configuration. Refusal still installs the shims and runs doctor, but installation exits unsuccessfully.
+
+Restart Codex, then run `agent-gh doctor --machine` inside the affected session to check refresh writes, and `agent-gh doctor` inside a repository to check GitHub API and Git access. A check in your ordinary terminal only tests that terminal's permissions. Active profiles, project settings, CLI overrides and managed policy can override the defaults. If an approved elevated retry works, fix the sandbox permissions rather than resetting the login. See [Codex permission settings](https://learn.chatgpt.com/docs/config-file/config-reference) for custom profiles.
+
 ## Agents find the shim
 
 Shell startup files are not enough on their own: a harness may start its tools from a snapshot of the environment it was launched in, and a version manager (mise, asdf, Homebrew's shellenv, Nix) can put its own gh back ahead of the shim after the startup files run. So `install-shims` also, for each harness that has run on the machine (its directory exists):
 
 - **Claude Code**: adds a SessionStart hook to `~/.claude/settings.json`, `agent-gh session-env`, which writes the PATH block to `CLAUDE_ENV_FILE`; Claude Code sources it before every command.
-- **Instructions**: adds a managed block to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.pi/agent/AGENTS.md`: run plain `gh`; if it says it is not logged in, run `agent-gh <gh arguments>`, or read with `GH_TOKEN=$(agent-gh read-token) gh ...`; never ask for `gh auth login`; where a repository opts in to reviews, run `agent-gh review full` before marking a pull request ready; answer each finding and notify with `agent-gh reply`; never push a tag or write a release unless John has run `agent-gh allow release <tag>` for it; and, to call John in, post the question as one comment whose first line is the ask, then add `needs-human`, never removing it or posting an `agent-hold release` line.
+- **Instructions**: adds a managed block to `~/.claude/CLAUDE.md`, `$CODEX_HOME/AGENTS.md` (default `~/.codex/AGENTS.md`), `~/.config/opencode/AGENTS.md`, and `~/.pi/agent/AGENTS.md`: run plain `gh`; if it says it is not logged in, run `agent-gh <gh arguments>`, or read with `GH_TOKEN=$(agent-gh read-token) gh ...`; never ask for `gh auth login`; where a repository opts in to reviews, run `agent-gh review full` before marking a pull request ready; answer each finding and notify with `agent-gh reply`; never push a tag or write a release unless John has run `agent-gh allow release <tag>` for it; and, to call John in, post the question as one comment whose first line is the ask, then add `needs-human`, never removing it or posting an `agent-hold release` line.
 
 `doctor --machine` checks both, and when another gh comes first it names the version manager responsible.
 

@@ -416,11 +416,11 @@ export const installShims = (deps: ShimDeps, agentMachine: boolean, families: re
   const startup = updateStartupFiles(deps.home, deps.shims, deps.bin);
   changed.push(...startup.written);
   deps.print(`gh shim: ${gh}, first on PATH in ${startup.files.join(", ")}; open a new shell to use it`);
-  const harnessFiles = [join(claudeDir(deps.home), "settings.json"), ...instructionFiles(deps.home)];
+  const harnessFiles = [join(claudeDir(deps.home), "settings.json"), ...instructionFiles(deps.home, deps.env)];
   const before = contents(harnessFiles);
   const claude = installClaudeHook(deps.home, deps.agentGh);
   if (claude !== undefined) deps.print(`Claude Code: a SessionStart hook in ${claude} puts the shim first on PATH before every command`);
-  const instructions = installInstructions(deps.home);
+  const instructions = installInstructions(deps.home, deps.env);
   if (instructions.length > 0) deps.print(`agent instructions: how to reach GitHub through agent-gh, in ${instructions.join(", ")}`);
   const after = contents(harnessFiles);
   changed.push(...harnessFiles.filter((_, index) => before[index] !== after[index]));

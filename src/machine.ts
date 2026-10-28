@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { claudeHookState, instructionFiles, pathOwner, staleInstructions } from "./agents.ts";
 import { isConfigured, READ_APP } from "./config.ts";
@@ -43,6 +43,29 @@ export const shimAdvice = (gh: string | undefined): string => {
 };
 
 type Line = { readonly state: "ok" | "FAIL" | "note"; readonly name: string; readonly detail: string };
+
+/** Probe refresh writes without reading credentials or touching a live token lock. */
+export const tokenStorageCheck = (dir: string): Line => {
+  let probe: string | undefined;
+  try {
+    probe = mkdtempSync(join(dir, ".agent-gh-doctor-"));
+    writeFileSync(join(probe, "lock"), "probe", { flag: "wx", mode: 0o600 });
+    writeFileSync(join(probe, "token"), "old", { mode: 0o600 });
+    renameSync(join(probe, "lock"), join(probe, "token"));
+    rmSync(probe, { recursive: true });
+    probe = undefined;
+    return { state: "ok", name: "token refresh storage", detail: `${dir}: lock creation and atomic replacement work in this process` };
+  } catch (error) {
+    if (probe === undefined && typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return { state: "FAIL", name: "token refresh storage", detail: `${dir}: directory is missing; rerun the install line to set up logins` };
+    }
+    return { state: "FAIL", name: "token refresh storage", detail: `${dir}: refresh writes failed; check sandbox and filesystem permissions, not the GitHub login` };
+  } finally {
+    if (probe !== undefined) {
+      try { rmSync(probe, { recursive: true, force: true }); } catch { /* The failed probe reports cleanup denial too. */ }
+    }
+  }
+};
 
 /** The newest release's tag, or undefined when GitHub does not say (a private repository, or offline). */
 export const latestRelease = async (api: Api, repo: string): Promise<string | undefined> => {
@@ -96,6 +119,8 @@ export const machineDoctor = async (
     add(usable ? "ok" : machine.agent_machine ? "FAIL" : "note", "login read", usable ? "usable" : `not logged in; ${RERUN} (or \`agent-gh login read\`)`);
   }
 
+  lines.push(tokenStorageCheck(deps.configDir));
+
   const gh = findReal("gh", deps.env.PATH, "");
   const shimmed = gh !== undefined && gh.startsWith(`${deps.shims}/`);
   add(shimmed ? "ok" : "FAIL", "gh shim", shimmed ? `${gh} is first on PATH` : shimAdvice(gh));
@@ -135,8 +160,8 @@ export const machineDoctor = async (
         : `${hook === "stale" ? "names another agent-gh" : "missing"} from ~/.claude/settings.json; ${RERUN}`,
     );
   }
-  const stale = staleInstructions(deps.home);
-  if (instructionFiles(deps.home).length > 0) add(stale.length === 0 ? "ok" : "FAIL", "agent instructions", stale.length === 0 ? "each harness's global instructions say how to reach GitHub" : `missing or out of date in ${stale.join(", ")}; ${RERUN}`);
+  const stale = staleInstructions(deps.home, deps.env);
+  if (instructionFiles(deps.home, deps.env).length > 0) add(stale.length === 0 ? "ok" : "FAIL", "agent instructions", stale.length === 0 ? "each harness's global instructions say how to reach GitHub" : `missing or out of date in ${stale.join(", ")}; ${RERUN}`);
   const git = join(deps.shims, "git");
   if (existsSync(git) && isShim(git)) add("FAIL", "git shim", `${git} is left from an older agent-gh; ${RERUN}`);
 
