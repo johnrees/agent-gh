@@ -8,6 +8,7 @@ import { claim, type ClaimIo, UNKNOWN } from "./claim-run.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { request } from "./github.ts";
 import { type Blocker, frontier, labelFilter, type LabelRules, NO_RULES, type Node, parseQueue, skippedText, type WaveIssue, type Waves, waves } from "./next.ts";
+import { DEFAULT_PRIORITY_LABELS } from "./priority.ts";
 import { parseRepo, type Repo, slug } from "./repo.ts";
 import { CONFIG_PATH } from "./review.ts";
 import type { ApiIo } from "./threads-run.ts";
@@ -60,8 +61,7 @@ export type QueueConfig = {
   readonly holdLabel?: string;
 };
 
-/** penmon's and soltui's priority labels, highest first. */
-export const DEFAULT_PRIORITY_LABELS = ["priority:high", "priority:medium", "priority:low"];
+export { DEFAULT_PRIORITY_LABELS };
 
 /**
  * `queue` in the review config on the default branch: `{"issue": N, "label":
