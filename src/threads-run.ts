@@ -1,11 +1,17 @@
-import { agentApps } from "./config.ts";
+import { postingApps, type Registry } from "./config.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { type Api, request } from "./github.ts";
 import { parseRepo, type Repo, slug } from "./repo.ts";
 import { awaitingOwner, type RequiredComment, requiredComments, type ThreadComment, type ThreadsInput } from "./threads.ts";
 
 /** What reading a repository's threads needs: the API, a token, and the repository. */
-export type ApiIo = { readonly api: Api; readonly token: string; readonly repo: Repo };
+export type ApiIo = {
+  readonly api: Api;
+  readonly token: string;
+  readonly repo: Repo;
+  /** The App registry; tests pass their own, everything else reads apps.json. */
+  readonly registry?: Registry;
+};
 
 const record = (value: unknown): Record<string, unknown> => (typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {});
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
@@ -101,7 +107,7 @@ export const pullThreads = async (
       comments.push(item);
     }
   }
-  const input: ThreadsInput = { owner, agentApps: agentApps().map((app) => app.id), since: pull.createdAt, comments };
+  const input: ThreadsInput = { owner, agentApps: postingApps(io.registry).map((app) => app.id), since: pull.createdAt, comments };
   const thumbedUp = new Set<number>();
   for (const candidate of awaitingOwner(input)) {
     if (candidate.thumbsUp === 0) continue;

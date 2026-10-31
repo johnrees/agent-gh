@@ -2,8 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { agentApps } from "../src/config.ts";
-import { reviewMarker, type ReviewMarker } from "../src/review.ts";
+import { agentApps, REGISTRY, type Registry } from "../src/config.ts";
+import { reviewMarker, type ReviewMarker, waiveMarker } from "../src/review.ts";
 import { pullDiff } from "../src/review-run.ts";
 import {
   agentCommit,
@@ -316,6 +316,8 @@ const history = () => {
 
 type Scenario = {
   head: string;
+  /** apps.json as this run reads it, where it differs from the committed one. */
+  registry?: Registry;
   mergeBase: string;
   remote?: string;
   author?: { login: string; type: string };
@@ -430,6 +432,7 @@ const statusWorld = (scenario: Scenario) => {
     api: fake.api,
     token: "ghs_actions",
     repo: { owner: "johnrees", name: "widget" },
+    ...(scenario.registry === undefined ? {} : { registry: scenario.registry }),
     remote: scenario.remote ?? "file:///nowhere",
     ntfyUrl: scenario.ntfy === undefined ? undefined : scenario.ntfy === "unreachable" ? `http://127.0.0.1:1/${TOPIC}` : `${fake.api.base}/ntfy/${TOPIC}`,
     git: async (args, input) => {
@@ -582,6 +585,23 @@ test("a person's waiver passes agent-review; an App's does not", async () => {
   expect((await deriveStatuses(person.io, 12))?.statuses[0]).toMatchObject({ state: "success", description: "waived by johnrees" });
   const app = statusWorld({ head: A, mergeBase: B, labels: ["review-waived"], events: [{ event: "labeled", label: { name: "review-waived" }, actor: { login: "johnrees" }, performed_via_github_app: { id: CLAUDE } }] });
   expect((await deriveStatuses(app.io, 12))?.statuses[0]).toMatchObject({ state: "pending" });
+});
+
+test("the workflow records the orchestrator's waiver with its Waived: comment for the head, and a push voids it (#110)", async () => {
+  const orchestrator = 990001;
+  const registry: Registry = { ...REGISTRY, orchestrator: { slug: "johnrees-orchestrator", app_id: orchestrator, client_id: "Iv23liORCH", bot_user_id: 990002 } };
+  const events = [{ event: "labeled", label: { name: "review-waived" }, actor: { login: "johnrees" }, performed_via_github_app: { id: orchestrator } }];
+  const comment = { id: 81, user: { login: "johnrees" }, performed_via_github_app: { id: orchestrator }, created_at: "2026-10-11T00:00:00Z", updated_at: "2026-10-11T00:00:00Z", body: `Waived: re-tested at the head\n\n${waiveMarker({ v: 1, head: A, session: "orch" })}` };
+  const statuses = async (head: string, config: Record<string, unknown> = { waiver_by: ["orchestrator"] }) =>
+    (await deriveStatuses(statusWorld({ head, mergeBase: B, registry, config, labels: ["review-waived"], events, comments: [comment] }).io, 12))?.statuses;
+  expect((await statuses(A))?.map((status) => [status.context, status.state, status.description])).toEqual([
+    ["agent-review", "success", "waived by orchestrator at aaaaaaaa: re-tested at the head"],
+    // The comment came through an agent App, so it waits for no answer.
+    ["agent-threads", "success", "no comment awaits an agent's answer"],
+  ]);
+  expect((await statuses("c".repeat(40)))?.[0]).toMatchObject({ state: "pending" });
+  // Without waiver_by, the orchestrator's label is any App's: it waives nothing.
+  expect((await statuses(A, {}))?.[0]).toMatchObject({ state: "pending" });
 });
 
 test("a pull request that is not an agent's passes both statuses; a repository without the config gets none", async () => {

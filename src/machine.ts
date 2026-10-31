@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { claudeHookState, instructionFiles, pathOwner, staleInstructions } from "./agents.ts";
-import { isConfigured, READ_APP } from "./config.ts";
+import { isConfigured, ORCHESTRATOR, READ_APP } from "./config.ts";
 import { familyNames } from "./family.ts";
 import type { Api } from "./github.ts";
 import { loginUsable } from "./login.ts";
@@ -121,6 +121,11 @@ export const machineDoctor = async (
 
   lines.push(tokenStorageCheck(deps.configDir));
 
+  // Only a machine that runs orchestrator sessions logs in to it, so a missing login is a note.
+  if (isConfigured(deps.configDir, ORCHESTRATOR, deps.registry)) {
+    const usable = loginUsable(deps.configDir, ORCHESTRATOR, deps.nowSeconds());
+    add(usable ? "ok" : "note", `login ${ORCHESTRATOR}`, usable ? "usable: `agent-gh waive` posts delegated review waivers from here" : `not logged in; \`agent-gh login ${ORCHESTRATOR}\` where you run orchestrator sessions`);
+  }
   const gh = findReal("gh", deps.env.PATH, "");
   const shimmed = gh !== undefined && gh.startsWith(`${deps.shims}/`);
   add(shimmed ? "ok" : "FAIL", "gh shim", shimmed ? `${gh} is first on PATH` : shimAdvice(gh));

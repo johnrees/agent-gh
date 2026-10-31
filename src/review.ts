@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Failure } from "./failure.ts";
+import { ORCHESTRATOR } from "./config.ts";
 import { familyNames } from "./family.ts";
 
 /**
@@ -25,6 +26,13 @@ export type ReviewConfig = {
   readonly effort: { readonly default: Effort; readonly rules: readonly EffortRule[] };
   readonly checklist: string | undefined;
   readonly waiverLabel: string;
+  /**
+   * `waiver_by`: identities whose waiver label counts, with a `Waived:`
+   * comment for the head, on a pull request they did not work on: only
+   * `orchestrator`, since a family listed here would be its own workers'.
+   * Empty by default: only a person's counts.
+   */
+  readonly waiverBy: readonly string[];
   /** A reviewer family that reviews every session's work, its own included. */
   readonly pin: ReviewerFamily | undefined;
   /**
@@ -184,7 +192,7 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
     throw new Failure(STAGE, `${CONFIG_PATH} is not valid JSON`);
   }
   const top = object(raw, "the file");
-  known(top, ["reviewers", "effort", "checklist", "waiver_label", "pin", "checks", "checks_output_lines", "post_checks_output", "checks_timeout_minutes", "block_on", "status_writer", "hold", "claims", "queue", "require"], "the file");
+  known(top, ["reviewers", "effort", "checklist", "waiver_label", "waiver_by", "pin", "checks", "checks_output_lines", "post_checks_output", "checks_timeout_minutes", "block_on", "status_writer", "hold", "claims", "queue", "require"], "the file");
   const checksRaw = top.checks ?? [];
   if (!Array.isArray(checksRaw)) throw new Failure(STAGE, `${CONFIG_PATH}: checks must be a list of commands`);
   const reviewersRaw = object(top.reviewers, "reviewers");
@@ -214,11 +222,19 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
   });
   const waiverLabel = top.waiver_label === undefined ? "review-waived" : string(top.waiver_label, "waiver_label");
   const writer = statusWriter(top.status_writer);
+  const waiverByRaw = top.waiver_by ?? [];
+  if (!Array.isArray(waiverByRaw)) throw new Failure(STAGE, `${CONFIG_PATH}: waiver_by must be a list, ["${ORCHESTRATOR}"] or []`);
+  const waiverBy = waiverByRaw.map((name, index) => {
+    // A model family is refused: its sessions are the workers, and any of them could act through its App.
+    if (string(name, `waiver_by[${index}]`) !== ORCHESTRATOR) throw new Failure(STAGE, `${CONFIG_PATH}: waiver_by[${index}] is ${JSON.stringify(name)}; only "${ORCHESTRATOR}" may waive, since a model family's App is its own workers'`);
+    return name as string;
+  });
   return {
     reviewers,
     effort: { default: effort(effortRaw.default ?? "high", "effort.default"), rules },
     checklist: top.checklist === undefined ? undefined : string(top.checklist, "checklist"),
     waiverLabel,
+    waiverBy,
     pin: pinned(top.pin, reviewers),
     require: requireConfig(top.require, reviewers),
     checks: checksRaw.map((check, index) => string(check, `checks[${index}]`)),
@@ -280,12 +296,11 @@ export const reviewersToRun = (config: ReviewConfig, author: string, only: strin
 };
 
 /**
- * Who waived the review: the login that last added the waiver label, when a
- * person added it. An App acting as that person (an agent) records
- * `performed_via_github_app`, so its label waives nothing. `events` is the
- * issue timeline's events, oldest first.
+ * Who last added the waiver label, if it is still on: the login, and the App
+ * it came through (`performed_via_github_app.id`), undefined for a person.
+ * `events` is the issue timeline's events, oldest first.
  */
-export const waivedBy = (events: readonly unknown[], waiverLabel: string): string | undefined => {
+export const waiverAdded = (events: readonly unknown[], waiverLabel: string): { readonly login: string; readonly appId: number | undefined } | undefined => {
   let last: Record<string, unknown> | undefined;
   for (const event of events) {
     if (typeof event !== "object" || event === null) continue;
@@ -294,9 +309,108 @@ export const waivedBy = (events: readonly unknown[], waiverLabel: string): strin
     if (entry.event === "labeled" && label?.name === waiverLabel) last = entry;
     if (entry.event === "unlabeled" && label?.name === waiverLabel) last = undefined;
   }
-  if (last === undefined || (last.performed_via_github_app !== null && last.performed_via_github_app !== undefined)) return undefined;
-  const actor = last.actor as Record<string, unknown> | undefined;
-  return typeof actor?.login === "string" ? actor.login : undefined;
+  const actor = last?.actor as Record<string, unknown> | undefined;
+  if (last === undefined || typeof actor?.login !== "string") return undefined;
+  const via = last.performed_via_github_app;
+  if (via === null || via === undefined) return { login: actor.login, appId: undefined };
+  const id = (via as Record<string, unknown>).id;
+  // An App GitHub names without an id waives nothing: it is not a person, and no listed App either.
+  return { login: actor.login, appId: Number.isSafeInteger(id) ? (id as number) : -1 };
+};
+
+/**
+ * Who waived the review: the login that last added the waiver label, when a
+ * person added it. An App acting as that person (an agent) records
+ * `performed_via_github_app`, so its label waives nothing here; a listed
+ * identity's is judged by `delegatedWaiver`.
+ */
+export const waivedBy = (events: readonly unknown[], waiverLabel: string): string | undefined => {
+  const added = waiverAdded(events, waiverLabel);
+  return added !== undefined && added.appId === undefined ? added.login : undefined;
+};
+
+/** On a `Waived:` comment: the head it waives, and the session that posted it (`agent-gh waive`). */
+export type WaiveMarker = { readonly v: 1; readonly head: string; readonly session: string };
+const WAIVE = /<!-- agent-waive (\{[^\n]*?\}) -->/;
+export const waiveMarker = (marker: WaiveMarker): string => `<!-- agent-waive ${JSON.stringify(marker)} -->`;
+
+export const parseWaive = (body: string): WaiveMarker | undefined => {
+  const match = WAIVE.exec(body);
+  if (match === null) return undefined;
+  try {
+    const value = JSON.parse(match[1] as string) as Record<string, unknown>;
+    return value.v === 1 && typeof value.head === "string" && /^[0-9a-f]{40}$/.test(value.head) && typeof value.session === "string" && value.session !== ""
+      ? { v: 1, head: value.head, session: value.session }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/** A conversation comment, as a delegated waiver's evidence is read from it. */
+export type WaiverComment = { readonly appId: number | undefined; readonly author: string; readonly createdAt: string; readonly updatedAt?: string; readonly body: string };
+
+/**
+ * Who worked on a pull request, so none of them waives it: the identities
+ * its claim marker and its commits' `Co-authored-by` credit, and the sessions
+ * its claim marker and its commits' `Agent-Session` name.
+ */
+export type Workers = { readonly identities: readonly string[]; readonly sessions: readonly string[] };
+
+/** The first line of a delegated waiver's reason, as the status shows it. */
+const reasonOf = (body: string): string => (body.replace(/<!--[\s\S]*?-->/g, "").trimStart().split("\n")[0] ?? "").replace(/^Waived:\s*/, "").trim();
+
+/**
+ * A delegated waiver: the label came through `delegate`'s App (an identity
+ * `waiver_by` lists), the same login posted a comment through the same App
+ * starting `Waived:` with a reason, whose marker names the current head, never edited (any
+ * agent, acting as John, could edit it), and neither the identity nor the
+ * comment's session worked on the pull request. A push moves the head, so it
+ * voids the waiver until a new comment names the new head. Says who waived
+ * at which head, and why, as the status records it.
+ */
+export const delegatedWaiver = (
+  added: { readonly login: string; readonly appId: number },
+  delegate: { readonly name: string; readonly id: number },
+  head: string,
+  comments: readonly WaiverComment[],
+  workers: Workers,
+): string | undefined => {
+  if (added.appId !== delegate.id || workers.identities.includes(delegate.name)) return undefined;
+  const evidence = comments.filter((comment) => {
+    const marker = parseWaive(comment.body);
+    return (
+      comment.appId === delegate.id &&
+      comment.author.toLowerCase() === added.login.toLowerCase() &&
+      // An edited comment (or one GitHub gives no edit time for) fails closed.
+      comment.updatedAt === comment.createdAt &&
+      comment.body.trimStart().startsWith("Waived:") &&
+      // The reason is the evidence: a bare `Waived:` gives none.
+      reasonOf(comment.body) !== "" &&
+      marker?.head === head &&
+      !workers.sessions.includes(marker.session)
+    );
+  });
+  const latest = evidence.at(-1);
+  return latest === undefined ? undefined : `${delegate.name} at ${head.slice(0, 8)}: ${reasonOf(latest.body)}`;
+};
+
+/**
+ * The identities and sessions a commit message credits: `Co-authored-by`
+ * bot logins (`bots` maps an identity to its), and `Agent-Session` values.
+ * Read loosely, from any line: a credit read too many times only stops a
+ * waiver, never lets one through.
+ */
+export const commitWorkers = (messages: readonly string[], bots: Readonly<Record<string, string>>): Workers => {
+  const identities = new Set<string>();
+  const sessions = new Set<string>();
+  for (const message of messages) {
+    for (const [, key, value] of message.matchAll(/^\s*(Co-authored-by|Agent-Session):\s*(\S+)/gim)) {
+      if ((key as string).toLowerCase() === "agent-session") sessions.add(value as string);
+      else for (const [name, bot] of Object.entries(bots)) if ((value as string).toLowerCase() === bot.toLowerCase()) identities.add(name);
+    }
+  }
+  return { identities: [...identities], sessions: [...sessions] };
 };
 
 export type CommitStatus = { readonly state: string; readonly description: string; readonly id: number | undefined; readonly url?: string };
