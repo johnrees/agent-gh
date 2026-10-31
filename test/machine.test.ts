@@ -391,6 +391,7 @@ test("doctor --machine passes a set-up agent machine and names the fix for each 
     `ok   gitleaks: ${join(bin, "gitleaks")}`,
     "ok   login claude: usable",
     "ok   login read: usable",
+    `ok   token refresh storage: ${deps.configDir}: lock creation and atomic replacement work in this process`,
     `ok   gh shim: ${join(deps.shims, "gh")} is first on PATH`,
     ...(HOST_CONFIG_HOOKS ? [COMMIT_HOOK_OK, PUSH_HOOK_OK] : []),
     `ok   git author: ${AUTHOR_NAME} <${AUTHOR_EMAIL}>`,

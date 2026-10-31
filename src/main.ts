@@ -17,6 +17,7 @@ import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, waves
 import { parseGraphArgs } from "./graph.ts";
 import { readGraph } from "./graph-run.ts";
 import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
+import { configureCodexSandbox } from "./codex.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
 import { doctor, PERSON } from "./doctor.ts";
 import { describe, Failure, NEXT_STEP } from "./failure.ts";
@@ -45,7 +46,9 @@ const USAGE = `usage:
   agent-gh doctor                   show who is acting, then check the user, App, git author, and repository access
   agent-gh setup <family>           create johnrees-<family> (${familyNames().join(", ")}, or read); run it yourself, not from an agent
   agent-gh login <family>|--all     authorize johnrees-<family> to act as you (device flow); --all: every App not yet logged in
-  agent-gh install-shims [--agent-machine]  the gh shim first on PATH; --agent-machine: git reads with the read App and pushes with the family App, gh logged out
+  agent-gh install-shims [--agent-machine] [--codex-sandbox]
+                                    --codex-sandbox: set Codex's global default to workspace-write, allow token-directory writes and outbound networking (all hosts)
+                                    the gh shim first on PATH; --agent-machine: git reads with the read App and pushes with the family App, gh logged out
   agent-gh doctor --machine         check this machine: release, gitleaks, logins, shims, and agent-machine settings
   agent-gh --version
   agent-gh credential get           git's credential helper on agent machines: an agent session's family App where installed, else the read App
@@ -491,14 +494,27 @@ const main = async (argv: readonly string[]): Promise<number> => {
   }
   if (first === "install-shims") {
     const agentMachine = rest.includes("--agent-machine");
-    if (rest.some((arg) => arg !== "--agent-machine")) {
+    if (rest.some((arg) => arg !== "--agent-machine" && arg !== "--codex-sandbox")) {
       console.error(USAGE);
       return 1;
     }
     if (inAgentSession(env)) {
       throw new Failure("installing the shims", "an agent does not change its own guardrails; run the install line in your own terminal");
     }
+    // Create CODEX_HOME before installing harness instructions on a fresh machine,
+    // but an optional config refusal must not prevent the shim installation.
+    let codexFailure: Failure | undefined;
+    if (rest.includes("--codex-sandbox")) {
+      const deps = shimDeps(env);
+      try {
+        console.log(configureCodexSandbox(deps.home, deps.configDir, env));
+      } catch (error) {
+        if (!(error instanceof Failure)) throw error;
+        codexFailure = error;
+      }
+    }
     installShims(shimDeps(env), agentMachine, limitedFamilies(familyNames(), env.AGENT_GH_FAMILIES));
+    if (codexFailure !== undefined) throw codexFailure;
     return 0;
   }
   if (first === "git") {

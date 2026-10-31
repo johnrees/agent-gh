@@ -12,6 +12,8 @@
 #
 # The only thing you do is enter the device-flow codes it prints. It needs no
 # sudo. AGENT_GH_FAMILIES=claude,codex limits which family Apps it logs in.
+# --codex-sandbox sets Codex's global default to workspace-write, with token-directory
+# writes and outbound network access to all hosts. Existing config values are preserved; original TOML is backed up.
 set -euo pipefail
 
 REPO="johnrees/agent-gh"
@@ -23,10 +25,12 @@ BIN="$HOME/.local/bin"
 SHIMS="$HOME/.local/share/agent-gh/shims"
 
 agent_machine=0
+codex_sandbox=0
 for arg in "$@"; do
   case $arg in
     --agent-machine) agent_machine=1 ;;
-    *) echo "install.sh: unknown option $arg (only --agent-machine)" >&2; exit 2 ;;
+    --codex-sandbox) codex_sandbox=1 ;;
+    *) echo "install.sh: unknown option $arg (only --agent-machine and --codex-sandbox)" >&2; exit 2 ;;
   esac
 done
 
@@ -112,12 +116,12 @@ login_ok=1
 "$BIN/agent-gh" login --all < "$tty" || login_ok=0
 
 # 4. The gh shim, and on an agent machine, git credentials and no personal write access.
-if [ "$agent_machine" = 1 ]; then
-  "$BIN/agent-gh" install-shims --agent-machine < "$tty"
-else
-  "$BIN/agent-gh" install-shims < "$tty"
-fi
+shim_args=(install-shims)
+if [ "$agent_machine" = 1 ]; then shim_args+=(--agent-machine); fi
+if [ "$codex_sandbox" = 1 ]; then shim_args+=(--codex-sandbox); fi
+shim_ok=1
+"$BIN/agent-gh" "${shim_args[@]}" < "$tty" || shim_ok=0
 
 # 5. The checklist.
 "$BIN/agent-gh" doctor --machine || exit 1
-[ "$login_ok" = 1 ] || exit 1
+[ "$login_ok" = 1 ] && [ "$shim_ok" = 1 ] || exit 1
