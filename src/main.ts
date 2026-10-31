@@ -33,7 +33,7 @@ import { parseAddress } from "./reply.ts";
 import { type NotifyOptions, notifyCommand, replyCommand, type ReplyOptions } from "./reply-run.ts";
 import { EFFORTS, type Effort } from "./review.ts";
 import { dispatchGh, guardPush, type ReviewIo, reviewFull, reviewSweep, spawnCheck, spawnReviewer } from "./review-run.ts";
-import { type Context, runAs, withToken } from "./run.ts";
+import { type Context, readOnly, runAs, withToken } from "./run.ts";
 import { type StatusIo, statusCommand } from "./status-run.ts";
 import { configuredFamilies, settingsLines } from "./settings.ts";
 import { setup } from "./setup.ts";
@@ -722,7 +722,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     },
     io: (target, childEnv) => reviewIo({ ...context, repo: target }, target, childEnv),
     runWith: async (ghArgs, childEnv) => (await runChild(["gh", ...ghArgs], childEnv)).code,
-    run: (ghArgs) => runAs(context, ["gh", ...ghArgs]),
+    run: (ghArgs) => runAs(context, ["gh", ...ghArgs], readOnly(ghArgs)),
   });
 };
 
