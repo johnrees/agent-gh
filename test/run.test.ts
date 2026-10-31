@@ -1,11 +1,11 @@
-import { afterEach, describe as group, expect, test } from "bun:test";
+import { afterEach, describe as group, expect, spyOn, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, Failure } from "../src/failure.ts";
 import { readConfig, type Registry } from "../src/config.ts";
 import { doctor, PERSON } from "../src/doctor.ts";
-import { type Context, runAs } from "../src/run.ts";
+import { type Context, readOnly, runAs } from "../src/run.ts";
 import {
   ACCESS,
   CONFIG,
@@ -111,6 +111,83 @@ group("a command runs as John through the family App", () => {
     expect(await runAs(context, recorder(3))).toBe(3);
   });
 
+});
+
+group("a read of a public repository the App is not installed on (#104)", () => {
+  const WORKERD = { owner: "cloudflare", name: "workerd" };
+  const NOT_INSTALLED =
+    "the johnrees-claude App is not installed on cloudflare/workerd; install it at https://github.com/apps/johnrees-claude/installations/new and select cloudflare/workerd";
+  const visible = (status: number, body: Record<string, unknown> = {}) => ({
+    ...HAPPY,
+    "GET /repos/cloudflare/workerd": () => reply(status, body),
+  });
+  const PUBLIC = visible(200, { private: false, visibility: "public" });
+
+  test("runs with the same login after GitHub says the repository is public, and says so on stderr", async () => {
+    const { fake, out, context } = setup(PUBLIC);
+    const said = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await runAs({ ...context, repo: WORKERD }, recorder(), true)).toBe(0);
+      expect(said.mock.calls.flat().join("\n")).toContain("cloudflare/workerd is public; reading it with the johnrees-claude App");
+    } finally {
+      said.mockRestore();
+    }
+    expect(fake.log.at(-1)).toMatchObject({ method: "GET", path: "/repos/cloudflare/workerd", auth: `Bearer ${ACCESS}` });
+    const env = JSON.parse(readFileSync(out, "utf8"));
+    expect([env.GH_TOKEN, env.GH_REPO]).toEqual([ACCESS, "cloudflare/workerd"]);
+  });
+
+  test("a write to the same public repository keeps the refusal, without asking about visibility", async () => {
+    const { fake, context } = setup(PUBLIC);
+    const error = await failure(runAs({ ...context, repo: WORKERD }, recorder()));
+    expect(error.detail).toBe(NOT_INSTALLED);
+    expect(fake.log.some((entry) => entry.path.startsWith("/repos/"))).toBe(false);
+  });
+
+  for (const [why, routes] of [
+    ["private", visible(200, { private: true, visibility: "private" })],
+    ["internal", visible(200, { private: false, visibility: "internal" })],
+    ["hidden from the login (404)", visible(404)],
+    ["of unknown visibility (HTTP 500)", visible(500)],
+  ] as const) {
+    test(`a read of a ${why} repository keeps the refusal`, async () => {
+      const { context } = setup(routes);
+      const error = await failure(runAs({ ...context, repo: WORKERD }, recorder(), true));
+      expect([error.stage, error.detail]).toEqual(["finding the installation", NOT_INSTALLED]);
+      clean(describe(error));
+    });
+  }
+
+  test("only commands that cannot write count as reads", () => {
+    for (const args of [
+      ["pr", "view", "7910", "-R", "cloudflare/workerd", "--json", "title,files"],
+      ["pr", "diff", "https://github.com/cloudflare/workerd/pull/7910"],
+      ["issue", "list", "--state", "all"],
+      ["search", "prs", "--repo", "cloudflare/workerd", "fix"],
+      ["release", "view", "v1"],
+      ["api", "repos/cloudflare/workerd/pulls/7910/files", "--paginate"],
+      ["api", "-X", "GET", "search/issues", "-f", "q=repo:cloudflare/workerd"],
+      ["api", "repos/graphql/graphql-js/contents/src/graphql.ts"],
+      ["pr", "-R", "cloudflare/workerd", "view", "7910"],
+      ["pr", "--repo=cloudflare/workerd", "view", "7910"],
+    ]) {
+      expect([args, readOnly(args)]).toEqual([args, true]);
+    }
+    for (const args of [
+      ["pr", "comment", "7910", "-R", "cloudflare/workerd", "-b", "x"],
+      ["pr", "-R", "cloudflare/workerd", "comment", "7910"],
+      ["issue", "create", "-t", "x"],
+      ["repo", "fork"],
+      ["api", "repos/cloudflare/workerd/issues", "-f", "title=x"],
+      ["api", "-X", "DELETE", "repos/cloudflare/workerd/issues/comments/1"],
+      ["api", "graphql", "-X", "GET", "-f", "query=mutation{x}"],
+      ["api", "-X", "GET", "https://api.github.com/graphql"],
+      ["api", "-X", "GET", "/graphql?query=x"],
+      ["pr", "-R", "view", "comment", "7910"],
+    ]) {
+      expect([args, readOnly(args)]).toEqual([args, false]);
+    }
+  });
 });
 
 group("the login refreshes before it expires, once, under a lock", () => {

@@ -163,6 +163,18 @@ const fullName = (item: Record<string, unknown>): string | undefined => {
   return typeof login === "string" && typeof item.name === "string" ? `${login}/${item.name}` : undefined;
 };
 
+/** A refusal because the App is not installed on the repository, not because a check failed. */
+export class MissingInstallation extends Failure {}
+
+/** Whether anyone may read the repository, asked with the App's login; a 404 (private, or gone) is not public. */
+export const isPublic = async (api: Api, stage: Stage, repo: Repo, token: string): Promise<boolean> => {
+  const response = await get(api, stage, `/repos/${repo.owner}/${repo.name}`, token);
+  if (response.status === 404) return false;
+  if (!response.ok) throw new Failure(stage, `HTTP ${response.status}`);
+  const body = await json(response, stage);
+  return body.private === false && body.visibility === "public";
+};
+
 /**
  * Refuses up front when the family's App is not installed on the repository:
  * gh's own error for that case does not say why. Uses John's user token for
@@ -179,7 +191,7 @@ export const requireInstallation = async (
   const stage = "finding the installation";
   const relogin = `run \`agent-gh login ${family}\` in your own terminal`;
   const missing = () =>
-    new Failure(
+    new MissingInstallation(
       stage,
       `the ${config.slug} App is not installed on ${slug(repo)}; install it at https://github.com/apps/${config.slug}/installations/new and select ${slug(repo)}`,
     );
