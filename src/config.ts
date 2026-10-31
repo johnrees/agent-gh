@@ -40,6 +40,15 @@ export const REGISTRY: Registry = registryJson;
  */
 export const READ_APP = "read";
 
+/**
+ * The orchestrator App (`johnrees-orchestrator`): an identity apart from every
+ * model family, which John logs in to only where he runs an orchestrator
+ * session. It never commits, claims, or reviews; `agent-gh waive` posts a
+ * delegated review waiver through it, which counts where a repository's
+ * `waiver_by` lists it and it is not the pull request's own worker.
+ */
+export const ORCHESTRATOR = "orchestrator";
+
 /** A family App agents act through: its id, and the bot login commits credit. */
 export type AgentApp = { readonly family: string; readonly slug: string; readonly id: number; readonly bot: string };
 
@@ -49,6 +58,21 @@ export const agentApps = (registry: Registry = REGISTRY): AgentApp[] =>
     const entry = Object.hasOwn(registry, family) ? registry[family] : undefined;
     return entry === undefined ? [] : [{ family, slug: entry.slug, id: entry.app_id, bot: `${entry.slug}[bot]` }];
   });
+
+/**
+ * The App a delegated waiver may come through: a family's or the
+ * orchestrator's, undefined until its registry entry is committed.
+ */
+export const appOf = (name: string, registry: Registry = REGISTRY): AgentApp | undefined => {
+  const entry = Object.hasOwn(registry, name) && (name === ORCHESTRATOR || familyNames().includes(name)) ? registry[name] : undefined;
+  return entry === undefined ? undefined : { family: name, slug: entry.slug, id: entry.app_id, bot: `${entry.slug}[bot]` };
+};
+
+/** The Apps an agent posts through: every family's and the orchestrator's, whose comments wait for no agent's answer. */
+export const postingApps = (registry: Registry = REGISTRY): AgentApp[] => {
+  const orchestrator = appOf(ORCHESTRATOR, registry);
+  return orchestrator === undefined ? agentApps(registry) : [...agentApps(registry), orchestrator];
+};
 
 export const defaultConfigDir = (): string => join(homedir(), ".config", "agent-gh");
 

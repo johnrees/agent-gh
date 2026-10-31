@@ -532,3 +532,13 @@ test.skipIf(!HOST_CONFIG_HOOKS)("the config-hook probe works from outside any re
     process.chdir(before);
   }
 });
+
+test("doctor --machine notes the orchestrator's login only where its App exists (#110)", async () => {
+  const { deps } = machine();
+  const lines = async (registry: typeof REGISTRY) =>
+    (await machineDoctor({ ...deps, registry, version: "dev", latest: async () => undefined, ssh: () => "refused" })).map(formatLine).filter((line) => line.includes("orchestrator"));
+  expect(await lines({ ...REGISTRY, orchestrator: { slug: "johnrees-orchestrator", app_id: 990001, client_id: "Iv23liORCH", bot_user_id: 990002 } })).toEqual([
+    "note login orchestrator: not logged in; `agent-gh login orchestrator` where you run orchestrator sessions",
+  ]);
+  expect(await lines(REGISTRY)).toEqual([]);
+});

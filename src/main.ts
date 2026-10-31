@@ -16,7 +16,7 @@ import type { LabelRules } from "./next.ts";
 import { apiReader, claimNext, nextIssues, nextJson, nextLines, wavesJson, wavesLines } from "./next-run.ts";
 import { parseGraphArgs } from "./graph.ts";
 import { readGraph } from "./graph-run.ts";
-import { defaultConfigDir, isConfigured, READ_APP, REGISTRY } from "./config.ts";
+import { defaultConfigDir, isConfigured, ORCHESTRATOR, READ_APP, REGISTRY } from "./config.ts";
 import { configureCodexSandbox } from "./codex.ts";
 import { credential, familyToken, readToken } from "./credential.ts";
 import { doctor, PERSON } from "./doctor.ts";
@@ -40,11 +40,12 @@ import { setup } from "./setup.ts";
 import { readGitConfig } from "./target.ts";
 import { defaultBinDir, defaultShimDir, installShims, rcBlock, type ShimDeps, whichReal } from "./shims.ts";
 import { VERSION } from "./version.ts";
+import { waiveCommand } from "./waive-run.ts";
 
 const USAGE = `usage:
   agent-gh <gh arguments...>        run gh as John through this agent's family App
   agent-gh doctor                   show who is acting, then check the user, App, git author, and repository access
-  agent-gh setup <family>           create johnrees-<family> (${familyNames().join(", ")}, or read); run it yourself, not from an agent
+  agent-gh setup <family>           create johnrees-<family> (${familyNames().join(", ")}, read, or ${ORCHESTRATOR}); run it yourself, not from an agent
   agent-gh login <family>|--all     authorize johnrees-<family> to act as you (device flow); --all: every App not yet logged in
   agent-gh install-shims [--agent-machine] [--codex-sandbox]
                                     --codex-sandbox: set Codex's global default to workspace-write, allow token-directory writes and outbound networking (all hosts)
@@ -72,6 +73,11 @@ const USAGE = `usage:
   agent-gh reply <finding> --applied <sha> | --declined "<why>" [--pr N]
                                     answer a review finding or a notify (its id as \`review full\` prints it, or its URL);
                                     a finding's review thread is answered and resolved
+  agent-gh waive --reason "<evidence>" [--pr N] [--as IDENTITY]
+                                    an orchestrator session's delegated review waiver, through johnrees-${ORCHESTRATOR}
+                                    (or --as's App): a \`Waived:\` comment naming the head, then the waiver label; it
+                                    counts where waiver_by lists the identity, never on a pull request it worked on,
+                                    and a push voids it
   agent-gh notify <issue or pr> --severity P0|P1|P2 --body "<text>" | --body-file <file|-> [--from <issue or pr>]
                                     post a finding on another thread, linked back to this branch's pull request (or --from);
                                     it waits for an agent's \`agent-gh reply\`
@@ -125,8 +131,8 @@ const openUrl = (url: string) => {
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
-/** Apps setup, login, and settings accept: every family, and the read App. */
-const apps = (): string[] => [...familyNames(), READ_APP];
+/** Apps setup, login, and settings accept: every family, the read App, and the orchestrator's. */
+const apps = (): string[] => [...familyNames(), READ_APP, ORCHESTRATOR];
 
 /** This binary, for the shims and git's credential helper to call; `bun src/main.ts` stands in for it with the installed one. */
 const self = (): string => (/(^|\/)agent-gh[^/]*$/.test(process.execPath) ? process.execPath : `${defaultBinDir()}/agent-gh`);
@@ -642,6 +648,25 @@ const main = async (argv: readonly string[]): Promise<number> => {
       parsed.tag,
       parsed.sha,
     );
+  }
+  if (first === "waive") {
+    const parsed = flagPairs(rest, 0, ["--reason", "--pr", "--as"]);
+    const pr = prFlag(parsed?.values["--pr"]);
+    const as = parsed?.values["--as"] ?? ORCHESTRATOR;
+    const reason = parsed?.values["--reason"];
+    if (reason === undefined || Number.isNaN(pr) || ![ORCHESTRATOR, ...familyNames()].includes(as)) {
+      console.error(USAGE);
+      return 1;
+    }
+    if (!inAgentSession(env)) throw new Failure("waiving the review", "John waives a review by adding the waiver label himself; `agent-gh waive` is for an orchestrator session");
+    const repo = await resolveRepo("git", [], env, () => originUrl(process.cwd()));
+    if (repo === undefined) throw new Failure("waiving the review", "no GH_REPO and no github.com origin remote; run it inside a clone of the repository");
+    // The session's own harness and session id, acting through the waiving identity's App.
+    const context: Context = { identity: { ...detectIdentity(env), family: as }, repo, env, api: GITHUB, configDir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) };
+    return withToken(context, async (childEnv) => {
+      await waiveCommand(reviewIo(context, repo, childEnv), { reason, ...(pr === undefined ? {} : { pr }) });
+      return 0;
+    });
   }
   if (first === "claim" || first === "release" || first === "claims" || first === "next") return claimCommand(first, rest, env);
   if (first === "graph") return graphCommand(rest, env);

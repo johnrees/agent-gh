@@ -50,6 +50,7 @@ export type Stage =
   | "granting a release"
   | "notifying"
   | "replying"
+  | "waiving the review"
   | "reviewing"
   | "deriving the statuses"
   | "claiming"

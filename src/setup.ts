@@ -1,11 +1,13 @@
 import { randomBytes } from "node:crypto";
-import { hasCredentials, READ_APP, REGISTRY, registryLine, writeCredentials, type AppConfig, type Registry } from "./config.ts";
+import { hasCredentials, ORCHESTRATOR, READ_APP, REGISTRY, registryLine, writeCredentials, type AppConfig, type Registry } from "./config.ts";
 import { Failure } from "./failure.ts";
 import type { Api } from "./github.ts";
 
 // statuses: `agent-gh review` records the agent-review status, and the gate on `gh pr ready` reads it.
 const WRITE = { contents: "write", issues: "write", pull_requests: "write", actions: "read", checks: "read", statuses: "write" } as const;
 const READ = { contents: "read", issues: "read", pull_requests: "read", actions: "read", checks: "read", statuses: "read" } as const;
+// The orchestrator only reads the review config and the pull request, and posts a `Waived:` comment and the waiver label.
+const WAIVE = { contents: "read", issues: "write", pull_requests: "write" } as const;
 
 /**
  * An App private to John's account, with no webhook deliveries. A model
@@ -19,14 +21,16 @@ export const manifest = (family: string, redirectUrl: string) => ({
   description:
     family === READ_APP
       ? "Read-only access for git clone and gh reads on machines that only run agents, through agent-gh."
-      : `The identity of agents running ${family} models, used through agent-gh.`,
+      : family === ORCHESTRATOR
+        ? "The orchestrator session John delegates review waivers to (`agent-gh waive`), apart from every model family."
+        : `The identity of agents running ${family} models, used through agent-gh.`,
   public: false,
   // GitHub requires a URL whenever hook_attributes is present; active: false
   // means nothing is ever delivered to it.
   hook_attributes: { url: "https://github.com/johnrees", active: false },
   redirect_url: redirectUrl,
   default_events: [],
-  default_permissions: family === READ_APP ? READ : WRITE,
+  default_permissions: family === READ_APP ? READ : family === ORCHESTRATOR ? WAIVE : WRITE,
   request_oauth_on_install: false,
   setup_on_update: false,
 });
@@ -124,10 +128,16 @@ export const setup = async (family: string, deps: Setup): Promise<AppConfig> => 
     deps.print(
       family === READ_APP
         ? `  1. Install it on every repository you clone on agent machines (it can only read): ${deps.github}/apps/${config.slug}/installations/new`
-        : `  1. Install it on each repository agents work in: ${deps.github}/apps/${config.slug}/installations/new`,
+        : family === ORCHESTRATOR
+          ? `  1. Install it on each repository whose agent-review.json lists it in waiver_by: ${deps.github}/apps/${config.slug}/installations/new`
+          : `  1. Install it on each repository agents work in: ${deps.github}/apps/${config.slug}/installations/new`,
     );
     deps.print(`  2. Tick "Enable Device Flow" and save (a manifest cannot set it): ${deps.github}/settings/apps/${config.slug}`);
-    deps.print(`  3. Run \`agent-gh login ${family}\` to let it act as you.`);
+    deps.print(
+      family === ORCHESTRATOR
+        ? `  3. Run \`agent-gh login ${family}\` only on the machine where you run orchestrator sessions (\`login --all\` leaves it out).`
+        : `  3. Run \`agent-gh login ${family}\` to let it act as you.`,
+    );
     deps.print(`  4. Add this line to apps.json in the agent-gh repository and commit it, so other machines need only \`agent-gh login ${family}\`:`);
     deps.print(`     ${registryLine(family, config)}`);
     return config;

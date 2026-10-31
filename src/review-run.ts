@@ -3,14 +3,14 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { type GrantMarker, GRANT_LABEL, grantCommand, grantProblem, parseGrant, validTag } from "./allow.ts";
 import { claimMarkerText, parseClaim, takesOf, withClaimMarker } from "./claim.ts";
-import { agentApps, REGISTRY } from "./config.ts";
+import { agentApps, appOf, postingApps, REGISTRY, type Registry } from "./config.ts";
 import { Failure, type Stage } from "./failure.ts";
 import { familyNames } from "./family.ts";
 import { type Api, request } from "./github.ts";
 import { HARNESSES, type Env } from "./harness.ts";
 import { parseRemoteUrl, parseRepo, type Repo, slug } from "./repo.ts";
 import { ACTIONS_APP, absent, checkState, type PushedTag, pushedRefs, type RequiredCheck, requiredChecks, type WorkflowRun } from "./merge.ts";
-import { type ApiIo, closingIssues, describeRequired, everyPage, pullThreads, repoOwner } from "./threads-run.ts";
+import { type ApiIo, closingIssues, describeRequired, everyPage, issueComments, pullThreads, repoOwner } from "./threads-run.ts";
 import {
   AWAITING,
   byReviewer,
@@ -80,7 +80,10 @@ import {
   statusDescription,
   sweepPrompt,
   type Ticket,
-  waivedBy,
+  commitWorkers,
+  delegatedWaiver,
+  waiverAdded,
+  type Workers,
   withIds,
 } from "./review.ts";
 
@@ -89,6 +92,8 @@ export type ReviewIo = {
   readonly api: Api;
   readonly token: string;
   readonly repo: Repo;
+  /** The App registry; tests pass their own, everything else reads apps.json. */
+  readonly registry?: Registry;
   /** The session's family: its work is reviewed by another family. */
   readonly family: string;
   /** The session's id as its claims carry it (`sessionId`); undefined when its environment names none. */
@@ -256,7 +261,13 @@ const priorReview = async (io: ReviewIo, pr: Pull, head: string, family?: Review
   };
 };
 
-/** The person who waived the review of this pull request, if one did and the label is still on it. */
+/**
+ * Who waived the review of this pull request, if anyone did and the label is
+ * still on it: the person who added it, or, where `waiver_by` lists the
+ * identity whose App added it, that identity with its `Waived:` comment for
+ * the head (`delegatedWaiver`). Only that second case reads the comments and
+ * commits, so a pull request with no waiver costs no more requests than before.
+ */
 export const waiver = async (io: ApiIo, stage: Stage, target: Pull, config: ReviewConfig): Promise<string | undefined> => {
   if (!target.labels.includes(config.waiverLabel)) return undefined;
   const events: unknown[] = [];
@@ -268,7 +279,32 @@ export const waiver = async (io: ApiIo, stage: Stage, target: Pull, config: Revi
     events.push(...value);
     if (value.length < 100) break;
   }
-  return waivedBy(events, config.waiverLabel);
+  const added = waiverAdded(events, config.waiverLabel);
+  if (added?.appId === undefined) return added?.login;
+  const registry = io.registry ?? REGISTRY;
+  const delegate = config.waiverBy.map((name) => appOf(name, registry)).find((app) => app?.id === added.appId);
+  if (delegate === undefined) return undefined;
+  const workers = await pullWorkers(io, stage, target);
+  if (workers === undefined) return undefined;
+  const comments = await issueComments(io, stage, io.repo, target.number, `#${target.number}`);
+  return delegatedWaiver({ login: added.login, appId: added.appId }, { name: delegate.family, id: delegate.id }, target.head, comments, workers);
+};
+
+/**
+ * Who worked on the pull request (`Workers`): its claim marker's family and
+ * session, and the identities and sessions its commits credit. Undefined
+ * when GitHub may not have listed every commit (it lists at most 250), since
+ * one left out could be the waiving identity's own.
+ */
+export const pullWorkers = async (io: ApiIo, stage: Stage, target: Pick<Pull, "number" | "body">): Promise<Workers | undefined> => {
+  const commits = (await everyPage(io, stage, `${repoPath(io)}/pulls/${target.number}/commits`, 3)).map((commit) => text(record(record(commit).commit).message));
+  if (commits.length >= 250) return undefined;
+  const credited = commitWorkers(commits, Object.fromEntries(postingApps(io.registry).map((app) => [app.family, app.bot])));
+  const claim = parseClaim(target.body);
+  return {
+    identities: [...credited.identities, ...(claim === undefined ? [] : [claim.family])],
+    sessions: [...credited.sessions, ...(claim === undefined ? [] : [claim.session])],
+  };
 };
 
 const setStatus = (io: ReviewIo, sha: string, state: "success" | "failure", description: string) =>
@@ -330,7 +366,7 @@ const gateUnreviewed = async (io: ReviewIo, stage: Stage, pr: Pull, config: Revi
     io.print(`agent-gh: the review of #${number} was waived by ${person}`);
     return;
   }
-  const waive = `or ask John to add the \`${config.waiverLabel}\` label`;
+  const waive = `or ask John to add the \`${config.waiverLabel}\` label${config.waiverBy.length === 0 ? "" : ` (or ${config.waiverBy.join(" or ")}, which \`waiver_by\` lists, to run \`agent-gh waive\`)`}`;
   // Where `require` names the author, a family yet to review this head is named, with the command that runs it alone.
   const awaiting = status?.state === "failure" ? AWAITING.exec(status.description) : null;
   if (awaiting !== null) {

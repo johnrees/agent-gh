@@ -41,6 +41,12 @@ test("the read App's manifest reads everything a family App can reach and writes
   expect(Object.values(value.default_permissions).every((level) => level === "read")).toBe(true);
 });
 
+test("the orchestrator App's manifest reads the review config and writes only comments and labels (#110)", () => {
+  const value = manifest("orchestrator", "http://127.0.0.1:5000/callback");
+  expect(value.name).toBe("johnrees-orchestrator");
+  expect(value.default_permissions).toEqual({ contents: "read", issues: "write", pull_requests: "write" });
+});
+
 const conversion = {
   id: 99,
   slug: "johnrees-codex",
