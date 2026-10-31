@@ -357,7 +357,7 @@ export type WaiverComment = { readonly appId: number | undefined; readonly autho
 export type Workers = { readonly identities: readonly string[]; readonly sessions: readonly string[] };
 
 /** The first line of a delegated waiver's reason, as the status shows it. */
-const reasonOf = (body: string): string => (body.trimStart().split("\n")[0] ?? "").replace(/^Waived:\s*/, "").trim();
+const reasonOf = (body: string): string => (body.replace(/<!--[\s\S]*?-->/g, "").trimStart().split("\n")[0] ?? "").replace(/^Waived:\s*/, "").trim();
 
 /**
  * A delegated waiver: the label came through `delegate`'s App (an identity

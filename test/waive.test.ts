@@ -128,6 +128,8 @@ test("the orchestrator's label without its comment, after a push, or under the d
     { events: [labeled(ORCH)], comments: [waivedComment(CLAUDE, HEAD)] },
     // The reason is the evidence: a bare `Waived:` gives none.
     { events: [labeled(ORCH)], comments: [{ ...waivedComment(ORCH, HEAD), body: `Waived:\n\n${waiveMarker({ v: 1, head: HEAD, session: "orch-session" })}` }] },
+    // Nor does the marker on the same line pass for one.
+    { events: [labeled(ORCH)], comments: [{ ...waivedComment(ORCH, HEAD), body: `Waived: ${waiveMarker({ v: 1, head: HEAD, session: "orch-session" })}` }] },
     // With no waiver_by, only a person's label counts, as before.
     { config: { ...CONFIG, waiver_by: undefined }, events: [labeled(ORCH)], comments: [waivedComment(ORCH, HEAD)] },
   ]) {
