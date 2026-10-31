@@ -167,6 +167,9 @@ group("a read of a public repository the App is not installed on (#104)", () => 
       ["release", "view", "v1"],
       ["api", "repos/cloudflare/workerd/pulls/7910/files", "--paginate"],
       ["api", "-X", "GET", "search/issues", "-f", "q=repo:cloudflare/workerd"],
+      ["api", "repos/graphql/graphql-js/contents/src/graphql.ts"],
+      ["pr", "-R", "cloudflare/workerd", "view", "7910"],
+      ["pr", "--repo=cloudflare/workerd", "view", "7910"],
     ]) {
       expect([args, readOnly(args)]).toEqual([args, true]);
     }
@@ -179,6 +182,8 @@ group("a read of a public repository the App is not installed on (#104)", () => 
       ["api", "-X", "DELETE", "repos/cloudflare/workerd/issues/comments/1"],
       ["api", "graphql", "-X", "GET", "-f", "query=mutation{x}"],
       ["api", "-X", "GET", "https://api.github.com/graphql"],
+      ["api", "-X", "GET", "/graphql?query=x"],
+      ["pr", "-R", "view", "comment", "7910"],
     ]) {
       expect([args, readOnly(args)]).toEqual([args, false]);
     }

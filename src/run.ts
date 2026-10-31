@@ -68,14 +68,30 @@ const READS = new Set([
   "run view", "run list",
 ]);
 
+/** gh's arguments without `-R`/`--repo` and their values, which gh also takes before a subcommand. */
+const withoutRepo = (args: readonly string[]): string[] => {
+  const rest: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index] as string;
+    if (arg === "--") return [...rest, ...args.slice(index)];
+    if (arg === "-R" || arg === "--repo") index++;
+    else if (!arg.startsWith("--repo=") && !arg.startsWith("-R")) rest.push(arg);
+  }
+  return rest;
+};
+
 /**
  * Whether gh's arguments only read: a command in READS, any `gh search`, or a
  * REST `gh api` GET. GraphQL is left out, since a query can carry a mutation.
  */
 export const readOnly = (args: readonly string[]): boolean => {
   const api = apiCall(args);
-  if (api !== undefined) return api.method === "GET" && api.endpoint !== undefined && !/(^|\/)graphql\b/i.test(api.endpoint);
-  return args[0] === "search" || READS.has(`${args[0]} ${args[1]}`);
+  if (api !== undefined) {
+    const path = api.endpoint?.replace(/^https:\/\/api\.github\.com/i, "").replace(/^\//, "").split(/[?#]/)[0];
+    return api.method === "GET" && path !== undefined && path.toLowerCase() !== "graphql";
+  }
+  const [command, verb] = withoutRepo(args);
+  return command === "search" || READS.has(`${command} ${verb}`);
 };
 
 /** Runs `gh` through the family's App and returns the child's exit code; `read` as `withToken` takes it. */
