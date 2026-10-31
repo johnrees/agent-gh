@@ -40,5 +40,11 @@
     "app_id": 5090216,
     "client_id": "Iv23liGJAws8hCxcdIdC",
     "bot_user_id": 334329927
+  },
+  "orchestrator": {
+    "slug": "johnrees-orchestrator",
+    "app_id": 5557721,
+    "client_id": "Iv23liZtigZ5lmrEQt7v",
+    "bot_user_id": 350816998
   }
 }
