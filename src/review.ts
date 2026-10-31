@@ -362,7 +362,7 @@ const reasonOf = (body: string): string => (body.trimStart().split("\n")[0] ?? "
 /**
  * A delegated waiver: the label came through `delegate`'s App (an identity
  * `waiver_by` lists), the same login posted a comment through the same App
- * starting `Waived:` whose marker names the current head, never edited (any
+ * starting `Waived:` with a reason, whose marker names the current head, never edited (any
  * agent, acting as John, could edit it), and neither the identity nor the
  * comment's session worked on the pull request. A push moves the head, so it
  * voids the waiver until a new comment names the new head. Says who waived
@@ -383,14 +383,14 @@ export const delegatedWaiver = (
       comment.author.toLowerCase() === added.login.toLowerCase() &&
       comment.updatedAt === comment.createdAt &&
       comment.body.trimStart().startsWith("Waived:") &&
+      // The reason is the evidence: a bare `Waived:` gives none.
+      reasonOf(comment.body) !== "" &&
       marker?.head === head &&
       !workers.sessions.includes(marker.session)
     );
   });
   const latest = evidence.at(-1);
-  if (latest === undefined) return undefined;
-  const reason = reasonOf(latest.body);
-  return `${delegate.name} at ${head.slice(0, 8)}${reason === "" ? "" : `: ${reason}`}`;
+  return latest === undefined ? undefined : `${delegate.name} at ${head.slice(0, 8)}: ${reasonOf(latest.body)}`;
 };
 
 /**

@@ -45,19 +45,34 @@ type World = { head?: string; config?: unknown; events?: unknown[]; comments?: u
 
 const world = ({ head = HEAD, config = CONFIG, events = [], comments = [], labels = ["review-waived"], session = "orch-session", family = "orchestrator" }: World = {}) => {
   const posts = [...comments];
+  const timeline = [...events];
+  const acting = family === "orchestrator" ? ORCH : CLAUDE;
+  // The label is on as its last event left it, else as the scenario says.
+  const current = () => {
+    const last = timeline.at(-1) as { event: string } | undefined;
+    return last === undefined ? labels : last.event === "labeled" ? ["review-waived"] : [];
+  };
   const fake = fakeGitHub({
     [`GET ${REPO}/pulls/12`]: () =>
-      reply(200, { state: "open", title: "Do it", body: CLAIM_BODY, head: { sha: head }, base: { ref: "main" }, labels: labels.map((name) => ({ name })), created_at: "2026-10-30T00:00:00Z", user: { login: "johnrees", type: "User" } }),
+      reply(200, { state: "open", title: "Do it", body: CLAIM_BODY, head: { sha: head }, base: { ref: "main" }, labels: current().map((name) => ({ name })), created_at: "2026-10-30T00:00:00Z", user: { login: "johnrees", type: "User" } }),
     [`GET ${REPO}/contents/.github/agent-review.json`]: () => reply(200, { content: Buffer.from(JSON.stringify(config)).toString("base64") }),
     [`GET ${REPO}/commits/${head}/status`]: () => reply(200, { state: "pending", total_count: 0, statuses: [] }),
-    [`GET ${REPO}/issues/12/events`]: () => reply(200, events),
+    [`GET ${REPO}/issues/12/events`]: () => reply(200, timeline),
     [`GET ${REPO}/pulls/12/commits`]: () => reply(200, [WORKER_COMMIT]),
     [`GET ${REPO}/issues/12/comments`]: () => reply(200, posts),
     [`POST ${REPO}/issues/12/comments`]: (body) => {
-      posts.push({ ...waivedComment(ORCH, head), body: (JSON.parse(body) as { body: string }).body });
+      posts.push({ ...waivedComment(acting, head), body: (JSON.parse(body) as { body: string }).body });
       return reply(201, {});
     },
-    [`POST ${REPO}/issues/12/labels`]: () => reply(200, []),
+    // GitHub records a labeled event only for a label that was not on already.
+    [`POST ${REPO}/issues/12/labels`]: () => {
+      if (!timeline.some((event) => (event as { event: string }).event === "labeled") || (timeline.at(-1) as { event: string }).event === "unlabeled") timeline.push(labeled(acting));
+      return reply(200, []);
+    },
+    [`DELETE ${REPO}/issues/12/labels/review-waived`]: () => {
+      timeline.push({ ...labeled(acting), event: "unlabeled" });
+      return reply(200, []);
+    },
     [`GET ${REPO}`]: () => reply(200, { default_branch: "main", owner: { login: "johnrees" } }),
     "POST /graphql": () => reply(200, { data: { repository: { pullRequest: { closingIssuesReferences: { totalCount: 0, nodes: [] } } } } }),
   });
@@ -111,6 +126,8 @@ test("the orchestrator's label without its comment, after a push, or under the d
     { events: [labeled(ORCH)], comments: [waivedComment(ORCH, HEAD, { updated_at: "2026-10-31T11:00:00Z" })] },
     // The comment must come through the App that added the label.
     { events: [labeled(ORCH)], comments: [waivedComment(CLAUDE, HEAD)] },
+    // The reason is the evidence: a bare `Waived:` gives none.
+    { events: [labeled(ORCH)], comments: [{ ...waivedComment(ORCH, HEAD), body: `Waived:\n\n${waiveMarker({ v: 1, head: HEAD, session: "orch-session" })}` }] },
     // With no waiver_by, only a person's label counts, as before.
     { config: { ...CONFIG, waiver_by: undefined }, events: [labeled(ORCH)], comments: [waivedComment(ORCH, HEAD)] },
   ]) {
@@ -129,7 +146,7 @@ test("a worker never waives its own pull request, even when waiver_by lists its 
 });
 
 test("agent-gh waive posts the Waived: comment for the head, then the label, and the gate then passes", async () => {
-  const w = world({ events: [labeled(ORCH)], comments: [] });
+  const w = world({ labels: [], comments: [] });
   await waiveCommand(w.io, { pr: 12, reason: "Fable reviewed it; bun test passed at the head" });
   const posts = w.fake.log.filter((entry) => entry.method === "POST" && entry.path.startsWith(`${REPO}/issues/12/`));
   expect(posts.map((entry) => entry.path)).toEqual([`${REPO}/issues/12/comments`, `${REPO}/issues/12/labels`]);
@@ -137,6 +154,15 @@ test("agent-gh waive posts the Waived: comment for the head, then the label, and
   expect(JSON.parse(posts[1]?.body ?? "{}")).toEqual({ labels: ["review-waived"] });
   await gateReady(w.io, { number: 12 });
   expect(w.printed.at(-1)).toBe("agent-gh: the review of #12 was waived by orchestrator at aaaaaaaa: Fable reviewed it; bun test passed at the head");
+});
+
+test("agent-gh waive takes off a waiver label a worker added, so the label it adds is the orchestrator's", async () => {
+  const w = world({ events: [labeled(CLAUDE)], comments: [] });
+  await waiveCommand(w.io, { pr: 12, reason: "re-tested at the head" });
+  const writes = w.fake.log.filter((entry) => entry.method !== "GET" && entry.path.startsWith(`${REPO}/issues/12/`)).map((entry) => `${entry.method} ${entry.path}`);
+  expect(writes).toEqual([`POST ${REPO}/issues/12/comments`, `DELETE ${REPO}/issues/12/labels/review-waived`, `POST ${REPO}/issues/12/labels`]);
+  await gateReady(w.io, { number: 12 });
+  expect(w.printed.at(-1)).toBe("agent-gh: the review of #12 was waived by orchestrator at aaaaaaaa: re-tested at the head");
 });
 
 test("agent-gh waive refuses a worker, an identity waiver_by does not list, and an empty reason, posting nothing", async () => {

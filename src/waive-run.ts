@@ -2,7 +2,7 @@ import { Failure } from "./failure.ts";
 import { request } from "./github.ts";
 import { slug } from "./repo.ts";
 import { waiveMarker } from "./review.ts";
-import { pull, pullNumber, pullWorkers, readReviewConfig, type ReviewIo } from "./review-run.ts";
+import { pull, pullNumber, pullWorkers, readReviewConfig, type ReviewIo, waiver } from "./review-run.ts";
 
 export type WaiveOptions = { readonly pr?: number; readonly reason: string };
 
@@ -40,7 +40,19 @@ export const waiveCommand = async (io: ReviewIo, options: WaiveOptions): Promise
     if (status < 200 || status >= 300) throw new Failure(STAGE, `HTTP ${status} from POST ${path}`);
   };
   await post(`/issues/${number}/comments`, { body });
+  // Adding a label already on records no event, so the label would stay whoever added it: take it off first.
+  if (pr.labels.includes(config.waiverLabel)) {
+    const path = `/repos/${slug(io.repo)}/issues/${number}/labels/${encodeURIComponent(config.waiverLabel)}`;
+    const { status } = await request(io.api, STAGE, "DELETE", path, io.token);
+    if (status !== 200 && status !== 404) throw new Failure(STAGE, `HTTP ${status} from DELETE the ${config.waiverLabel} label`);
+  }
   await post(`/issues/${number}/labels`, { labels: [config.waiverLabel] });
+  // Read back as the gate reads it, so a waiver that does not count is never reported as done.
+  const now = await pull(io, STAGE, number);
+  const by = await waiver(io, STAGE, now, config);
+  if (by === undefined || !by.startsWith(`${io.family} at `)) {
+    throw new Failure(STAGE, `the waiver on #${number} does not count as ${io.family}'s (${now.head === pr.head ? `the label reads ${by === undefined ? "as no waiver" : `as ${by}'s`}` : `the head moved to ${now.head.slice(0, 8)} meanwhile`}); run \`agent-gh waive\` again`);
+  }
   io.print(
     `agent-gh: waived the review of #${number} at ${pr.head.slice(0, 8)} as ${io.family}; ${config.statusWriter === "actions" ? "the agent-review workflow records it" : "`agent-gh review full` records it on the status"}, and a push voids it`,
   );
