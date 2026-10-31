@@ -292,17 +292,21 @@ export const waiver = async (io: ApiIo, stage: Stage, target: Pull, config: Revi
 
 /**
  * Who worked on the pull request (`Workers`): its claim marker's family and
- * session, and the identities and sessions its commits credit. Undefined
+ * session, the App that opened it, and the identities and sessions its
+ * commits credit. Undefined
  * when GitHub may not have listed every commit (it lists at most 250), since
  * one left out could be the waiving identity's own.
  */
 export const pullWorkers = async (io: ApiIo, stage: Stage, target: Pick<Pull, "number" | "body">): Promise<Workers | undefined> => {
   const commits = (await everyPage(io, stage, `${repoPath(io)}/pulls/${target.number}/commits`, 3)).map((commit) => text(record(record(commit).commit).message));
   if (commits.length >= 250) return undefined;
-  const credited = commitWorkers(commits, Object.fromEntries(postingApps(io.registry).map((app) => [app.family, app.bot])));
+  const apps = postingApps(io.registry);
+  const credited = commitWorkers(commits, Object.fromEntries(apps.map((app) => [app.family, app.bot])));
   const claim = parseClaim(target.body);
+  const openedVia = record(record((await call(io, stage, "GET", `${repoPath(io)}/issues/${target.number}`)).value).performed_via_github_app).id;
+  const opener = apps.find((app) => app.id === openedVia)?.family;
   return {
-    identities: [...credited.identities, ...(claim === undefined ? [] : [claim.family])],
+    identities: [...credited.identities, ...(claim === undefined ? [] : [claim.family]), ...(opener === undefined ? [] : [opener])],
     sessions: [...credited.sessions, ...(claim === undefined ? [] : [claim.session])],
   };
 };

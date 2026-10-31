@@ -73,11 +73,10 @@ const USAGE = `usage:
   agent-gh reply <finding> --applied <sha> | --declined "<why>" [--pr N]
                                     answer a review finding or a notify (its id as \`review full\` prints it, or its URL);
                                     a finding's review thread is answered and resolved
-  agent-gh waive --reason "<evidence>" [--pr N] [--as IDENTITY]
-                                    an orchestrator session's delegated review waiver, through johnrees-${ORCHESTRATOR}
-                                    (or --as's App): a \`Waived:\` comment naming the head, then the waiver label; it
-                                    counts where waiver_by lists the identity, never on a pull request it worked on,
-                                    and a push voids it
+  agent-gh waive --reason "<evidence>" [--pr N]
+                                    an orchestrator session's delegated review waiver, through johnrees-${ORCHESTRATOR}:
+                                    a \`Waived:\` comment naming the head, then the waiver label; it counts where
+                                    waiver_by lists ${ORCHESTRATOR}, never on a pull request it worked on, and a push voids it
   agent-gh notify <issue or pr> --severity P0|P1|P2 --body "<text>" | --body-file <file|-> [--from <issue or pr>]
                                     post a finding on another thread, linked back to this branch's pull request (or --from);
                                     it waits for an agent's \`agent-gh reply\`
@@ -650,19 +649,18 @@ const main = async (argv: readonly string[]): Promise<number> => {
     );
   }
   if (first === "waive") {
-    const parsed = flagPairs(rest, 0, ["--reason", "--pr", "--as"]);
+    const parsed = flagPairs(rest, 0, ["--reason", "--pr"]);
     const pr = prFlag(parsed?.values["--pr"]);
-    const as = parsed?.values["--as"] ?? ORCHESTRATOR;
     const reason = parsed?.values["--reason"];
-    if (reason === undefined || Number.isNaN(pr) || ![ORCHESTRATOR, ...familyNames()].includes(as)) {
+    if (reason === undefined || Number.isNaN(pr)) {
       console.error(USAGE);
       return 1;
     }
     if (!inAgentSession(env)) throw new Failure("waiving the review", "John waives a review by adding the waiver label himself; `agent-gh waive` is for an orchestrator session");
     const repo = await resolveRepo("git", [], env, () => originUrl(process.cwd()));
     if (repo === undefined) throw new Failure("waiving the review", "no GH_REPO and no github.com origin remote; run it inside a clone of the repository");
-    // The session's own harness and session id, acting through the waiving identity's App.
-    const context: Context = { identity: { ...detectIdentity(env), family: as }, repo, env, api: GITHUB, configDir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) };
+    // The session's own harness and session id, acting through the orchestrator's App.
+    const context: Context = { identity: { ...detectIdentity(env), family: ORCHESTRATOR }, repo, env, api: GITHUB, configDir: defaultConfigDir(), registry: REGISTRY, nowSeconds, sleep: (ms) => Bun.sleep(ms) };
     return withToken(context, async (childEnv) => {
       await waiveCommand(reviewIo(context, repo, childEnv), { reason, ...(pr === undefined ? {} : { pr }) });
       return 0;

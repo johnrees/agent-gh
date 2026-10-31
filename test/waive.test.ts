@@ -41,9 +41,9 @@ const waivedComment = (app: unknown, head: string, extra: Record<string, unknown
 const CLAIM_BODY = `Closes #7.\n\n${claimMarker({ v: 1, issue: 7, family: "claude", session: WORKER, id: "0123456789abcdef" })}`;
 const WORKER_COMMIT = { commit: { message: `Do it\n\nAgent-Session: ${WORKER}\nCo-authored-by: johnrees-claude[bot] <1+johnrees-claude[bot]@users.noreply.github.com>` } };
 
-type World = { head?: string; config?: unknown; events?: unknown[]; comments?: unknown[]; labels?: string[]; session?: string; family?: string };
+type World = { head?: string; config?: unknown; events?: unknown[]; comments?: unknown[]; labels?: string[]; session?: string; family?: string; openedVia?: unknown };
 
-const world = ({ head = HEAD, config = CONFIG, events = [], comments = [], labels = ["review-waived"], session = "orch-session", family = "orchestrator" }: World = {}) => {
+const world = ({ head = HEAD, config = CONFIG, events = [], comments = [], labels = ["review-waived"], session = "orch-session", family = "orchestrator", openedVia = CLAUDE }: World = {}) => {
   const posts = [...comments];
   const timeline = [...events];
   const acting = family === "orchestrator" ? ORCH : CLAUDE;
@@ -57,6 +57,7 @@ const world = ({ head = HEAD, config = CONFIG, events = [], comments = [], label
       reply(200, { state: "open", title: "Do it", body: CLAIM_BODY, head: { sha: head }, base: { ref: "main" }, labels: current().map((name) => ({ name })), created_at: "2026-10-30T00:00:00Z", user: { login: "johnrees", type: "User" } }),
     [`GET ${REPO}/contents/.github/agent-review.json`]: () => reply(200, { content: Buffer.from(JSON.stringify(config)).toString("base64") }),
     [`GET ${REPO}/commits/${head}/status`]: () => reply(200, { state: "pending", total_count: 0, statuses: [] }),
+    [`GET ${REPO}/issues/12`]: () => reply(200, { performed_via_github_app: openedVia }),
     [`GET ${REPO}/issues/12/events`]: () => reply(200, timeline),
     [`GET ${REPO}/pulls/12/commits`]: () => reply(200, [WORKER_COMMIT]),
     [`GET ${REPO}/issues/12/comments`]: () => reply(200, posts),
@@ -102,12 +103,12 @@ const refusal = async (run: Promise<unknown>): Promise<string> => {
   throw new Error("expected a refusal");
 };
 
-test("waiver_by defaults to none, lists identities, and refuses a name that is no identity", () => {
+test("waiver_by defaults to none, takes the orchestrator, and refuses a model family, whose App is its own workers'", () => {
   const base = { reviewers: { codex: { model: "m" } } };
   expect(parseReviewConfig(JSON.stringify(base)).waiverBy).toEqual([]);
-  expect(parseReviewConfig(JSON.stringify({ ...base, waiver_by: ["orchestrator", "codex"] })).waiverBy).toEqual(["orchestrator", "codex"]);
-  // The read App writes nothing, so it waives nothing either.
-  for (const bad of [["read"], "orchestrator", [1]]) expect(() => parseReviewConfig(JSON.stringify({ ...base, waiver_by: bad }))).toThrow(Failure);
+  expect(parseReviewConfig(JSON.stringify({ ...base, waiver_by: ["orchestrator"] })).waiverBy).toEqual(["orchestrator"]);
+  // With "claude" listed, a claude worker could strip its claim, commit with --no-verify, and waive its own pull request.
+  for (const bad of [["claude"], ["orchestrator", "codex"], ["read"], "orchestrator", [1]]) expect(() => parseReviewConfig(JSON.stringify({ ...base, waiver_by: bad }))).toThrow(Failure);
 });
 
 test("the gate passes on the orchestrator's label with its Waived: comment for the head", async () => {
@@ -137,11 +138,13 @@ test("the orchestrator's label without its comment, after a push, or under the d
   }
 });
 
-test("a worker never waives its own pull request, even when waiver_by lists its identity", async () => {
-  // claude claimed and co-authored #12, so claude's label and comment count for nothing.
-  const listed = { ...CONFIG, waiver_by: ["orchestrator", "claude"] };
-  const w = world({ config: listed, events: [labeled(CLAUDE)], comments: [waivedComment(CLAUDE, HEAD)] });
+test("a worker never waives its own pull request", async () => {
+  // A worker family's label and comment count for nothing: waiver_by cannot list it.
+  const w = world({ events: [labeled(CLAUDE)], comments: [waivedComment(CLAUDE, HEAD)] });
   expect(await refusal(gateReady(w.io, { number: 12 }))).toContain("has no agent-review status");
+  // Nor does the orchestrator's on a pull request it opened.
+  const opened = world({ openedVia: ORCH, events: [labeled(ORCH)], comments: [waivedComment(ORCH, HEAD)] });
+  expect(await refusal(gateReady(opened.io, { number: 12 }))).toContain("has no agent-review status");
   // Nor does the orchestrator's App when the comment's session is the worker's.
   const own = world({ events: [labeled(ORCH)], comments: [{ ...waivedComment(ORCH, HEAD), body: `Waived: mine\n\n${waiveMarker({ v: 1, head: HEAD, session: WORKER })}` }] });
   expect(await refusal(gateReady(own.io, { number: 12 }))).toContain("has no agent-review status");
@@ -170,7 +173,7 @@ test("agent-gh waive takes off a waiver label a worker added, so the label it ad
 test("agent-gh waive refuses a worker, an identity waiver_by does not list, and an empty reason, posting nothing", async () => {
   const cases: [World, string][] = [
     [{ session: WORKER }, "this session (worker-session) worked on pull request #12"],
-    [{ family: "claude", config: { ...CONFIG, waiver_by: ["claude"] } }, "claude worked on pull request #12"],
+    [{ openedVia: ORCH }, "orchestrator worked on pull request #12"],
     [{ config: { ...CONFIG, waiver_by: [] } }, "does not list orchestrator in waiver_by"],
   ];
   for (const [scenario, why] of cases) {

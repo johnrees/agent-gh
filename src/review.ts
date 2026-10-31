@@ -27,9 +27,10 @@ export type ReviewConfig = {
   readonly checklist: string | undefined;
   readonly waiverLabel: string;
   /**
-   * `waiver_by`: identities (the orchestrator, or model families) whose
-   * waiver label counts, with a `Waived:` comment for the head, on a pull
-   * request they did not work on. Empty by default: only a person's counts.
+   * `waiver_by`: identities whose waiver label counts, with a `Waived:`
+   * comment for the head, on a pull request they did not work on: only
+   * `orchestrator`, since a family listed here would be its own workers'.
+   * Empty by default: only a person's counts.
    */
   readonly waiverBy: readonly string[];
   /** A reviewer family that reviews every session's work, its own included. */
@@ -222,10 +223,10 @@ export const parseReviewConfig = (text: string): ReviewConfig => {
   const waiverLabel = top.waiver_label === undefined ? "review-waived" : string(top.waiver_label, "waiver_label");
   const writer = statusWriter(top.status_writer);
   const waiverByRaw = top.waiver_by ?? [];
-  const identities = [ORCHESTRATOR, ...familyNames()];
-  if (!Array.isArray(waiverByRaw)) throw new Failure(STAGE, `${CONFIG_PATH}: waiver_by must be a list of identities (${identities.join(", ")})`);
+  if (!Array.isArray(waiverByRaw)) throw new Failure(STAGE, `${CONFIG_PATH}: waiver_by must be a list, ["${ORCHESTRATOR}"] or []`);
   const waiverBy = waiverByRaw.map((name, index) => {
-    if (!identities.includes(string(name, `waiver_by[${index}]`))) throw new Failure(STAGE, `${CONFIG_PATH}: waiver_by[${index}] is ${JSON.stringify(name)}, which names no identity; use ${identities.join(", ")}`);
+    // A model family is refused: its sessions are the workers, and any of them could act through its App.
+    if (string(name, `waiver_by[${index}]`) !== ORCHESTRATOR) throw new Failure(STAGE, `${CONFIG_PATH}: waiver_by[${index}] is ${JSON.stringify(name)}; only "${ORCHESTRATOR}" may waive, since a model family's App is its own workers'`);
     return name as string;
   });
   return {
@@ -381,6 +382,7 @@ export const delegatedWaiver = (
     return (
       comment.appId === delegate.id &&
       comment.author.toLowerCase() === added.login.toLowerCase() &&
+      // An edited comment (or one GitHub gives no edit time for) fails closed.
       comment.updatedAt === comment.createdAt &&
       comment.body.trimStart().startsWith("Waived:") &&
       // The reason is the evidence: a bare `Waived:` gives none.

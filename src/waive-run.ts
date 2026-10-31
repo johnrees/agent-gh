@@ -10,7 +10,7 @@ const STAGE = "waiving the review" as const;
 
 /**
  * `agent-gh waive`: a delegated review waiver, posted through the App of
- * `io.family` (the orchestrator's, unless `--as` names another identity):
+ * `io.family`, the orchestrator's:
  * a comment starting `Waived:` with the reason and a marker naming the head
  * and this session, then the waiver label. It refuses where the base
  * branch's config does not list the identity in `waiver_by`, and on a pull
@@ -32,7 +32,7 @@ export const waiveCommand = async (io: ReviewIo, options: WaiveOptions): Promise
   }
   const workers = await pullWorkers(io, STAGE, pr);
   if (workers === undefined) throw new Failure(STAGE, `pull request #${number} has 250 commits or more, so who worked on it cannot be read; John waives it himself`);
-  if (workers.identities.includes(io.family)) throw new Failure(STAGE, `${io.family} worked on pull request #${number} (its claim or a commit's co-author), and a worker never waives its own review`);
+  if (workers.identities.includes(io.family)) throw new Failure(STAGE, `${io.family} worked on pull request #${number} (it opened it, holds its claim, or co-authored a commit), and a worker never waives its own review`);
   if (workers.sessions.includes(io.session)) throw new Failure(STAGE, `this session (${io.session}) worked on pull request #${number} (its claim or a commit's Agent-Session), and a worker never waives its own review`);
   const body = `Waived: ${reason}\n\nHead: ${pr.head}\n\n${waiveMarker({ v: 1, head: pr.head, session: io.session })}`;
   const post = async (path: string, value: unknown) => {
