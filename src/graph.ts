@@ -18,17 +18,51 @@ import { sameLabel, STATUS_CONTEXT } from "./review.ts";
 import { HOLD_CONTEXT } from "./status.ts";
 import { THREADS_CONTEXT } from "./threads.ts";
 
-/** `graph --json [--all]`, with an optional `-R repo`; undefined when it does not parse, or lacks `--json`. */
-export const parseGraphArgs = (args: readonly string[]): { readonly all: boolean } | undefined => {
+export type GraphArgs = {
+  readonly format: "json" | "mermaid" | "html";
+  readonly all: boolean;
+  /** `--mermaid` and `--html`: one milestone's title, or `none`. */
+  readonly milestone?: string;
+  /** `--html`: the file to write instead of stdout. */
+  readonly out?: string;
+  /** `--html --out`: rewrite it every so many seconds, at least 30. */
+  readonly every?: number;
+};
+
+/**
+ * `graph --json|--mermaid|--html [--all]`, with an optional `-R repo`;
+ * `--milestone <title>` for `--mermaid` and `--html`, `--out <file>` and
+ * `--every <seconds>` (with `--out`, at least 30) for `--html`. Undefined
+ * when it does not parse.
+ */
+export const parseGraphArgs = (args: readonly string[]): GraphArgs | undefined => {
   const words: string[] = [];
+  const values = new Map<string, string>();
   for (let index = 0; index < args.length; index++) {
     const arg = args[index] as string;
     if (arg === "-R" || arg === "--repo") {
       if (args[++index] === undefined) return undefined;
+    } else if (arg === "--milestone" || arg === "--out" || arg === "--every") {
+      const value = args[++index];
+      if (value === undefined || values.has(arg)) return undefined;
+      values.set(arg, value);
     } else if (!arg.startsWith("--repo=") && !(arg.startsWith("-R") && arg.length > 2)) words.push(arg);
   }
-  if (words.some((word) => word !== "--json" && word !== "--all") || new Set(words).size !== words.length || !words.includes("--json")) return undefined;
-  return { all: words.includes("--all") };
+  if (words.some((word) => !["--json", "--mermaid", "--html", "--all"].includes(word)) || new Set(words).size !== words.length) return undefined;
+  const formats = (["json", "mermaid", "html"] as const).filter((format) => words.includes(`--${format}`));
+  const [format] = formats;
+  if (format === undefined || formats.length > 1) return undefined;
+  const milestone = values.get("--milestone");
+  const out = values.get("--out");
+  const every = values.get("--every");
+  if ((milestone !== undefined && format === "json") || ((out !== undefined || every !== undefined) && format !== "html")) return undefined;
+  if (milestone === "" || out === "" || (every !== undefined && (out === undefined || !/^\d+$/.test(every) || Number(every) < 30))) return undefined;
+  return {
+    format, all: words.includes("--all"),
+    ...(milestone === undefined ? {} : { milestone }),
+    ...(out === undefined ? {} : { out }),
+    ...(every === undefined ? {} : { every: Number(every) }),
+  };
 };
 
 /** A pull request as an issue links it (`closedByPullRequestsReferences`), open or not. */
@@ -210,6 +244,8 @@ export const graphJson = (input: GraphRead) => {
       url: issue.url,
       state: issue.open ? "open" : "closed",
       milestone: issue.milestone?.title ?? null,
+      // A closed milestone's issue can be in the graph while the milestone is not in `milestones`, so the issue carries its number for the order.
+      milestone_number: issue.milestone?.number ?? null,
       labels: [...issue.labels].sort(),
       priority: node?.priority?.label ?? null,
       queued: at === -1 ? null : at,
