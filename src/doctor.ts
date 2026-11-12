@@ -13,7 +13,9 @@ export const PERSON: Identity = { harness: "none", family: READ_APP };
  * then, with John's user token for that App: the acting user, that the token
  * belongs to the App (GitHub lists only the issuing App's installations for a
  * user token), John's git author, and git access to the repository. Exit 0
- * only if all hold.
+ * only if all hold. It asks GitHub whether the App is installed on the
+ * repository whatever an earlier command remembered, and a no forgets that
+ * yes, so doctor is also how to correct one.
  */
 export const doctor = async (context: Context & { readonly repo: Repo }, print: (line: string) => void): Promise<number> => {
   const { identity } = context;
@@ -53,5 +55,5 @@ export const doctor = async (context: Context & { readonly repo: Repo }, print: 
     ] as const;
     for (const [name, ok, seen] of checks) print(`${ok ? "ok  " : "FAIL"} ${name}: ${seen}`);
     return checks.every(([, ok]) => ok) ? 0 : 1;
-  });
+  }, { recheck: true });
 };

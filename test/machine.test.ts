@@ -264,6 +264,16 @@ test("a family token is the session family's, and only once its App is on the re
   expect(fake.log.map((entry) => `${entry.method} ${entry.path}`)).toContain("GET /user/installations");
   await expect(familyToken(deps, { owner: "johnrees", name: "elsewhere" })).rejects.toThrow("is not installed on johnrees/elsewhere");
   await expect(familyToken({ ...deps, env: { OPENCODE_TERMINAL: "1" } }, undefined)).rejects.toThrow("opencode does not tell shell commands");
+
+  // git asks on every fetch and push: the yes is remembered for the hour, the no is asked again.
+  const asked = () => fake.log.splice(0).length;
+  asked();
+  expect(await familyToken(deps, { owner: "johnrees", name: "penmon" })).toBe(FAMILY_TOKEN);
+  expect(asked()).toBe(0);
+  await expect(familyToken(deps, { owner: "johnrees", name: "elsewhere" })).rejects.toThrow("is not installed on johnrees/elsewhere");
+  expect(asked()).toBe(2);
+  expect(await familyToken({ ...deps, nowSeconds: () => NOW + 3600 }, { owner: "johnrees", name: "penmon" })).toBe(FAMILY_TOKEN);
+  expect(asked()).toBe(2);
 });
 
 test("install-shims --agent-machine: git reads with the read App and pushes with the family App, gh is logged out, and a rerun changes nothing", () => {
