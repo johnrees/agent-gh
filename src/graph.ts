@@ -244,6 +244,7 @@ export const graphJson = (input: GraphRead) => {
     fetched_at: input.fetchedAt,
     queue: input.config.issue ?? null,
     label: input.config.label,
+    priority_labels: [...input.config.priorityLabels],
     milestones: input.milestones.map((milestone) => ({ ...milestone })),
     issues,
     stuck: laid.stuck.map((item) => item.issue),

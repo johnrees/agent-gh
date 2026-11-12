@@ -267,7 +267,7 @@ const REPOSITORY: World = {
 test("graph gives every open issue its status, wave, milestone, blockers, holder, and pull request, with each open milestone's closed issues", async () => {
   const { io } = world(REPOSITORY);
   const graph = await readGraph(io, apiReader(io), { all: false }, NOW);
-  expect(graph).toMatchObject({ v: 1, repo: "johnrees/widget", fetched_at: "2026-10-21T12:00:00.000Z", queue: null, label: "ready", stuck: [9, 10, 11], cycles: [[9, 10]] });
+  expect(graph).toMatchObject({ v: 1, repo: "johnrees/widget", fetched_at: "2026-10-21T12:00:00.000Z", queue: null, label: "ready", priority_labels: DEFAULT_PRIORITY_LABELS, stuck: [9, 10, 11], cycles: [[9, 10]] });
   expect(graph.milestones).toEqual([
     { number: 1, title: "M0", description: "about M0", state: "open", open: 2, closed: 2 },
     { number: 2, title: "M1", description: "about M1", state: "open", open: 1, closed: 0 },
