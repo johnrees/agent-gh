@@ -111,6 +111,18 @@ group("a command runs as John through the family App", () => {
     expect(await runAs(context, recorder(3))).toBe(3);
   });
 
+  test("the installation is checked once an hour for a repository, not before every command", async () => {
+    const { fake, out, context } = setup();
+    expect(await runAs(context, recorder())).toBe(0);
+    expect(await runAs(context, recorder(3))).toBe(3);
+    expect(await runAs(context, recorder())).toBe(0);
+    expect(fake.log.map((entry) => entry.path)).toEqual(["/user/installations", "/user/installations/42/repositories"]);
+    const env = JSON.parse(readFileSync(out, "utf8"));
+    expect([env.GH_TOKEN, env.GH_REPO]).toEqual([ACCESS, "johnrees/penmon"]);
+    expect(await runAs({ ...context, nowSeconds: () => NOW + 3600 }, recorder())).toBe(0);
+    expect(fake.log).toHaveLength(4);
+  });
+
 });
 
 group("a read of a public repository the App is not installed on (#104)", () => {
@@ -432,6 +444,36 @@ group("another machine needs only the committed registry and `agent-gh login`", 
     expect(lines).toContain("ok   acting user: johnrees");
     expect(lines).toContain("ok   token app: johnrees-claude, installed on johnrees");
     expect(existsSync(join(dir, "claude.pem"))).toBe(false);
+  });
+
+  test("doctor asks GitHub whether the App is installed whatever a command remembered, and a no corrects it", async () => {
+    let installed = true;
+    const { fake, context } = setup({
+      ...HAPPY,
+      "GET /user/installations/42/repositories": () =>
+        reply(200, { total_count: 1, repositories: [{ full_name: installed ? "johnrees/penmon" : "johnrees/soltui" }] }),
+    });
+    const dir = loginOnly();
+    const bin = mkdtempSync(join(tmpdir(), "agent-gh-bin-"));
+    const script = (name: string, body: string) => {
+      writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    };
+    script("gh", 'case "$2" in user) echo johnrees ;; user/installations) echo johnrees ;; esac');
+    script("git", 'case "$1" in var) echo "John Rees <john@example.com> 1800000000 +0000" ;; ls-remote) echo "0000 HEAD" ;; --version) echo "git version 2" ;; esac');
+    const machine = { ...context, configDir: dir, registry: { claude: ENTRY }, env: { ...context.env, PATH: `${bin}:${process.env.PATH}` } } satisfies Context;
+    const asked = () => fake.log.splice(0).length;
+    expect(await runAs(machine, ["gh", "--version"])).toBe(0);
+    expect(asked()).toBe(2);
+    expect(await doctor(machine, () => {})).toBe(0);
+    expect(asked()).toBe(2);
+
+    // The App is removed from the repository: a command still trusts the yes, doctor does not, and after doctor no command does.
+    installed = false;
+    expect(await runAs(machine, ["gh", "--version"])).toBe(0);
+    expect(asked()).toBe(0);
+    const error = await failure(doctor(machine, () => {}));
+    expect(error.detail).toStartWith("the johnrees-claude App is not installed on johnrees/penmon");
+    expect((await failure(runAs(machine, ["gh", "--version"]))).detail).toStartWith("the johnrees-claude App is not installed on johnrees/penmon");
   });
 
   test("a person's doctor says so, credits no commit, and checks with the read App", async () => {

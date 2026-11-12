@@ -1,8 +1,9 @@
 import { runChild } from "./child.ts";
 import { readConfig, type AppConfig, type Registry } from "./config.ts";
 import { childEnv } from "./env.ts";
-import { type Api, isPublic, MissingInstallation, requireInstallation } from "./github.ts";
+import { type Api, isPublic, MissingInstallation } from "./github.ts";
 import type { Env, Identity } from "./harness.ts";
+import { requireInstalled } from "./installed.ts";
 import { userToken } from "./login.ts";
 import { type Repo, slug } from "./repo.ts";
 import { apiCall } from "./review.ts";
@@ -27,6 +28,9 @@ export type Context = {
  * every repository the App is installed on, cannot be narrowed to one per
  * call, and GitHub refuses the rest itself. The App's private key is never
  * read here. GitHub records what the child does as John with the App's badge.
+ * A yes is remembered for an hour (`requireInstalled`), so the check costs
+ * GitHub requests once an hour for each repository, not before every command;
+ * `recheck` asks GitHub whatever is remembered.
  *
  * A `read` (see `readOnly`) of a public repository the App is not installed
  * on goes ahead with the same token, which reads any public repository, and
@@ -36,7 +40,7 @@ export type Context = {
 export const withToken = async <T>(
   context: Context,
   use: (env: Record<string, string>, config: AppConfig) => Promise<T>,
-  read = false,
+  { read = false, recheck = false }: { readonly read?: boolean; readonly recheck?: boolean } = {},
 ): Promise<T> => {
   const { family } = context.identity;
   const config = readConfig(context.configDir, family, context.registry);
@@ -49,7 +53,7 @@ export const withToken = async <T>(
   const { repo } = context;
   if (repo !== undefined) {
     try {
-      await requireInstallation(context.api, config, family, token, repo);
+      await requireInstalled({ api: context.api, dir: context.configDir, nowSeconds: context.nowSeconds }, config, family, token, repo, recheck);
     } catch (error) {
       if (!read || !(error instanceof MissingInstallation)) throw error;
       if (!(await isPublic(context.api, error.stage, repo, token).catch(() => false))) throw error;
@@ -96,4 +100,4 @@ export const readOnly = (args: readonly string[]): boolean => {
 
 /** Runs `gh` through the family's App and returns the child's exit code; `read` as `withToken` takes it. */
 export const runAs = async (context: Context, command: readonly string[], read = false): Promise<number> =>
-  withToken(context, async (env) => (await runChild(command, env)).code, read);
+  withToken(context, async (env) => (await runChild(command, env)).code, { read });

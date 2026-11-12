@@ -1,7 +1,7 @@
 import { READ_APP, readConfig, type Registry } from "./config.ts";
 import { describe, Failure, NEXT_STEP } from "./failure.ts";
-import { requireInstallation } from "./github.ts";
 import { detectIdentity, type Env } from "./harness.ts";
+import { requireInstalled } from "./installed.ts";
 import { type LoginDeps, userToken } from "./login.ts";
 import { parseRepo, type Repo } from "./repo.ts";
 
@@ -24,13 +24,14 @@ export const readToken = async (deps: TokenDeps): Promise<string> =>
 /**
  * The session family's user token for a repository, after checking that its
  * App is installed there when git names one: GitHub's own refusal does not
- * say why.
+ * say why. A yes is remembered for an hour (`requireInstalled`), since git
+ * asks for a credential on every fetch and push.
  */
 export const familyToken = async (deps: TokenDeps & { readonly env: Env }, repo: Repo | undefined): Promise<string> => {
   const { family } = detectIdentity(deps.env);
   const config = readConfig(deps.dir, family, deps.registry);
   const token = await userToken(config, family, deps);
-  if (repo !== undefined) await requireInstallation(deps.api, config, family, token, repo);
+  if (repo !== undefined) await requireInstalled(deps, config, family, token, repo);
   return token;
 };
 
